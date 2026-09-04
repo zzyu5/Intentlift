@@ -7,22 +7,56 @@ admission nor the executable states available to the search.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import statistics
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from intentir.backend.materialize import BackendSearchState, CPrior
 from intentir.backend.riscv.compile import (
     RiscvLoweringCandidate,
     RiscvSchedule,
     RiscvTransformationState,
+    ragged_schedule_supported,
 )
+from intentir.backend.riscv.contract import (
+    RiscvContractError,
+    derive_riscv_contract_view,
+    riscv_allowed_authorizations,
+    validate_riscv_target_contract,
+)
+from intentir.ir.layer_c import (
+    ImplementationChoice,
+    LayerCBinding,
+    LayerCExtensionPoint,
+    LayerCInterface,
+    TargetLowering,
+    TargetParallelMapping,
+    TargetPipeline,
+    TargetRealizationContract,
+    TargetSplit,
+    TargetLayerCPlugin,
+    layer_c_content_digest,
+    validate_layer_c_attachments,
+)
+from intentir.backend.protocol import (
+    TargetBindingContext,
+    TargetExtensionMapping,
+    TargetPluginArtifact,
+    bind_target,
+    deserialize_target_plugin,
+    project_source_c_to_target,
+    serialize_target_plugin,
+    validate_target_plugin,
+)
+from intentir.verify.gate1.model import SemanticArchive
 
 
 RVV_SEARCH_PLAN_PROTOCOL = "intentir.backend.riscv.search-plan.v11"
 RVV_C_PROJECTION_PROTOCOL = "intentir.backend.riscv.c-projection.v1"
+RVV_LAYER_C_BACKEND_KIND = "riscv"
 
 _PARALLEL_TILES = (1, 2, 4, 8, 16, 32, 64, 128)
 _REDUCTION_TILES = (1, 2, 4, 8, 16, 32, 64, 128)
@@ -693,14 +727,7 @@ def _has_typed_flash_attention_graph(value: Mapping[str, Any]) -> bool:
 
 
 def _target_vlen_bits(state: BackendSearchState) -> int:
-    values = []
-    for feature in state.target.features:
-        match = re.fullmatch(r"vlen([0-9]+)", feature.lower())
-        if match is not None:
-            values.append(int(match.group(1)))
-    if len(set(values)) > 1:
-        raise ValueError("RVV target declares conflicting VLEN features")
-    return values[0] if values else 128
+    return validate_riscv_target_contract(state)
 
 
 def _power_of_two_floor(value: float) -> int:
@@ -808,6 +835,7 @@ def _project_c_priors(
     projection = {
         "protocol": RVV_C_PROJECTION_PROTOCOL,
         "target_vlen_bits": vlen_bits,
+        "target_identity": state.target.to_dict(),
         "element_bits": element_bits,
         "vector_lanes": vector_lanes,
         "reduction_axes": [list(item) for item in sorted(reduction_axes)],
@@ -1000,6 +1028,372 @@ class RiscvSearchPlan:
         }
 
 
+def _riscv_loop_attachment(
+    j: SemanticArchive,
+) -> tuple[str, int | str | None] | None:
+    if not isinstance(j, SemanticArchive):
+        raise TypeError("RISC-V Layer-C interface requires SemanticArchive")
+    node_by_path = {path: node_id for node_id, path in j.node_ids.items()}
+    loops: list[tuple[str, Any]] = []
+    for index, operation in enumerate(j.intent.body):
+        if operation.op != "loop":
+            continue
+        path = f"body[{index}]"
+        node_id = operation.node_id or node_by_path.get(path)
+        if node_id is None:
+            raise RiscvContractError(
+                "RISC-V structured loop lacks a stable J node attachment"
+            )
+        loops.append((node_id, operation))
+    if not loops:
+        return None
+    if len(loops) != 1:
+        raise RiscvContractError(
+            "RISC-V Layer-C currently requires at most one top-level loop"
+        )
+    node_id, loop = loops[0]
+    if loop.trip is None:
+        raise RiscvContractError("RISC-V structured loop lacks a trip axis")
+    # Dynamic value trips have no semantic dimension axis.  Keep the loop
+    # subject available for target pipeline provenance, but do not expose a
+    # fake tile attachment to RVV search or the target plugin grammar.
+    return node_id, loop.trip.axis
+
+
+def riscv_layer_c_interface(j: SemanticArchive) -> LayerCInterface:
+    """Declare only J-addressed values consumed before RVV search/lowering."""
+
+    if not isinstance(j, SemanticArchive):
+        raise TypeError("RISC-V Layer-C interface requires SemanticArchive")
+    attachment = _riscv_loop_attachment(j)
+    if attachment is None:
+        return LayerCInterface()
+    subject_ref, axis_ref = attachment
+    if axis_ref is None:
+        return LayerCInterface()
+    return LayerCInterface(
+        (
+            LayerCExtensionPoint(
+                slot="loop_schedule_tile",
+                role="loop_schedule_tile",
+                value_type="i64",
+                required=False,
+                subject_ref=subject_ref,
+                axis_ref=axis_ref,
+            ),
+        )
+    )
+
+
+def _riscv_plugin_bindings(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+) -> tuple[LayerCBinding, ...]:
+    del state, candidate
+    # No currently registered RiscvLoweringCandidate requests pre-M0 scan
+    # strip-mining.  The optional point remains declared for a future closed
+    # candidate kind, while today's plugins deliberately leave it unbound and
+    # consume the deterministic full-axis J-only materialization.
+    return ()
+
+
+def _riscv_target_realization_contract(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+    choice: ImplementationChoice,
+) -> TargetRealizationContract:
+    """Project one admitted RVV schedule into the shared typed grammar."""
+
+    attachment = _riscv_loop_attachment(state.base.j)
+    subject_ref, axis_ref = attachment if attachment is not None else (None, None)
+    schedule = candidate.schedule
+    transformation = candidate.transformation
+    if (attachment is None or axis_ref is None) and (
+        schedule.parallel_tile or schedule.reduction_tile
+    ):
+        raise RiscvContractError(
+            "RISC-V tiled schedule requires a static-axis J-attached top-level loop"
+        )
+    parallel_mapping: tuple[TargetParallelMapping, ...] = ()
+    split: tuple[TargetSplit, ...] = ()
+    if subject_ref is not None and axis_ref is not None:
+        if schedule.parallel_tile:
+            parallel_mapping = (
+                TargetParallelMapping(
+                    slot=None,
+                    subject_ref=subject_ref,
+                    axis_ref=axis_ref,
+                    mapping="parallel",
+                    factor=schedule.parallel_tile,
+                ),
+            )
+        if schedule.reduction_tile:
+            split = (
+                TargetSplit(
+                    slot=None,
+                    subject_ref=subject_ref,
+                    axis_ref=axis_ref,
+                    factor=schedule.reduction_tile,
+                ),
+            )
+    return TargetRealizationContract(
+        parallel_mapping=parallel_mapping,
+        pipeline=(
+            TargetPipeline(
+                stage=transformation.lowering_path_kind,
+                depth=1,
+                subject_ref=subject_ref,
+                axis_ref=axis_ref,
+            ),
+        ),
+        split=split,
+        lowering=TargetLowering(
+            backend_kind=choice.backend_kind,
+            candidate_key=choice.candidate_key,
+            candidate_digest=choice.candidate_digest,
+        ),
+    )
+
+
+def _riscv_target_binding_context(
+    state: BackendSearchState,
+    contract_view: Any,
+    *,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+) -> TargetBindingContext:
+    target_interface = riscv_layer_c_interface(state.base.j)
+    return TargetBindingContext(
+        j=state.base.j,
+        target=state.target,
+        interface=target_interface,
+        capabilities=contract_view.capabilities,
+        allowed_authorizations=riscv_allowed_authorizations(state),
+        # C_target is not Source-C.  Only an explicit producer projection may
+        # populate shared E_C; an omitted value means that this context is
+        # binding a target-only plugin.
+        e_c=e_c,
+    )
+
+
+def riscv_candidate_digest(candidate: RiscvLoweringCandidate) -> str:
+    """Digest the complete internal candidate, never caller-authored payload."""
+
+    if not isinstance(candidate, RiscvLoweringCandidate):
+        raise TypeError("RISC-V candidate digest requires RiscvLoweringCandidate")
+    return layer_c_content_digest(candidate.to_dict())
+
+
+def riscv_candidate_key(candidate: RiscvLoweringCandidate) -> str:
+    """Return a bounded opaque registry coordinate for one internal candidate."""
+
+    digest = riscv_candidate_digest(candidate)
+    return "riscv.candidate." + hashlib.sha256(
+        (candidate.candidate_id + ":" + digest).encode("utf-8")
+    ).hexdigest()
+
+
+def _required_authorizations(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+) -> tuple[str, ...]:
+    # The current registered RVV candidates do not consume a standalone
+    # realization-authorization payload.  Reassociation admission comes from
+    # the typed reduce ``assoc`` contract inspected by plan_riscv_search; other
+    # transforms are exact closed compiler states.  Keeping this empty is
+    # deliberate: a plugin that injects even a J-declared but irrelevant u*
+    # reference is rejected by resolve_riscv_target_plugin below.
+    del state, candidate
+    return ()
+
+
+def build_riscv_target_plugin(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+    *,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+) -> TargetLayerCPlugin:
+    """Freeze one plan-admitted RVV candidate as a closed target plugin."""
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("RISC-V plugin construction requires BackendSearchState")
+    if not isinstance(candidate, RiscvLoweringCandidate):
+        raise TypeError("RISC-V plugin construction requires RiscvLoweringCandidate")
+    contract = derive_riscv_contract_view(state)
+    plan = plan_riscv_search(state, enable_b_transformations=True)
+    matches = [item for item in plan.universe if item == candidate]
+    if len(matches) != 1:
+        raise RiscvContractError(
+            "RISC-V candidate is absent or ambiguous in the rebuilt search universe"
+        )
+    required_capabilities = tuple(
+        sorted(candidate.transformation.required_b_capabilities)
+    )
+    missing = set(required_capabilities) - set(contract.capabilities)
+    if missing:
+        raise RiscvContractError(
+            "RISC-V candidate lacks internally derived capabilities: "
+            + ", ".join(sorted(missing))
+        )
+    choice = ImplementationChoice(
+        backend_kind=RVV_LAYER_C_BACKEND_KIND,
+        candidate_key=riscv_candidate_key(candidate),
+        candidate_digest=riscv_candidate_digest(candidate),
+        authorization_refs=_required_authorizations(state, candidate),
+    )
+    target_contract = _riscv_target_realization_contract(
+        state,
+        candidate,
+        choice,
+    )
+    return bind_target(
+        _riscv_target_binding_context(state, contract, e_c=e_c),
+        bindings=_riscv_plugin_bindings(state, candidate),
+        choice=choice,
+        required_capabilities=required_capabilities,
+        contract=target_contract,
+    )
+
+
+def build_riscv_target_artifact(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+    *,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+    e_c_mapping: Sequence[TargetExtensionMapping | Mapping[str, Any]] | None = None,
+    source_c: Any | None = None,
+) -> TargetPluginArtifact:
+    """Build the complete shared-E_C/RVV target handoff."""
+
+    target_interface = riscv_layer_c_interface(state.base.j)
+    if source_c is not None:
+        projected_e_c, projected_mapping = project_source_c_to_target(
+            j=state.base.j,
+            source_c=source_c,
+            target_interface=target_interface,
+            e_c_mapping=e_c_mapping,
+        )
+        shared_e_c = (
+            projected_e_c
+            if e_c is None
+            else (
+                e_c
+                if isinstance(e_c, LayerCInterface)
+                else LayerCInterface.from_dict(e_c)
+            )
+        )
+        if shared_e_c != projected_e_c:
+            raise RiscvContractError(
+                "explicit RISC-V E_C is not the Source-C projection selected "
+                "by e_c_mapping"
+            )
+        if e_c_mapping is None:
+            e_c_mapping = projected_mapping
+    else:
+        # Target-only declarations remain owned by ``C_target``.  Treating
+        # the whole target interface as shared when ``source_c`` is omitted
+        # would create a false Source-C -> target relation and detach the
+        # artifact from the actual producer boundary.
+        shared_e_c = (
+            LayerCInterface()
+            if e_c is None
+            else (
+                e_c
+                if isinstance(e_c, LayerCInterface)
+                else LayerCInterface.from_dict(e_c)
+            )
+        )
+    validate_layer_c_attachments(state.base.j, shared_e_c)
+    plugin = build_riscv_target_plugin(state, candidate, e_c=shared_e_c)
+    if e_c_mapping is None:
+        if shared_e_c == plugin.interface:
+            e_c_mapping = tuple(
+                TargetExtensionMapping(item.slot, item.slot)
+                for item in shared_e_c.points
+            )
+        elif not shared_e_c.points:
+            e_c_mapping = ()
+        else:
+            raise RiscvContractError(
+                "RISC-V shared E_C and target interface differ; an explicit "
+                "e_c_mapping is required"
+            )
+    return TargetPluginArtifact(
+        e_c=shared_e_c,
+        plugin=plugin,
+        e_c_mapping=tuple(e_c_mapping),
+    )
+
+
+def resolve_riscv_target_plugin(
+    state: BackendSearchState,
+    plugin: TargetLayerCPlugin,
+) -> RiscvLoweringCandidate:
+    """Rebuild plan/universe and resolve exactly one key+digest; never fallback."""
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("RISC-V plugin resolution requires BackendSearchState")
+    if not isinstance(plugin, TargetLayerCPlugin):
+        raise TypeError("RISC-V lowering requires TargetLayerCPlugin")
+    contract_view = derive_riscv_contract_view(state)
+    context = _riscv_target_binding_context(state, contract_view)
+    plugin = deserialize_target_plugin(
+        context,
+        serialize_target_plugin(plugin),
+    )
+    if plugin.choice.backend_kind != RVV_LAYER_C_BACKEND_KIND:
+        raise RiscvContractError("RISC-V plugin has the wrong backend kind")
+    plan = plan_riscv_search(state, enable_b_transformations=True)
+    matches = [
+        item
+        for item in plan.universe
+        if riscv_candidate_key(item) == plugin.choice.candidate_key
+        and riscv_candidate_digest(item) == plugin.choice.candidate_digest
+    ]
+    if len(matches) != 1:
+        raise RiscvContractError(
+            "RISC-V plugin candidate key+digest is absent or ambiguous for this J/target"
+        )
+    candidate = matches[0]
+    expected_bindings = _riscv_plugin_bindings(state, candidate)
+    if plugin.bindings != expected_bindings:
+        raise RiscvContractError(
+            "RISC-V plugin bindings do not match the rebuilt candidate requirements"
+        )
+    required_capabilities = tuple(
+        sorted(candidate.transformation.required_b_capabilities)
+    )
+    if plugin.required_capabilities != required_capabilities:
+        raise RiscvContractError(
+            "RISC-V plugin capability requirements do not match the rebuilt candidate"
+        )
+    if plugin.choice.authorization_refs != _required_authorizations(state, candidate):
+        raise RiscvContractError(
+            "RISC-V plugin authorizations do not match the rebuilt candidate"
+        )
+    expected_choice = ImplementationChoice(
+        backend_kind=RVV_LAYER_C_BACKEND_KIND,
+        candidate_key=riscv_candidate_key(candidate),
+        candidate_digest=riscv_candidate_digest(candidate),
+        authorization_refs=_required_authorizations(state, candidate),
+    )
+    expected_contract = _riscv_target_realization_contract(
+        state,
+        candidate,
+        expected_choice,
+    )
+    try:
+        validate_target_plugin(
+            context,
+            plugin,
+            expected_choice=expected_choice,
+            expected_bindings=expected_bindings,
+            expected_contract=expected_contract,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RiscvContractError(str(exc)) from exc
+    return candidate
+
+
 def plan_riscv_search(
     state: BackendSearchState,
     *,
@@ -1007,6 +1401,7 @@ def plan_riscv_search(
 ) -> RiscvSearchPlan:
     if not isinstance(state, BackendSearchState):
         raise TypeError("RVV search planning requires BackendSearchState")
+    contract = derive_riscv_contract_view(state)
     j_payload = state.base.j.to_json()
     reduction_axes, _has_scan, _float_bits, has_reassociation, has_contraction = (
         _operation_facts(j_payload)
@@ -1033,6 +1428,40 @@ def plan_riscv_search(
         enable_paired_rotation=has_paired_rotation,
         enable_streaming_attention=has_streaming_attention,
     )
+    has_ragged = bool(contract.ragged_ops)
+    has_dynamic_ragged_member = contract.dynamic_ragged_member_output
+    ragged_schedule_rejections = 0
+    if has_dynamic_ragged_member:
+        # Ragged values have a data-dependent result extent.  Keep the
+        # materialized carrier-tensor realization as the sole C++/RVV path;
+        # vector/fusion/tiled candidates are flat-tensor transformations and
+        # must not be selected around a dynamic output ABI.  The predicate is
+        # shared with the compile boundary so search and execution cannot
+        # disagree about the admitted schedule.
+        before = len(raw_universe)
+        raw_universe = tuple(
+            item
+            for item in raw_universe
+            if (
+                item.transformation == RiscvTransformationState(False)
+                and ragged_schedule_supported(item.schedule)
+            )
+        )
+        ragged_schedule_rejections = before - len(raw_universe)
+    target_vlen_bits = int(projection["target_vlen_bits"])
+    incompatible_vlen_schedules_rejected = sum(
+        item.schedule.vectorize
+        and not item.schedule.scalable_vectorization
+        and item.schedule.vector_bits != target_vlen_bits
+        for item in raw_universe
+    )
+    raw_universe = tuple(
+        item
+        for item in raw_universe
+        if not item.schedule.vectorize
+        or item.schedule.scalable_vectorization
+        or item.schedule.vector_bits == target_vlen_bits
+    )
     minimum_reduction_tile = int(projection["vector_lanes"])
     subvector_reduction_schedules_rejected = sum(
         0 < item.schedule.reduction_tile < minimum_reduction_tile
@@ -1051,10 +1480,32 @@ def plan_riscv_search(
             and item.schedule.reduction_tile >= minimum_reduction_tile
         )
     )
+    schedule_attachment = _riscv_loop_attachment(state.base.j)
+    schedule_attachment_rejections = 0
+    # A dynamic value loop is a valid J control construct, but it has no
+    # semantic axis for RVV strip-mining or reduction tiling.  Remove those
+    # candidates before scoring/admission so search and target-contract
+    # validation see the same closed universe.
+    if schedule_attachment is None or schedule_attachment[1] is None:
+        before = len(universe)
+        universe = tuple(
+            item
+            for item in universe
+            if item.schedule.parallel_tile == 0
+            and item.schedule.reduction_tile == 0
+        )
+        schedule_attachment_rejections = before - len(universe)
     projection = {
         **projection,
         "minimum_reduction_tile": minimum_reduction_tile,
         "target_schedule_rejections": len(raw_universe) - len(universe),
+        "incompatible_vlen_schedules_rejected": (
+            incompatible_vlen_schedules_rejected
+        ),
+        "fixed_schedule_vlen_rule": (
+            "fixed-vector candidates must match target vlenN exactly; "
+            "other targets use scalable candidates"
+        ),
         "subvector_reduction_schedules_rejected": (
             subvector_reduction_schedules_rejected
         ),
@@ -1064,6 +1515,16 @@ def plan_riscv_search(
         "generic_contraction_reduction_tiling_admitted": not has_contraction,
         "generic_contraction_reduction_schedules_rejected": (
             contraction_reduction_schedules_rejected
+        ),
+        "schedule_attachment_rejections": schedule_attachment_rejections,
+        "ragged_schedule_rejections": ragged_schedule_rejections,
+        "ragged_schedule_rule": (
+            "only scalar, untiled, single-thread schedules may carry the "
+            "dynamic ragged_member output ABI"
+        ) if has_dynamic_ragged_member else (
+            "ragged_outer keeps the ordinary RVV schedule universe; no "
+            "dynamic member output ABI is present"
+            if has_ragged else "not_applicable"
         ),
     }
     scores = {
@@ -1185,7 +1646,14 @@ def plan_riscv_search(
 __all__ = [
     "RVV_SEARCH_PLAN_PROTOCOL",
     "RVV_C_PROJECTION_PROTOCOL",
+    "RVV_LAYER_C_BACKEND_KIND",
     "RiscvSearchPlan",
+    "build_riscv_target_plugin",
+    "build_riscv_target_artifact",
     "enumerate_riscv_candidates",
     "plan_riscv_search",
+    "resolve_riscv_target_plugin",
+    "riscv_candidate_digest",
+    "riscv_candidate_key",
+    "riscv_layer_c_interface",
 ]

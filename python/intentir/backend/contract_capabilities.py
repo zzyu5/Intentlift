@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from intentir.backend.materialize import MaterializedJ
+from intentir.ir.model import walk_intent_ops
 from intentir.verify.gate1.model import EffectKind, ParameterMode
 
 
@@ -39,17 +40,11 @@ def derive_search_capabilities(base: MaterializedJ) -> tuple[str, ...]:
     # unrelated unused tensor suppress whole-graph fusion for every live input.
     # Walk every structured region so this projection is derived from J itself,
     # never from a runtime sample or kernel-name allowlist.
-    dag_operands: set[str] = set()
-
-    def visit(operations) -> None:
-        for operation in operations:
-            dag_operands.update(operation.operands)
-            visit(operation.body)
-            for branch in (operation.positive, operation.negative):
-                if branch is not None:
-                    visit(branch.body)
-
-    visit(j.intent.body)
+    dag_operands = {
+        operand
+        for operation in walk_intent_ops(j.intent.body)
+        for operand in operation.operands
+    }
     observable_inputs = {
         output.name for output in j.intent.outputs if output.name in input_names
     }

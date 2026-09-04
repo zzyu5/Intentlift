@@ -46,11 +46,6 @@ _LIFT_READ_ONLY_CONTEXT_COMMANDS = frozenset(
         "source-find",
         "source-outline",
         "source-brief",
-        "source-ttir",
-        "source-ttir-find",
-        "source-ttir-def-use",
-        "source-ttir-outline",
-        "source-observer",
         "harness",
         "harness-abi",
         "candidate",
@@ -290,7 +285,7 @@ class IntentIRLiftEnvironmentConfig(BaseModel):
     output_dir: Path
     scratch_dir: Path
     tmp_dir: Path | None = None
-    timeout: int = 60
+    timeout: float | None = None
     candidate_check_limit: int = 0
     candidate_submission_check_limit: int = 0
     submission_kind: str = "candidate"
@@ -350,6 +345,9 @@ class IntentIRLiftEnvironment:
         self._multi_action_rejections = 0
         self._structured_context_queries: list[str] = []
         self._structured_schema_queries: list[list[str]] = []
+        self._stage_action_calls = 0
+        self._stage_action_failures = 0
+        self._stage_action_elapsed_ms = 0.0
         self._validate_paths()
         self._startup_context, self._startup_context_receipt = (
             self._build_startup_context()
@@ -510,8 +508,6 @@ class IntentIRLiftEnvironment:
         view = action.get("view")
         if view not in {
             "source", "source_outline", "source_find", "source_brief",
-            "source_ttir", "source_ttir_outline", "source_ttir_find",
-            "source_ttir_def_use", "source_observer",
             "harness", "harness_abi", "feedback",
             "feedback_category",
             "candidate", "candidate_find", "candidate_nodes", "candidate_node",
@@ -550,8 +546,7 @@ class IntentIRLiftEnvironment:
                 "query",
                 required=view
                 in {
-                    "source_find", "source_ttir_find", "source_ttir_def_use",
-                    "feedback_category", "candidate_find",
+                    "source_find", "feedback_category", "candidate_find",
                     "candidate_node", "knowledge",
                 },
             )
@@ -570,20 +565,6 @@ class IntentIRLiftEnvironment:
             command += ["source-find", str(query), "--context", str(context)]
         elif view == "source_brief":
             command.append("source-brief")
-        elif view == "source_ttir":
-            command += ["source-ttir", "--start", str(start), "--lines", str(count)]
-        elif view == "source_ttir_outline":
-            command += [
-                "source-ttir-outline", "--start", str(start), "--count", str(count)
-            ]
-        elif view == "source_ttir_find":
-            command += ["source-ttir-find", str(query), "--context", str(context)]
-        elif view == "source_ttir_def_use":
-            command += ["source-ttir-def-use", str(query), "--context", str(context)]
-        elif view == "source_observer":
-            command.append("source-observer")
-            if path is not None:
-                command += ["--path", path]
         elif view in {"harness", "feedback", "candidate"}:
             command.append(view)
             if path is not None:
@@ -1498,12 +1479,48 @@ class IntentIRLiftEnvironment:
             for child in directory.iterdir():
                 _remove_path_iterative(child)
 
+    def reset_stage_execution_metrics(self) -> None:
+        """Start a fresh per-agent-stage action timer without changing state."""
+
+        self._stage_action_calls = 0
+        self._stage_action_failures = 0
+        self._stage_action_elapsed_ms = 0.0
+
+    @property
+    def stage_execution_metrics(self) -> dict[str, Any]:
+        return {
+            "elapsed_ms": self._stage_action_elapsed_ms,
+            "count": self._stage_action_calls,
+            "failures": self._stage_action_failures,
+        }
+
     def execute(
         self,
         action: dict,
         cwd: str = "",
         *,
-        timeout: int | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Time one agent action while preserving the closed executor path."""
+
+        started = time.monotonic()
+        self._stage_action_calls += 1
+        try:
+            return self._execute(action, cwd, timeout=timeout)
+        except Exception:
+            self._stage_action_failures += 1
+            raise
+        finally:
+            self._stage_action_elapsed_ms += (
+                time.monotonic() - started
+            ) * 1000.0
+
+    def _execute(
+        self,
+        action: dict,
+        cwd: str = "",
+        *,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         if cwd not in {"", "/work"}:
             raise ValueError("IntentIR Lift cwd is fixed at /work")
@@ -1628,7 +1645,9 @@ class IntentIRLiftEnvironment:
             return output
         bounded_shell = (
             f"printf '{_SANDBOX_START_MARKER.decode()}'; "
-            "ulimit -t 60 -f 8192 -n 64 -u 128 -v 524288; "
+            # Keep non-time resource protections, but do not impose a hidden
+            # CPU-time deadline on an otherwise unbounded Lift action.
+            "ulimit -f 8192 -n 64 -u 128 -v 524288; "
             "set -o pipefail; "
             f"/bin/bash --noprofile --norc -c \"$1\" 2>&1 | "
             f"/usr/bin/head -c {MAX_ACTION_OUTPUT_BYTES}"
@@ -1642,7 +1661,7 @@ class IntentIRLiftEnvironment:
             "intentir-lift-action",
             command,
         ]
-        action_timeout = timeout or self.config.timeout
+        action_timeout = timeout if timeout is not None else self.config.timeout
         process: subprocess.Popen[bytes] | None = None
         limit_error = ""
         try:
@@ -1654,7 +1673,10 @@ class IntentIRLiftEnvironment:
                 )
                 started = time.monotonic()
                 while process.poll() is None:
-                    if time.monotonic() - started >= action_timeout:
+                    if (
+                        action_timeout is not None
+                        and time.monotonic() - started >= action_timeout
+                    ):
                         limit_error = (
                             f"action exceeded {action_timeout} second timeout"
                         )

@@ -784,7 +784,7 @@ class CodexCLISession:
         self,
         prompt: str,
         *,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
         effort: str | None = None,
         resume: bool | None = None,
         stop_requested: Callable[[], int | None] | None = None,
@@ -795,8 +795,8 @@ class CodexCLISession:
     ) -> CodexCLITurn:
         if self._closed:
             raise CodexCLIError("Codex session is closed")
-        if timeout_seconds <= 0:
-            raise ValueError("Codex turn timeout must be positive")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("Codex turn timeout must be positive when set")
         if submission_grace_seconds < 0:
             raise ValueError("submission grace must be non-negative")
         if diagnostic_grace_seconds < 0:
@@ -878,7 +878,10 @@ class CodexCLISession:
                         and not accepted_submission
                         and not ready_diagnostic
                     ):
-                        if elapsed >= timeout_seconds:
+                        if (
+                            timeout_seconds is not None
+                            and elapsed >= timeout_seconds
+                        ):
                             limit_error = "Codex turn exceeded its wall-time limit"
                         elif stdout.tell() > MAX_CODEX_STDOUT_BYTES:
                             limit_error = "Codex stdout exceeded its byte limit"

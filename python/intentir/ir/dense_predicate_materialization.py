@@ -36,7 +36,7 @@ from intentir.ir.contract_materialization import (
     ContractMaterializationProjection,
     project_contract_materialization,
 )
-from intentir.ir.model import IntentFunction, IntentOp
+from intentir.ir.model import IntentFunction, IntentOp, walk_intent_op_paths
 from intentir.verify.gate1.model import SemanticArchive
 
 
@@ -190,18 +190,7 @@ def _walk(
     body: Sequence[IntentOp],
     prefix: str = "body",
 ) -> tuple[tuple[str, IntentOp], ...]:
-    result: list[tuple[str, IntentOp]] = []
-    for index, operation in enumerate(body):
-        path = f"{prefix}[{index}]"
-        result.append((path, operation))
-        result.extend(_walk(operation.body, f"{path}.body"))
-        for polarity, arm in (
-            ("positive", operation.positive),
-            ("negative", operation.negative),
-        ):
-            if arm is not None:
-                result.extend(_walk(arm.body, f"{path}.{polarity}.body"))
-    return tuple(result)
+    return tuple(walk_intent_op_paths(body, prefix))
 
 
 def _results(operation: IntentOp) -> tuple[str, ...]:
@@ -391,7 +380,7 @@ def materialize_dense_load_predicates(
         extent
         for tensor in [*j.intent.inputs, *j.intent.outputs]
         for extent in tensor.shape
-        if isinstance(extent, str)
+        if isinstance(extent, str) and extent != "?"
     }
     value_dimensions = {
         item.value_ref: item.dimension_ref
@@ -461,7 +450,7 @@ def materialize_dense_load_predicates(
     prefix: list[IntentOp] = []
     broadcasts: dict[str, dict[str, tuple[int, ...]]] = {}
     records: list[PredicateMaterializationRecord] = []
-    mask_cache: dict[
+    predicate_value_cache: dict[
         tuple[str, tuple[int | str, ...]],
         tuple[str, tuple[int | str, ...], tuple[str, ...]],
     ] = {}
@@ -565,8 +554,8 @@ def materialize_dense_load_predicates(
             fill = 0
             guard_dominated = True
 
-        mask_key = (access.predicate, _shape_tuple(tensor.shape))
-        cached = mask_cache.get(mask_key)
+        predicate_key = (access.predicate, _shape_tuple(tensor.shape))
+        cached = predicate_value_cache.get(predicate_key)
         generated: list[str] = []
         if cached is None:
             components: list[tuple[str, tuple[int | str, ...], int | None]] = []
@@ -678,7 +667,11 @@ def materialize_dense_load_predicates(
                     for axis in range(len(tensor.shape))
                     if axis not in active_positions
                 ) if compact_shape else ()
-            mask_cache[mask_key] = (mask_value, mask_shape, mask_axes)
+            predicate_value_cache[predicate_key] = (
+                mask_value,
+                mask_shape,
+                mask_axes,
+            )
         else:
             mask_value, mask_shape, mask_axes = cached
 

@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Protocol
 
+from intentir.ir.canonical_j import canonicalize_gate1_artifact
 from intentir.extraction.providers.client import (
     DEFAULT_RESPONSES_TIMEOUT_SECONDS,
     XHIGH_RESPONSES_TIMEOUT_SECONDS,
@@ -15,7 +16,15 @@ from intentir.extraction.providers.client import (
 from intentir.extraction.providers.client import call_responses
 from intentir.extraction.providers.provider import ProviderConfig, get_provider
 
-from .codegen import CodeExtractionError, UnsafeReplayCodeError, extract_python_module
+from .codegen import (
+    CodeExtractionError,
+    TRITON_REPLAY_ABI_CONTRACT,
+    TRITON_REPLAY_API_CONTRACT,
+    TRITON_REPLAY_CONTROL_CONTRACT,
+    TRITON_REPLAY_STRUCTURE_CONTRACT,
+    UnsafeReplayCodeError,
+    extract_python_module,
+)
 from .compiler import (
     CompileCase,
     CompileResult,
@@ -25,7 +34,7 @@ from .compiler import (
 )
 from .cuda_codegen import extract_cuda_module
 from .cute_codegen import extract_cute_module
-from .model import Frontend, Gate1Artifact
+from .model import Frontend, Gate1Artifact, opaque_replay_representation
 from .pi import NORMALIZATION_WITNESS_SCHEMA
 from .prompt import (
     assert_source_isolated_payload,
@@ -46,8 +55,10 @@ from .ttir import (
 
 
 MINISWE_REPLAY_BACKEND = "minisweagent.intentir-replay.v34"
-MINISWE_REPLAY_TURN_TIMEOUT_SECONDS = 300.0
-MINISWE_REPLAY_XHIGH_TURN_TIMEOUT_SECONDS = 900.0
+# Keep a stalled CPA Replay turn bounded; the outer Replay lifecycle records
+# the failure and never duplicates a provider transport retry.
+MINISWE_REPLAY_TURN_TIMEOUT_SECONDS = 60.0
+MINISWE_REPLAY_XHIGH_TURN_TIMEOUT_SECONDS = 180.0
 RESPONSES_REPLAY_BACKEND = "openai.responses.intentir-replay.v1"
 STATIC_REPLAY_BACKEND = "intentir.static-replay-test.v1"
 REPLAY_CHECK_PROTOCOL = "intentir.scrc.replay-check.v15"
@@ -145,6 +156,825 @@ class _ReplayABIViolation(ValueError):
         super().__init__(rule_code)
 
 
+def _packet_c_slots(packet: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    c = packet.get("c")
+    if not isinstance(c, Mapping):
+        return []
+    slots = c.get("slots")
+    if not isinstance(slots, list):
+        return []
+    return [item for item in slots if isinstance(item, Mapping)]
+
+
+def _assigned_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Starred):
+        return _assigned_names(node.value)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        result: set[str] = set()
+        for item in node.elts:
+            result.update(_assigned_names(item))
+        return result
+    return set()
+
+
+def _constant_truth(
+    node: ast.AST,
+    constants: Mapping[str, bool | int | float | str] | None = None,
+) -> bool | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int)):
+        return bool(node.value)
+    if (
+        isinstance(node, ast.Name)
+        and constants is not None
+        and node.id in constants
+    ):
+        return bool(constants[node.id])
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        value = _constant_truth(node.operand, constants)
+        return None if value is None else not value
+    if isinstance(node, ast.BoolOp):
+        values = [_constant_truth(item, constants) for item in node.values]
+        if isinstance(node.op, ast.And):
+            if False in values:
+                return False
+            return True if all(item is True for item in values) else None
+        if isinstance(node.op, ast.Or):
+            if True in values:
+                return True
+            return False if all(item is False for item in values) else None
+    return None
+
+
+def _meaningfully_consumed_names(
+    function: ast.FunctionDef,
+    *,
+    constants: Mapping[str, bool | int | float | str] | None = None,
+) -> set[str]:
+    """Return callable handles that reach effective construction or control.
+
+    This is a small forward dependency interpreter, not a general Python
+    evaluator.  It preserves sequential assignment kills, merges control-flow
+    alternatives, and propagates control dependence through values that survive
+    a branch or loop.  That is sufficient for the reject-only C-handle check and
+    avoids both treating a dead overwritten use as effective and losing a use
+    that occurs in only one reachable branch.
+    """
+
+    @dataclass(frozen=True)
+    class SymbolicValue:
+        dependencies: frozenset[str]
+        identity: tuple[Any, ...]
+
+    parameter_names = {item.arg for item in function.args.args}
+    initial_state: dict[str, SymbolicValue] = {
+        name: SymbolicValue(frozenset({name}), ("parameter", name))
+        for name in parameter_names
+    }
+    closed_constants = dict(constants or {})
+
+    def symbolic(
+        node: ast.AST | None,
+        state: Mapping[str, SymbolicValue],
+    ) -> SymbolicValue:
+        if node is None:
+            return SymbolicValue(frozenset(), ("none",))
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                return state.get(
+                    node.id,
+                    SymbolicValue(
+                        frozenset({node.id}),
+                        ("free_name", node.id),
+                    ),
+                )
+            return SymbolicValue(
+                frozenset(),
+                ("stored_name", node.id),
+            )
+        if isinstance(node, ast.Constant):
+            return SymbolicValue(
+                frozenset(),
+                ("constant", type(node.value).__name__, repr(node.value)),
+            )
+
+        dependencies: set[str] = set()
+        fields: list[tuple[str, Any]] = []
+        for field_name, value in ast.iter_fields(node):
+            if isinstance(value, ast.AST):
+                child = symbolic(value, state)
+                dependencies.update(child.dependencies)
+                fields.append((field_name, child.identity))
+                continue
+            if isinstance(value, list):
+                identities: list[Any] = []
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        child = symbolic(item, state)
+                        dependencies.update(child.dependencies)
+                        identities.append(child.identity)
+                    else:
+                        identities.append(repr(item))
+                fields.append((field_name, tuple(identities)))
+                continue
+            fields.append((field_name, repr(value)))
+        return SymbolicValue(
+            frozenset(dependencies),
+            (type(node).__name__, tuple(fields)),
+        )
+
+    def call_name(node: ast.Call) -> str:
+        target = node.func
+        return (
+            target.attr
+            if isinstance(target, ast.Attribute)
+            else target.id
+            if isinstance(target, ast.Name)
+            else ""
+        )
+
+    def nested_effects(
+        node: ast.AST | None,
+        state: Mapping[str, SymbolicValue],
+    ) -> tuple[SymbolicValue, ...]:
+        if node is None:
+            return ()
+        result: list[SymbolicValue] = []
+        for item in ast.walk(node):
+            if not isinstance(item, ast.Call):
+                continue
+            name = call_name(item)
+            if name == "store" or name.startswith("atomic_"):
+                result.append(symbolic(item, state))
+        return tuple(result)
+
+    def standalone_call_may_have_effect(node: ast.Call) -> bool:
+        """Keep helper calls conservative without accepting discarded tl values.
+
+        A bare public value constructor does not consume an attached C handle
+        merely because Python evaluated it; its result must flow to an actual
+        effect or effective control decision. Stores and atomics are collected
+        by ``nested_effects``. Unknown named calls remain conservative because a
+        sibling JIT helper can own effects internally.
+        """
+
+        target = node.func
+        if isinstance(target, ast.Name):
+            return target.id not in {"bool", "float", "int", "range"}
+        if not isinstance(target, ast.Attribute):
+            return True
+        root: ast.AST = target.value
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if isinstance(root, ast.Name) and root.id in {"tl", "libdevice"}:
+            return False
+        # The safe Replay subset admits only Triton tensor conversion through
+        # arbitrary receiver attributes; conversion is a pure value operation.
+        return target.attr != "to"
+
+    def assigned_in(statements: list[ast.stmt]) -> set[str]:
+        result: set[str] = set()
+        for statement in statements:
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                result.add(statement.name)
+                continue
+            for item in ast.walk(statement):
+                if isinstance(item, ast.Name) and isinstance(item.ctx, ast.Store):
+                    result.add(item.id)
+        return result
+
+    def merge_states(
+        base: Mapping[str, SymbolicValue],
+        left: Mapping[str, SymbolicValue],
+        right: Mapping[str, SymbolicValue],
+        *,
+        controlled: set[str],
+        control: SymbolicValue,
+        selected: bool | None = None,
+    ) -> dict[str, SymbolicValue]:
+        result: dict[str, SymbolicValue] = {}
+        for name in set(base) | set(left) | set(right):
+            default = base.get(
+                name,
+                SymbolicValue(frozenset(), ("undefined", name)),
+            )
+            left_value = left.get(name, default)
+            right_value = right.get(name, default)
+            if selected is None:
+                merged_dependencies = set(left_value.dependencies)
+                merged_dependencies.update(right_value.dependencies)
+            else:
+                chosen = left_value if selected else right_value
+                merged_dependencies = set(chosen.dependencies)
+            if left_value.identity == right_value.identity:
+                result[name] = SymbolicValue(
+                    frozenset(merged_dependencies),
+                    left_value.identity,
+                )
+                continue
+            if name in controlled:
+                merged_dependencies.update(control.dependencies)
+            if selected is None:
+                identity = (
+                    "branch_value",
+                    control.identity,
+                    left_value.identity,
+                    right_value.identity,
+                )
+            else:
+                chosen = left_value if selected else right_value
+                other = right_value if selected else left_value
+                identity = (
+                    "specialized_branch_value",
+                    control.identity,
+                    selected,
+                    chosen.identity,
+                    other.identity,
+                )
+            result[name] = SymbolicValue(
+                frozenset(merged_dependencies),
+                identity,
+            )
+        return result
+
+    def process_block(
+        statements: list[ast.stmt],
+        incoming: Mapping[str, SymbolicValue],
+    ) -> tuple[dict[str, SymbolicValue], set[str], tuple[Any, ...]]:
+        state = dict(incoming)
+        meaningful: set[str] = set()
+        effects: list[Any] = []
+
+        for statement in statements:
+            if isinstance(statement, ast.Assign):
+                value = symbolic(statement.value, state)
+                statement_effects = nested_effects(statement.value, state)
+                for effect in statement_effects:
+                    meaningful.update(effect.dependencies)
+                    effects.append(effect.identity)
+                targets = [_assigned_names(item) for item in statement.targets]
+                if all(targets):
+                    for names in targets:
+                        for name in names:
+                            state[name] = value
+                else:
+                    meaningful.update(value.dependencies)
+                    for target in statement.targets:
+                        meaningful.update(symbolic(target, state).dependencies)
+                    effects.append(symbolic(statement, state).identity)
+                continue
+
+            if isinstance(statement, ast.AnnAssign):
+                value = symbolic(statement.value, state)
+                statement_effects = nested_effects(statement.value, state)
+                for effect in statement_effects:
+                    meaningful.update(effect.dependencies)
+                    effects.append(effect.identity)
+                targets = _assigned_names(statement.target)
+                if targets:
+                    for name in targets:
+                        state[name] = value
+                else:
+                    meaningful.update(value.dependencies)
+                    meaningful.update(
+                        symbolic(statement.target, state).dependencies
+                    )
+                    effects.append(symbolic(statement, state).identity)
+                continue
+
+            if isinstance(statement, ast.AugAssign):
+                value = symbolic(statement.value, state)
+                targets = _assigned_names(statement.target)
+                if targets:
+                    for name in targets:
+                        previous = state.get(
+                            name,
+                            SymbolicValue(
+                                frozenset({name}),
+                                ("free_name", name),
+                            ),
+                        )
+                        state[name] = SymbolicValue(
+                            previous.dependencies | value.dependencies,
+                            (
+                                "augmented",
+                                type(statement.op).__name__,
+                                previous.identity,
+                                value.identity,
+                            ),
+                        )
+                else:
+                    meaningful.update(value.dependencies)
+                    meaningful.update(
+                        symbolic(statement.target, state).dependencies
+                    )
+                    effects.append(symbolic(statement, state).identity)
+                for effect in nested_effects(statement.value, state):
+                    meaningful.update(effect.dependencies)
+                    effects.append(effect.identity)
+                continue
+
+            if isinstance(statement, ast.Expr):
+                if isinstance(statement.value, ast.Call):
+                    statement_effects = nested_effects(statement.value, state)
+                    for effect in statement_effects:
+                        meaningful.update(effect.dependencies)
+                        effects.append(effect.identity)
+                    if (
+                        not statement_effects
+                        and standalone_call_may_have_effect(statement.value)
+                    ):
+                        effect = symbolic(statement.value, state)
+                        meaningful.update(effect.dependencies)
+                        effects.append(effect.identity)
+                continue
+
+            if isinstance(statement, ast.If):
+                test = symbolic(statement.test, state)
+                truth = _constant_truth(statement.test, closed_constants)
+                left_state, left_meaningful, left_effectful = process_block(
+                    statement.body, state
+                )
+                right_state, right_meaningful, right_effectful = process_block(
+                    statement.orelse, state
+                )
+                controlled = assigned_in(statement.body) | assigned_in(
+                    statement.orelse
+                )
+                state = merge_states(
+                    state,
+                    left_state,
+                    right_state,
+                    controlled=controlled,
+                    control=test,
+                    selected=truth,
+                )
+                if truth is None:
+                    meaningful.update(left_meaningful)
+                    meaningful.update(right_meaningful)
+                elif truth:
+                    meaningful.update(left_meaningful)
+                else:
+                    meaningful.update(right_meaningful)
+                if left_effectful == right_effectful:
+                    effects.extend(left_effectful)
+                else:
+                    meaningful.update(test.dependencies)
+                    effects.append(
+                        (
+                            "conditional_effects",
+                            test.identity,
+                            truth,
+                            left_effectful,
+                            right_effectful,
+                        )
+                    )
+                continue
+
+            if isinstance(statement, (ast.For, ast.AsyncFor)):
+                iterator = symbolic(statement.iter, state)
+                loop_state = dict(state)
+                for name in _assigned_names(statement.target):
+                    loop_state[name] = SymbolicValue(
+                        iterator.dependencies,
+                        ("loop_target", iterator.identity),
+                    )
+                body_state, body_meaningful, body_effectful = process_block(
+                    statement.body, loop_state
+                )
+                controlled = assigned_in(statement.body) | _assigned_names(
+                    statement.target
+                )
+                state = merge_states(
+                    state,
+                    state,
+                    body_state,
+                    controlled=controlled,
+                    control=iterator,
+                )
+                else_state, else_meaningful, else_effectful = process_block(
+                    statement.orelse, state
+                )
+                state = else_state
+                meaningful.update(body_meaningful)
+                meaningful.update(else_meaningful)
+                if body_effectful:
+                    meaningful.update(iterator.dependencies)
+                    effects.append(
+                        ("loop_effects", iterator.identity, body_effectful)
+                    )
+                effects.extend(else_effectful)
+                continue
+
+            if isinstance(statement, ast.While):
+                test = symbolic(statement.test, state)
+                truth = _constant_truth(statement.test, closed_constants)
+                if truth is False:
+                    state, nested_meaningful, nested_effectful = process_block(
+                        statement.orelse, state
+                    )
+                    meaningful.update(nested_meaningful)
+                    effects.extend(nested_effectful)
+                    continue
+                body_state, body_meaningful, body_effectful = process_block(
+                    statement.body, state
+                )
+                controlled = assigned_in(statement.body)
+                state = merge_states(
+                    state,
+                    state,
+                    body_state,
+                    controlled=controlled,
+                    control=test,
+                )
+                state, else_meaningful, else_effectful = process_block(
+                    statement.orelse, state
+                )
+                meaningful.update(body_meaningful)
+                meaningful.update(else_meaningful)
+                if body_effectful:
+                    meaningful.update(test.dependencies)
+                    effects.append(
+                        ("while_effects", test.identity, body_effectful)
+                    )
+                effects.extend(else_effectful)
+                continue
+
+            if isinstance(statement, (ast.Return, ast.Raise, ast.Assert)):
+                effect = symbolic(statement, state)
+                meaningful.update(effect.dependencies)
+                effects.append(effect.identity)
+                continue
+
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                state[statement.name] = SymbolicValue(
+                    frozenset(),
+                    ("definition", statement.name),
+                )
+                continue
+
+            # Imports, pass/break/continue, and uncommon compound statements do
+            # not define the accepted Triton kernel subset.  Preserve safety by
+            # treating any dependencies they carry as effective rather than
+            # silently approving an attached C handle through unknown syntax.
+            effect = symbolic(statement, state)
+            meaningful.update(effect.dependencies)
+            if any(isinstance(item, ast.Call) for item in ast.walk(statement)):
+                effects.append(effect.identity)
+
+        return state, meaningful, tuple(effects)
+
+    _state, meaningful, _effectful = process_block(function.body, initial_state)
+    return meaningful & parameter_names
+
+
+def _assert_packet_c_matches_artifact(
+    packet: Mapping[str, Any], artifact: Gate1Artifact
+) -> None:
+    c = packet.get("c")
+    canonical_artifact = canonicalize_gate1_artifact(artifact)
+    if not canonical_artifact.c.slots:
+        if c is not None:
+            raise ValueError("J-only Replay packet must omit C")
+        return
+    if not isinstance(c, Mapping):
+        raise ValueError("Replay packet omitted required complete C")
+    canonical_artifact.c.validate_complete_values(path="Replay artifact C")
+    expected = canonical_artifact.rewriter_view(masked=False)["c"]
+    if dict(c) != expected:
+        raise ValueError("Replay packet complete C differs from the artifact")
+
+
+def _assert_packet_representation_matches_artifact(
+    packet: Mapping[str, Any], artifact: Gate1Artifact
+) -> None:
+    """Require the packet's typed representation view to be artifact-derived."""
+
+    expected = opaque_replay_representation(canonicalize_gate1_artifact(artifact))
+    u_f = packet.get("u_f")
+    actual = u_f.get("representation_contract") if isinstance(u_f, Mapping) else None
+    if expected:
+        if not isinstance(actual, Mapping) or dict(actual) != expected:
+            raise ValueError(
+                "Replay packet representation contract differs from the artifact"
+            )
+    elif actual is not None:
+        raise ValueError(
+            "Replay packet contains representation ownership absent from the artifact"
+        )
+
+
+def _check_triton_address_carrier_uses(
+    function: ast.FunctionDef,
+    carrier_names: set[str],
+    *,
+    forbidden_carrier_names: set[str] | frozenset[str] = frozenset(),
+) -> tuple[_ReplayABIViolation, ...]:
+    """Allow null-logical-ref scalars only in a closed pointer-address slice.
+
+    ``logical_ref=null`` is deliberately not a license to use an ABI scalar as
+    a hidden logical extent.  Real Triton call ABIs nevertheless carry physical
+    strides and related address operands, so rejecting every body reference
+    would make a valid non-contiguous tensor lowering impossible.  This check
+    resolves the small, source-independent distinction needed at ingress:
+
+    * transfer pointer operands and pointer-producing base/stride expressions
+      may consume a representation carrier;
+    * masks, values, predicates, shapes, loop bounds, and all other semantic
+      expressions may not consume it;
+    * a local derived from a carrier is checked transitively, so it cannot be
+      used once for addressing and then reused as a semantic value.
+
+    The routine is intentionally syntactic and conservative.  It does not
+    infer tensor layouts, J coordinates, or Source facts.
+    """
+
+    all_carrier_names = set(carrier_names) | set(forbidden_carrier_names)
+    if not all_carrier_names:
+        return ()
+
+    def call_name(node: ast.Call) -> str:
+        target = node.func
+        if isinstance(target, ast.Attribute):
+            return target.attr
+        if isinstance(target, ast.Name):
+            return target.id
+        return ""
+
+    def target_names(node: ast.AST) -> tuple[str, ...]:
+        if isinstance(node, ast.Name):
+            return (node.id,)
+        if isinstance(node, (ast.Tuple, ast.List)):
+            names: list[str] = []
+            for item in node.elts:
+                names.extend(target_names(item))
+            return tuple(names)
+        if isinstance(node, ast.Starred):
+            return target_names(node.value)
+        return ()
+
+    def transfer_pointer(node: ast.Call) -> ast.AST | None:
+        if len(node.args) > 0:
+            return node.args[0]
+        for keyword in node.keywords:
+            if keyword.arg in {"pointer", "ptr"}:
+                return keyword.value
+        return None
+
+    def named_argument(
+        node: ast.Call,
+        position: int,
+        names: set[str],
+    ) -> ast.AST | None:
+        if len(node.args) > position:
+            return node.args[position]
+        for keyword in node.keywords:
+            if keyword.arg in names:
+                return keyword.value
+        return None
+
+    transfer_names = {"load", "store"}
+
+    # Keep all local definitions in one conservative lexical map.  If a local
+    # is used as a pointer, all of its possible definitions must be address-only
+    # as well.  Loop targets are intentionally not reconstructed here: a carrier
+    # hidden in a loop iterator remains rejected rather than being guessed as an
+    # address definition.
+    definitions: dict[str, list[ast.AST]] = {}
+    reassigned_carriers: dict[str, ast.Name] = {}
+    for statement in ast.walk(function):
+        if isinstance(statement, ast.Assign):
+            value = statement.value
+            for target in statement.targets:
+                for name in target_names(target):
+                    definitions.setdefault(name, []).append(value)
+                    if name in all_carrier_names and isinstance(target, ast.Name):
+                        reassigned_carriers.setdefault(name, target)
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            value = statement.value
+            for name in target_names(statement.target):
+                definitions.setdefault(name, []).append(value)
+                if name in all_carrier_names and isinstance(statement.target, ast.Name):
+                    reassigned_carriers.setdefault(name, statement.target)
+        elif isinstance(statement, ast.AugAssign):
+            for name in target_names(statement.target):
+                definitions.setdefault(name, []).append(statement.value)
+                if name in all_carrier_names and isinstance(statement.target, ast.Name):
+                    reassigned_carriers.setdefault(name, statement.target)
+
+    address_nodes: set[int] = set()
+    visited_address_nodes: set[int] = set()
+    visiting_names: set[str] = set()
+
+    def mark_address_expression(expression: ast.AST | None) -> None:
+        if expression is None:
+            return
+        expression_id = id(expression)
+        if expression_id in visited_address_nodes:
+            return
+        visited_address_nodes.add(expression_id)
+
+        if isinstance(expression, ast.Name):
+            if isinstance(expression.ctx, ast.Load):
+                address_nodes.add(expression_id)
+                if expression.id not in carrier_names and expression.id not in visiting_names:
+                    visiting_names.add(expression.id)
+                    for definition in definitions.get(expression.id, ()):
+                        mark_address_expression(definition)
+                    visiting_names.remove(expression.id)
+            return
+        if isinstance(expression, ast.Constant):
+            return
+        if isinstance(expression, ast.Call):
+            called = call_name(expression)
+            if called in transfer_names or called.startswith("atomic_"):
+                mark_address_expression(transfer_pointer(expression))
+                return
+            if called == "make_block_ptr":
+                mark_address_expression(
+                    named_argument(expression, 0, {"base"})
+                )
+                mark_address_expression(
+                    named_argument(expression, 2, {"strides", "stride"})
+                )
+                return
+            if called in {"advance", "multiple_of", "max_contiguous"}:
+                for argument in expression.args:
+                    mark_address_expression(argument)
+                for keyword in expression.keywords:
+                    mark_address_expression(keyword.value)
+                return
+            if called == "cast":
+                mark_address_expression(
+                    named_argument(expression, 0, {"input", "x", "value"})
+                )
+                return
+            if called == "to" and isinstance(expression.func, ast.Attribute):
+                mark_address_expression(expression.func.value)
+                return
+            # A predicate-producing or value-producing call is not an address
+            # wrapper.  Do not recursively bless carrier uses hidden inside it.
+            return
+        if isinstance(expression, ast.IfExp):
+            # The condition is a predicate/control input, never an address
+            # carrier.  Only the selected pointer values belong to this slice.
+            mark_address_expression(expression.body)
+            mark_address_expression(expression.orelse)
+            return
+        if isinstance(expression, (ast.Compare, ast.BoolOp)):
+            return
+        if isinstance(expression, ast.Attribute):
+            mark_address_expression(expression.value)
+            return
+        for child in ast.iter_child_nodes(expression):
+            mark_address_expression(child)
+
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        called = call_name(node)
+        if called in transfer_names or called.startswith("atomic_"):
+            mark_address_expression(transfer_pointer(node))
+
+    dependency_cache: dict[int, frozenset[str]] = {}
+    dependency_stack: set[tuple[str, int]] = set()
+
+    def carrier_dependencies(expression: ast.AST | None) -> frozenset[str]:
+        if expression is None:
+            return frozenset()
+        expression_id = id(expression)
+        cached = dependency_cache.get(expression_id)
+        if cached is not None:
+            return cached
+        if isinstance(expression, ast.Name):
+            if not isinstance(expression.ctx, ast.Load):
+                result = frozenset()
+            elif expression.id in all_carrier_names:
+                result = frozenset({expression.id})
+            elif expression.id in definitions:
+                key = (expression.id, expression_id)
+                if key in dependency_stack:
+                    result = frozenset()
+                else:
+                    dependency_stack.add(key)
+                    result = frozenset(
+                        set().union(
+                            *(
+                                carrier_dependencies(definition)
+                                for definition in definitions[expression.id]
+                            )
+                        )
+                    )
+                    dependency_stack.remove(key)
+            else:
+                result = frozenset()
+            dependency_cache[expression_id] = result
+            return result
+        if isinstance(expression, ast.Constant):
+            result = frozenset()
+        elif isinstance(expression, ast.Call):
+            called = call_name(expression)
+            if called in transfer_names or called.startswith("atomic_"):
+                # The transfer result is tensor data, not an address carrier.
+                result = frozenset()
+            elif called == "make_block_ptr":
+                relevant = (
+                    named_argument(expression, 0, {"base"}),
+                    named_argument(expression, 2, {"strides", "stride"}),
+                )
+                result = frozenset(
+                    set().union(*(carrier_dependencies(item) for item in relevant))
+                )
+            elif called in {"advance", "multiple_of", "max_contiguous", "cast"}:
+                result = frozenset(
+                    set().union(
+                        *(
+                            carrier_dependencies(item)
+                            for item in expression.args
+                        ),
+                        *(
+                            carrier_dependencies(item.value)
+                            for item in expression.keywords
+                        ),
+                    )
+                )
+            elif called == "to" and isinstance(expression.func, ast.Attribute):
+                result = carrier_dependencies(expression.func.value)
+            else:
+                result = frozenset(
+                    set().union(
+                        *(carrier_dependencies(child) for child in ast.iter_child_nodes(expression))
+                    )
+                )
+        else:
+            result = frozenset(
+                set().union(
+                    *(carrier_dependencies(child) for child in ast.iter_child_nodes(expression))
+                )
+            )
+        dependency_cache[expression_id] = result
+        return result
+
+    first_bad: dict[str, ast.AST] = {}
+    used_address_carriers: set[str] = set()
+    for name, node in reassigned_carriers.items():
+        first_bad.setdefault(name, node)
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+            continue
+        if node.id in forbidden_carrier_names:
+            first_bad.setdefault(node.id, node)
+        dependencies = carrier_dependencies(node)
+        if not dependencies:
+            continue
+        if id(node) in address_nodes:
+            used_address_carriers.update(
+                name for name in dependencies if name in carrier_names
+            )
+            if not dependencies & set(forbidden_carrier_names):
+                continue
+        for name in dependencies:
+            if name in forbidden_carrier_names or id(node) not in address_nodes:
+                first_bad.setdefault(name, node)
+
+    for name in sorted(set(carrier_names) - used_address_carriers):
+        first_bad.setdefault(name, function)
+
+    violations: list[_ReplayABIViolation] = []
+    for name, node in sorted(
+        first_bad.items(),
+        key=lambda item: (getattr(item[1], "lineno", 0), getattr(item[1], "col_offset", 0), item[0]),
+    ):
+        violations.append(
+            _ReplayABIViolation(
+                "unowned_value_carrier_use_forbidden",
+                path=f"<parameter:{name}>",
+                handles=(name,),
+                line=getattr(node, "lineno", None),
+                expected={
+                    "allowed_use": (
+                        "pointer/address expression only for a carrier listed "
+                        "by representation_contract.address_bindings"
+                    ),
+                    "forbidden_use": (
+                        "any use for an unlisted carrier; shape, extent, grid, "
+                        "coordinate, predicate, fill, value, reducer, loop bound, "
+                        "or schedule"
+                    ),
+                },
+                observed={
+                    "use": (
+                        "unowned carrier read"
+                        if name in forbidden_carrier_names
+                        else "outside pointer/address expression"
+                    )
+                },
+            )
+        )
+    return tuple(violations[:20])
+
+
 def _check_triton_exact_abi(
     code: str,
     packet: Mapping[str, Any],
@@ -161,7 +991,7 @@ def _check_triton_exact_abi(
     j_parameters = packet["j"]["signature"]["parameters"]
     c_slots = [
         item
-        for item in packet["c"]["slots"]
+        for item in _packet_c_slots(packet)
         if item.get("kind") == "constexpr"
     ]
     expected_names = [
@@ -207,6 +1037,24 @@ def _check_triton_exact_abi(
         if item.get("kind") == "scalar"
         and item.get("logical_ref") is None
     }
+    u_f = packet.get("u_f")
+    representation_contract = (
+        u_f.get("representation_contract")
+        if isinstance(u_f, Mapping)
+        else None
+    )
+    address_bindings = (
+        representation_contract.get("address_bindings", [])
+        if isinstance(representation_contract, Mapping)
+        else []
+    )
+    owned_address_carriers = {
+        str(item.get("carrier"))
+        for item in address_bindings
+        if isinstance(item, Mapping) and isinstance(item.get("carrier"), str)
+    }
+    owned_address_carriers &= unowned_value_carriers
+    unowned_address_carriers = unowned_value_carriers - owned_address_carriers
     absent_carriers = {
         str(item["name"])
         for item in j_parameters
@@ -217,10 +1065,6 @@ def _check_triton_exact_abi(
         **{
             name: "specialization_carrier_use_forbidden"
             for name in specialization_carriers
-        },
-        **{
-            name: "unowned_value_carrier_use_forbidden"
-            for name in unowned_value_carriers
         },
         **{name: "absent_carrier_use_forbidden" for name in absent_carriers},
     }
@@ -252,13 +1096,16 @@ def _check_triton_exact_abi(
                 )
             )
     first_carrier_load: dict[str, ast.Name] = {}
+    attached_c_constexpr_names = {
+        str(item["name"])
+        for item in c_slots
+        if item.get("subject_ref") is not None
+    }
     for statement in function.body:
         for node in ast.walk(statement):
-            if (
-                isinstance(node, ast.Name)
-                and isinstance(node.ctx, ast.Load)
-                and node.id in forbidden_carriers
-            ):
+            if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load):
+                continue
+            if node.id in forbidden_carriers:
                 first_carrier_load.setdefault(node.id, node)
     for name, node in sorted(
         first_carrier_load.items(),
@@ -270,6 +1117,27 @@ def _check_triton_exact_abi(
                 path=f"<parameter:{name}>",
                 handles=(name,),
                 line=node.lineno,
+            )
+        )
+    violations.extend(
+        _check_triton_address_carrier_uses(
+            function,
+            owned_address_carriers,
+            forbidden_carrier_names=unowned_address_carriers,
+        )
+    )
+    c_values = packet.get("c", {}).get("values", {})
+    consumed_names = _meaningfully_consumed_names(
+        function,
+        constants=(c_values if isinstance(c_values, Mapping) else None),
+    )
+    for name in sorted(attached_c_constexpr_names - consumed_names):
+        violations.append(
+            _ReplayABIViolation(
+                "c_constexpr_handle_unused",
+                path=f"<parameter:{name}>",
+                handles=(name,),
+                line=function.lineno,
             )
         )
     return tuple(violations[:20])
@@ -818,7 +1686,7 @@ def _check_triton_typed_control_contract(
         if item.get("kind") == "constexpr"
     } | {
         str(item["name"])
-        for item in packet["c"]["slots"]
+        for item in _packet_c_slots(packet)
         if item.get("kind") == "constexpr"
     }
     actual = _runtime_if_nodes(
@@ -1252,7 +2120,12 @@ def _packet_compiled_iteration_contracts(
         if access is not None:
             tensor = access.get("tensor")
             shape = value_shapes.get(str(tensor))
-            if shape is not None and axis < len(shape) and isinstance(shape[axis], str):
+            if (
+                shape is not None
+                and axis < len(shape)
+                and isinstance(shape[axis], str)
+                and shape[axis] != "?"
+            ):
                 return shape[axis]
             return None
         operation = operation_by_node.get(subject)
@@ -1271,6 +2144,7 @@ def _packet_compiled_iteration_contracts(
                 and axis in axes
                 and axis < len(shape)
                 and isinstance(shape[axis], str)
+                and shape[axis] != "?"
             ):
                 return shape[axis]
             return None
@@ -1298,7 +2172,7 @@ def _packet_compiled_iteration_contracts(
             if shape is None or len(shape) != len(term):
                 continue
             for current, extent in zip(term, shape, strict=True):
-                if current == label and isinstance(extent, str):
+                if current == label and isinstance(extent, str) and extent != "?":
                     dimensions.add(extent)
         return next(iter(dimensions)) if len(dimensions) == 1 else None
 
@@ -1930,18 +2804,6 @@ def replay_source_ingress(
                 },
             ),
         )
-    if selected_frontend is not Frontend.TRITON:
-        return ReplayIngressResult(
-            "fail",
-            diagnostics=(
-                {
-                    "rule_code": "frontend_not_supported",
-                    "path": "<frontend>",
-                    "anonymous_handles": [],
-                    "line": None,
-                },
-            ),
-        )
     if packet is None:
         packet = build_rewriter_payload(
             artifact,
@@ -1949,22 +2811,55 @@ def replay_source_ingress(
             masked=False,
         )
     assert_source_isolated_payload(packet)
+    packet_frontend = packet.get("u_f", {}).get("frontend")
+    if packet_frontend != selected_frontend.value:
+        return ReplayIngressResult(
+            "fail",
+            diagnostics=(
+                {
+                    "rule_code": "frontend_packet_mismatch",
+                    "path": "<u_f.frontend>",
+                    "anonymous_handles": [],
+                    "line": None,
+                    "expected": {"frontend": selected_frontend.value},
+                    "observed": {"frontend": packet_frontend},
+                },
+            ),
+        )
+    _assert_packet_c_matches_artifact(packet, artifact)
+    _assert_packet_representation_matches_artifact(packet, artifact)
     try:
         code, entry = _extract_replay_code(
             source,
             frontend=selected_frontend,
             function_name=function_name,
         )
-        abi_violations = _check_triton_exact_abi(code, packet, function_name)
-        if abi_violations:
-            return ReplayIngressResult(
-                "fail",
-                diagnostics=tuple(
-                    _closed_ingress_diagnostic(item)
-                    for item in abi_violations
-                ),
+        if selected_frontend is Frontend.TRITON:
+            abi_violations = _check_triton_exact_abi(code, packet, function_name)
+            if abi_violations:
+                return ReplayIngressResult(
+                    "fail",
+                    diagnostics=tuple(
+                        _closed_ingress_diagnostic(item)
+                        for item in abi_violations
+                    ),
+                )
+            _check_triton_program_id_axes(code, function_name)
+        elif selected_frontend in {
+            Frontend.CUTE,
+            Frontend.TILELANG,
+            Frontend.CUDA,
+        }:
+            # The frontend-specific extractor owns the source language's
+            # canonical entry and static safety policy.  ABI binding and native
+            # IR/PTX observation remain in the matching Gate1 compiler; this
+            # ingress must not invent a Triton TTIR check for native sources.
+            if not code.strip():
+                raise ValueError("frontend Replay source is empty after extraction")
+        else:  # pragma: no cover - Frontend is a closed enum
+            raise ValueError(
+                f"source-blind Replay has no audited validator for {selected_frontend.value!r}"
             )
-        _check_triton_program_id_axes(code, function_name)
         # Replay construction preflight owns syntax and the exact J/C ABI only.
         # Pi is deliberately absent from the Replay packet; realization
         # differences are handled later by Gate1's fixed normalizer.
@@ -1990,6 +2885,14 @@ _SYNTHETIC_PROBE_DTYPES = {
     "i32": "int32",
     "i64": "int64",
     "u8": "uint8",
+    "u16": "uint16",
+    "u32": "uint32",
+    "ui8": "uint8",
+    "ui16": "uint16",
+    "ui32": "uint32",
+    "uint8": "uint8",
+    "uint16": "uint16",
+    "uint32": "uint32",
 }
 _COMPILE_LINE = re.compile(r"(?:CompilationError:\s*)?at\s+(\d+):\d+")
 _DIAGNOSTIC_HANDLE = re.compile(r"\b[pc][0-9]+\b")
@@ -2019,13 +2922,16 @@ def _synthetic_probe_scalar(dtype: str) -> bool | int | float | str:
 def build_source_blind_replay_compile_case(
     artifact: Gate1Artifact,
 ) -> CompileCase:
-    """Build a public deterministic compile profile from J/C declarations.
+    """Build a source-isolated compile profile from J and optional complete C.
 
-    The profile deliberately never reads ``C.values``, Source, Harness values,
-    the launch grid, or prior Gate evidence.  Tensor storage size is irrelevant
-    to Triton's pointer type during warmup, so every pointer uses one element;
-    public scalar/constexpr representatives are fixed by declared dtype.
+    J ABI values remain public deterministic placeholders. When C exists, its
+    exact implementation values are used as callable constexpr or external
+    compiler bindings. Tensor storage size is irrelevant to Triton's pointer
+    type during warmup, so every pointer uses one element.
     """
+
+    if artifact.c.slots:
+        artifact.c.validate_complete_values(path="Replay compile C")
 
     arguments: dict[str, RuntimeArgument] = {}
     schedule: dict[str, bool | int | float | str] = {}
@@ -2048,9 +2954,19 @@ def build_source_blind_replay_compile_case(
         else:  # pragma: no cover - closed enum defensive boundary
             raise ValueError(f"unsupported Replay probe parameter kind {kind!r}")
     for slot in artifact.c.slots:
-        if slot.kind.value != "constexpr":
+        value = artifact.c.values[slot.name]
+        if slot.kind.value == "compiler":
+            if slot.role in arguments or slot.role in schedule:
+                raise ValueError(
+                    f"compiler C role {slot.role!r} collides with a compile binding"
+                )
+            schedule[slot.role] = value
             continue
-        schedule[slot.name] = _synthetic_probe_scalar(slot.value_type)
+        if slot.name in arguments or slot.name in schedule:
+            raise ValueError(
+                f"C constexpr handle {slot.name!r} collides with a compile binding"
+            )
+        schedule[slot.name] = value
     return CompileCase(arguments, (1, 1, 1), schedule)
 
 
@@ -2623,14 +3539,39 @@ def _packet_required_compiled_program_ids(
     signature ``p*`` instances always share their already-existing callable ABI
     carrier.  This projection rejects extra compiled coordinates but never
     invents a coordinate.  On the active normalization-witness path, one
-    ``program_bindings`` row denotes one observed physical coordinate while its
-    named logical axes state only the closed J-side relation.  It deliberately
-    carries no physical axis identity, so source-aware reconciliation may check
-    the coordinate count but must leave axis identity hard for formal Gate1.
+    ``program_bindings`` row is a closed physical-coordinate mapping: its
+    ``axis`` is the observed launch axis and its named logical axes state the
+    J-side direct/product/guarded relation.  This lets the source-blind
+    compiled-obligation check retain both coordinate count and physical-axis
+    identity without deriving a coordinate formula.
     """
 
     j = packet.get("j")
     pi = packet.get("pi")
+    u_f = packet.get("u_f")
+    representation_contract = (
+        u_f.get("representation_contract")
+        if isinstance(u_f, Mapping)
+        else None
+    )
+    if isinstance(representation_contract, Mapping):
+        program_bindings = representation_contract.get("program_bindings", [])
+        if isinstance(program_bindings, list) and program_bindings:
+            axes_by_domain = {
+                str(item.get("domain_ref")): int(item["axis"])
+                for item in program_bindings
+                if isinstance(item, Mapping)
+                and isinstance(item.get("domain_ref"), str)
+                and isinstance(item.get("axis"), int)
+                and not isinstance(item.get("axis"), bool)
+            }
+            if len(axes_by_domain) == len(program_bindings):
+                expected_axes = tuple(sorted(set(axes_by_domain.values())))
+                return (
+                    len(expected_axes),
+                    tuple(sorted(axes_by_domain)),
+                    expected_axes,
+                )
     if not isinstance(j, Mapping) or not isinstance(pi, Mapping):
         return None, (), None
     boundary = j.get("boundary")
@@ -2654,9 +3595,20 @@ def _packet_required_compiled_program_ids(
             if program_axes_value:
                 return None, (), None
             claimed_domains: set[str] = set()
+            claimed_physical_axes: set[int] = set()
+            physical_axis_by_domain: dict[str, int] = {}
             for binding in program_bindings_value:
                 if not isinstance(binding, Mapping):
                     return None, (), None
+                physical_axis = binding.get("axis")
+                if (
+                    isinstance(physical_axis, bool)
+                    or not isinstance(physical_axis, int)
+                    or not 0 <= physical_axis <= 2
+                    or physical_axis in claimed_physical_axes
+                ):
+                    return None, (), None
+                claimed_physical_axes.add(physical_axis)
                 logical_axes = binding.get("logical_axes")
                 if not isinstance(logical_axes, list) or not logical_axes:
                     return None, (), None
@@ -2666,11 +3618,16 @@ def _packet_required_compiled_program_ids(
                     domain_ref = logical_axis.get("domain_ref")
                     if not isinstance(domain_ref, str) or domain_ref not in domain_refs:
                         return None, (), None
+                    previous_axis = physical_axis_by_domain.setdefault(
+                        domain_ref, physical_axis
+                    )
+                    if previous_axis != physical_axis:
+                        return None, (), None
                     claimed_domains.add(domain_ref)
             return (
-                len(program_bindings_value),
+                len(claimed_physical_axes),
                 tuple(sorted(claimed_domains)),
-                None,
+                tuple(sorted(claimed_physical_axes)),
             )
         axes_by_domain = {
             str(item.get("domain_ref")): int(item["axis"])
@@ -3292,12 +4249,24 @@ def source_blind_replay_compile_check(
     compiler: TritonCompiler | None = None,
     packet: Mapping[str, Any] | None = None,
 ) -> ReplayIngressResult:
-    """Compile Replay against the public synthetic profile, without an oracle.
+    """Compile Replay against the source-isolated J/optional-C profile.
 
     This check has no acceptance authority.  Formal Gate1 recompiles the exact
-    submitted bytes against the real c0 after the agent episode ends.
+    submitted bytes against the accepted artifact after the agent episode ends.
     """
 
+    selected_packet = (
+        packet
+        if packet is not None
+        else build_rewriter_payload(
+            artifact,
+            frontend=Frontend.TRITON,
+            masked=False,
+        )
+    )
+    assert_source_isolated_payload(selected_packet)
+    _assert_packet_c_matches_artifact(selected_packet, artifact)
+    _assert_packet_representation_matches_artifact(selected_packet, artifact)
     selected_compiler = compiler or TritonCompiler(timeout=120.0)
     try:
         source = KernelSource.from_replay(code, function_name)
@@ -3326,9 +4295,11 @@ def source_blind_replay_compile_check(
         )
     try:
         # This is a construction compile probe, not a semantic-membership oracle.
-        # Parsing proves only that the submitted source reaches the supported raw
-        # observer. Formal J/C closure remains exclusively outside the episode.
-        parse_ttir(result.ttir)
+        # Parsing proves that the submitted source reaches the supported raw
+        # observer.  The closed J/C obligation projection adds only reject-only
+        # cardinality/order checks already defined for this packet; formal
+        # Source-vs-Replay closure remains exclusively outside the episode.
+        fingerprint = parse_ttir(result.ttir)
     except TTIRParseError:
         return ReplayIngressResult(
             "fail",
@@ -3340,6 +4311,17 @@ def source_blind_replay_compile_check(
                     "line": None,
                 },
             ),
+        )
+    obligation_diagnostics = compiled_packet_obligation_diagnostics(
+        selected_packet,
+        result.ttir,
+        fingerprint=fingerprint,
+        path_prefix="<synthetic-frontend-compile>",
+    )
+    if obligation_diagnostics:
+        return ReplayIngressResult(
+            "fail",
+            diagnostics=obligation_diagnostics,
         )
     return ReplayIngressResult(
         "pass",
@@ -3453,6 +4435,49 @@ def _trajectory_bytes(trajectory: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def _frontend_replay_guidance(frontend: Frontend) -> str:
+    """Append the target-specific ownership boundary after shared guidance."""
+
+    if frontend is Frontend.TRITON:
+        return (
+            "\nFor this episode the frontend is Triton, so the Triton-specific "
+            "contracts above apply.\n"
+        )
+    if frontend is Frontend.CUDA:
+        return """
+Frontend-specific override: this episode is CUDA C++, not Triton Python. Return
+one standalone CUDA translation unit with exactly one 'extern "C" __global__'
+kernel named 'scrc_k0'; use the positional runtime ABI from J and keep C values
+as compile/launch choices rather than extra runtime parameters. Do not emit
+'tl.*', '@triton.jit', Triton program-id code, Python, host code, inline PTX, or
+any Triton-only operation/TTIR assumption. replay_ttir_inspect is unavailable
+for this frontend; the frontend-specific compile checker is the construction
+checkpoint and formal Gate1 owns the native PTX observation.
+"""
+    if frontend is Frontend.TILELANG:
+        return """
+Frontend-specific override: this episode is TileLang, not Triton. Return one
+self-contained module using exactly 'import tilelang.language as T' and one
+'@T.prim_func' named 'scrc_k0'; express the logical tensor ABI through public
+TileLang annotations and use only public TileLang CUDA realization APIs. Do not
+emit '@triton.jit', 'tl.*', CUDA host code, or assume a Triton TTIR. C values
+are compile-time schedule choices, never extra logical runtime parameters.
+replay_ttir_inspect is unavailable for this frontend; the frontend-specific
+compile checker is the construction checkpoint and formal Gate1 owns the native
+TileLang/PTX observation.
+"""
+    if frontend is Frontend.CUTE:
+        return """
+Frontend-specific override: this episode is NVIDIA CuTe, not Triton. Use only
+the public CuTe source and entry contract in 'frontend.json', keep the semantic
+runtime ABI positional, and construct representation-only objects inside the
+entry. Do not emit Triton Python or assume a Triton TTIR. The frontend-specific
+compile checker is the construction checkpoint and formal Gate1 owns the native
+CuTe MLIR/PTX observation.
+"""
+    raise ValueError(f"no source-blind frontend guidance for {frontend.value!r}")
+
+
 def _replay_input_files(
     artifact: Gate1Artifact,
     *,
@@ -3481,7 +4506,7 @@ def _replay_input_files(
         separators=(",", ":"),
     ) + "\n"
     compiler_index = materialize_replay_compiler_index(
-        semantic_program.to_json(), packet["c"]
+        semantic_program.to_json(), packet.get("c")
     )
     compiler_index_text = json.dumps(
         compiler_index.to_json(),
@@ -3490,13 +4515,19 @@ def _replay_input_files(
         allow_nan=False,
         separators=(",", ":"),
     ) + "\n"
-    mask_c_text = json.dumps(
-        packet["c"],
-        sort_keys=True,
-        ensure_ascii=False,
-        allow_nan=False,
-        indent=2,
-    ) + "\n"
+    c = packet.get("c")
+    c_text = (
+        json.dumps(
+            c,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=2,
+        )
+        + "\n"
+        if isinstance(c, Mapping)
+        else None
+    )
     frontend_text = json.dumps(
         packet["u_f"],
         sort_keys=True,
@@ -3504,17 +4535,25 @@ def _replay_input_files(
         allow_nan=False,
         indent=2,
     ) + "\n"
+    implementation_contract = (
+        "Complete C is present in `c.json` and `packet.json`. Its values are exact "
+        "implementation bindings. Keep every kind=constexpr c* as a callable "
+        "placeholder and use kind=compiler values only for external invocation.\n"
+        if c_text is not None
+        else "No C is required for this episode. Compile parameterized J directly "
+        "and retain every J.signature ABI placeholder.\n"
+    )
     instructions = """# Replay ownership contract
 
 J is the sole semantic authority: operators, operands, constants, predicates,
 domains, effects, result relations, and boundary index expressions come only from J.
-C is masked and supplies only its declared anonymous slot.
+""" + implementation_contract + TRITON_REPLAY_API_CONTRACT + TRITON_REPLAY_ABI_CONTRACT + TRITON_REPLAY_CONTROL_CONTRACT + TRITON_REPLAY_STRUCTURE_CONTRACT + """
 `semantic-program.intent` and `semantic-program.json` are deterministic, read-only,
 parameterized materializations of this episode's J. They are compiler input IR, not a
 target-source skeleton or a fourth artifact. Compile the complete semantic program;
 do not edit it. Source code, source
-compiler IR, Harness values, Gate evidence, previous Replay, and kernel templates do
-not exist in this episode.
+compiler IR, Harness facts beyond optional C, Gate evidence, previous Replay, and kernel
+templates do not exist in this episode.
 For Triton, a J scalar used only as a pointwise arithmetic value may remain
 specializable: use it directly in the tensor expression (for example
 `rhs * p2`). Never call `.to(...)` on such a parameter, because Triton may
@@ -3529,9 +4568,9 @@ add, remove, or alter J-owned values, predicates, domains, accesses, effects, re
 or relations. Physical realization is not an extra semantic input. It will be compared
 outside this episode after fixed normalization; no Gate observation is available here.
 
-`compiler-index.intent` merely puts existing J domain-dependency sets beside anonymous
-MaskC attachments. A dependency subset is syntactic, not a schedule or proof of domain
-containment. Use it to avoid reconstructing cross-references, then compile the complete
+`compiler-index.intent` merely puts existing J domain-dependency sets beside optional
+complete-C bindings and attachments. A dependency subset is syntactic, not a proof of
+domain containment. Use it to avoid reconstructing cross-references, then compile the complete
 `boundary_ownership` contract. Preserve every authored access/effect as a distinct logical
 occurrence and keep logical domain guards distinct from access-local predicates; choose
 all target realization yourself from S_J and public frontend capabilities.
@@ -3543,7 +4582,7 @@ Ordinary algebraic instruction selection may fold a J `add` whose one operand is
 exact all-zero constant, including when that identity node exists only to express a
 logical broadcasted output shape.  Preserve the other operand, output mapping, access
 shape, predicate and effect, but do not emit target add arithmetic for the identity.
-The declaration order of `boundary_ownership.access_effects` is J/C-owned observable
+The declaration order of `boundary_ownership.access_effects` is J-owned observable
 effect order: emit the corresponding loads, stores, atomics, and updates in that order.
 Do not postpone an earlier authored statistics store until after later parameter loads or
 another output store merely to group computations or outputs. One authored access with a
@@ -3594,7 +4633,7 @@ is not a launch domain and MUST NOT receive an independent `program_id`, except 
 the closed singleton additive-scatter update above. Do not merge
 distinct parallel J domains into a product coordinate. Within one multi-axis parallel J
 domain, you may instead use one linear `program_id(0)`, derive the per-axis tile counts,
-and decode it with div/rem. These choices depend only on J domain ownership and MaskC(C),
+and decode it with div/rem. These choices depend only on J domain ownership and optional C,
 never on Source, grid, or pi.
 For an untiled parallel/output domain whose affected J stores are scalar in that domain
 coordinate, use one scalar `program_id` directly. Do not manufacture `arange(0, 1)`, a
@@ -3605,7 +4644,7 @@ When a rank-2-or-higher dense full-rank tensor has a closed anonymous
 `block_order` attachment for every tensor axis, you MUST realize every access
 to that tensor with `tl.make_block_ptr`, not expanded flat-pointer arithmetic:
 use the
-J-authored shape and stride scalars, the decoded tile offsets, the attached
+J-authored shape/dimension scalars and ABI-owned stride/address carriers, the decoded tile offsets, the attached
 anonymous order slots, and `boundary_check` on the same axes. Use this only
 when the access/axis attachments make the grouping unambiguous.
 For this fully attached multi-axis case, compute every `num_tiles[d]` with
@@ -3620,7 +4659,7 @@ the J-authored accumulator across tiles, form each global contraction coordinate
 loop base plus the local range, retain the authored access predicate, then perform the final
 local reduction and store. Even when the current anonymous tile equals the current extent,
 retain this physical loop form rather than turning the contraction axis into a launch axis.
-This is source-blind target lowering from J plus MaskC(C), not a Source loop claim or a pi
+This is source-blind target lowering from J plus optional C, not a Source loop claim or a pi
 instruction. Do not apply this contraction-loop rule to an ordinary standalone J `reduce`.
 For the closed standalone diagonal-gather reduction case, however, a physical tiled
 accumulator loop is the canonical target realization: J has one scalar reduction whose
@@ -3684,10 +4723,10 @@ predicates. Reuse those same expanded coordinates for address formation. This
 canonical target form follows only from J access rank and predicate sharing; do
 not compare rank-one coordinates and only later expand the boolean results. A
 genuinely rank-one access remains rank-one.
-In the common J-only fill case (no logical inputs, one guarded output, one runtime extent,
-and one anonymous tile), cast `program_id`, `arange`, and the runtime extent
-individually only when the J-selected coordinate dtype requires it. Do not rely
-on implicit promotion of an already-combined coordinate.
+In the common guarded fill case with complete C (no logical inputs, one guarded
+output, one runtime extent, and one C tile attachment), cast `program_id`,
+`arange`, and the runtime extent individually only when the J-selected coordinate
+dtype requires it. Do not rely on implicit promotion of an already-combined coordinate.
 Conversely, do not invent an explicit cast for a scalar operand when J does not
 author one. An i32 stride multiplied by a J-authored i64 iota is written directly
 as `coordinate * stride`; let public mixed-integer promotion realize that consumer
@@ -3713,30 +4752,36 @@ optional guard elision, keep the guarded and unguarded memory operations lexical
 inside their respective alternatives. An always-true comparison or mask is not an
 unguarded access: do not hoist one masked operation out of those alternatives.
 """
+    instructions += _frontend_replay_guidance(frontend)
+    c_readme = (
+        "- `c.json`: exact complete C implementation configuration.\n"
+        if c_text is not None
+        else "- No C file is present; this is a parameterized J-only episode.\n"
+    )
     readme = """# IntentIR source-blind Replay input
 
 This immutable directory is the complete input allowlist for one fresh episode.
 
-- `packet.json`: exact J + MaskC(C) + public U_f.
+- `packet.json`: exact J, optional complete C, and public U_f.
 - `semantic-program.intent`: compact, typed, parameterized read-only S_J.
 - `semantic-program.json`: exact structured form of the same S_J.
-- `compiler-index.intent` / `.json`: compact exact S_J+MaskC cross-reference;
-  syntactic dependency index only, never a schedule.
-- `mask-c.json`: exact anonymous MaskC(C), with no valuation.
+- `compiler-index.intent` / `.json`: compact exact S_J plus optional C cross-reference.
+""" + c_readme + """
 - `frontend.json`: public source-neutral U_f and required callable entry.
 - `REPLAY_CONTRACT.md`: ownership and no-leak boundary.
 - `TOOL.md`: coding, query, compile, own-IR, checkpoint, and submit commands.
 
 Read files by path and only page sections needed for the current construction. No
-Source, real C value, CompileCase/grid, Gate result, history, repository, or network
-is available. S_J is derived only from this episode's J and contains no pi, C value,
+Source, CompileCase/grid, Gate result, history, repository, or network is available.
+S_J is derived only from this episode's J and contains no pi or C value,
 target operator, API, source statement, instruction selection, or repair.
 """
     tool = """# Replay agent tools
 
+""" + TRITON_REPLAY_API_CONTRACT + TRITON_REPLAY_ABI_CONTRACT + TRITON_REPLAY_CONTROL_CONTRACT + TRITON_REPLAY_STRUCTURE_CONTRACT + """
 Act like a compiler coding agent. Read `compiler-index.intent`,
-`semantic-program.intent`, `frontend.json`, and `mask-c.json` completely before
-drafting. Query exact J/S_J only for a named
+`semantic-program.intent`, and `frontend.json` completely; also read `c.json` when
+it is present. Query exact J/S_J/C only for a named
 cross-reference, and write one complete `/output/replay.source`.
 
 ```text
@@ -3798,19 +4843,22 @@ and is never visible here. Merely writing source that compiles creates at most a
 recoverable checkpoint; it does not submit or terminate the episode. Review your own
 TTIR and explicitly call `submit_replay`.
 """
+    tool += _frontend_replay_guidance(frontend)
+    files = {
+        "README.md": readme,
+        "packet.json": packet_text,
+        "semantic-program.json": semantic_program_text,
+        "semantic-program.intent": semantic_program.text,
+        "compiler-index.json": compiler_index_text,
+        "compiler-index.intent": compiler_index.text,
+        "frontend.json": frontend_text,
+        "REPLAY_CONTRACT.md": instructions + "\n",
+        "TOOL.md": tool,
+    }
+    if c_text is not None:
+        files["c.json"] = c_text
     return (
-        {
-            "README.md": readme,
-            "packet.json": packet_text,
-            "semantic-program.json": semantic_program_text,
-            "semantic-program.intent": semantic_program.text,
-            "compiler-index.json": compiler_index_text,
-            "compiler-index.intent": compiler_index.text,
-            "mask-c.json": mask_c_text,
-            "frontend.json": frontend_text,
-            "REPLAY_CONTRACT.md": instructions + "\n",
-            "TOOL.md": tool,
-        },
+        files,
         packet,
         instructions,
     )
@@ -3821,6 +4869,7 @@ class ResponsesReplayWriter:
     provider: ProviderConfig | None = None
     effort: str | None = None
     frontend: Frontend = Frontend.TRITON
+    compile_checker: ReplayCompileChecker | None = None
     _records: list[ReplayGeneration | ReplayAttempt] = field(
         default_factory=list, init=False, repr=False
     )
@@ -3832,6 +4881,10 @@ class ResponsesReplayWriter:
     def generate(
         self, artifact: Gate1Artifact, *, masked: bool = False
     ) -> ReplayGeneration:
+        if self.frontend is not Frontend.TRITON and self.compile_checker is None:
+            raise ValueError(
+                "native Responses Replay requires a frontend-specific compile checker"
+            )
         instructions, user = build_rewriter_prompt(
             artifact,
             frontend=self.frontend,
@@ -3862,6 +4915,47 @@ class ResponsesReplayWriter:
                 frontend=frontend,
                 function_name=function_name,
             )
+            ingress = replay_source_ingress(
+                code,
+                artifact=artifact,
+                frontend=frontend,
+                function_name=function_name,
+                packet=packet,
+            )
+            if ingress.status != "pass" or ingress.code is None:
+                raise ValueError(
+                    "Replay ingress rejected response: "
+                    + json.dumps(
+                        list(ingress.diagnostics),
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    )
+                )
+            code = ingress.code
+            entry_function_name = ingress.entry_function_name
+            if self.compile_checker is not None:
+                compile_result = self.compile_checker(
+                    code,
+                    artifact,
+                    function_name,
+                )
+                if not isinstance(compile_result, ReplayIngressResult):
+                    raise TypeError(
+                        "Replay compile checker must return ReplayIngressResult"
+                    )
+                if compile_result.status != "pass":
+                    raise ValueError(
+                        "Replay compile preflight rejected response: "
+                        + json.dumps(
+                            list(compile_result.diagnostics),
+                            sort_keys=True,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        )
+                    )
         except Exception as exc:
             attempt = ReplayAttempt(
                 model=reply.model,
@@ -3917,7 +5011,7 @@ class ResponsesReplayWriter:
 
 @dataclass
 class MiniSWEReplayWriter:
-    """Fresh bounded single-owner Replay agent; the current backend is Triton-only."""
+    """Fresh bounded single-owner source-blind Replay agent."""
 
     provider: ProviderConfig | None = None
     effort: str | None = None
@@ -3939,22 +5033,18 @@ class MiniSWEReplayWriter:
     def generate(
         self, artifact: Gate1Artifact, *, masked: bool = False
     ) -> ReplayGeneration:
-        if self.frontend is not Frontend.TRITON:
-            raise ValueError(
-                "MiniSWE Replay v2 fails closed for non-Triton frontends"
-            )
         provider = self.provider or get_provider()
         effective_effort = self.effort or provider.reasoning_effort
         timeout = self.model_timeout_seconds
         if timeout is None:
             provider_timeout = (
                 XHIGH_RESPONSES_TIMEOUT_SECONDS
-                if effective_effort.casefold() == "xhigh"
+                if effective_effort.casefold() in {"xhigh", "max"}
                 else DEFAULT_RESPONSES_TIMEOUT_SECONDS
             )
             turn_timeout = (
                 MINISWE_REPLAY_XHIGH_TURN_TIMEOUT_SECONDS
-                if effective_effort.casefold() == "xhigh"
+                if effective_effort.casefold() in {"xhigh", "max"}
                 else MINISWE_REPLAY_TURN_TIMEOUT_SECONDS
             )
             timeout = min(provider_timeout, turn_timeout)
@@ -3994,8 +5084,14 @@ class MiniSWEReplayWriter:
                 packet=packet,
             )
 
-        probe_compiler = TritonCompiler(timeout=120.0)
         compile_checker = self.compile_checker
+        probe_compiler: TritonCompiler | None = None
+        if compile_checker is None:
+            if self.frontend is not Frontend.TRITON:
+                raise ValueError(
+                    "native MiniSWE Replay requires a frontend-specific compile checker"
+                )
+            probe_compiler = TritonCompiler(timeout=120.0)
 
         def compile_check(source_text: str) -> dict[str, Any]:
             ingress_result = ingress(source_text)

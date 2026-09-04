@@ -22,6 +22,7 @@ from intentir.verify.scrc_batch import (
     SequentialSCRCBatchRunner,
     dry_run_executor,
 )
+from intentir.verify.scrc_runner import MAX_LIFT_CALLS
 from intentir.verify.workload_manifest import build_workload_manifest
 
 
@@ -538,6 +539,15 @@ def _parser() -> argparse.ArgumentParser:
         help="bounded formal relift/Replay/Gate1 rounds per candidate branch",
     )
     parser.add_argument(
+        "--max-lift-calls",
+        type=int,
+        default=MAX_LIFT_CALLS,
+        help=(
+            "maximum logical Lift invocations per candidate branch "
+            f"(1-{MAX_LIFT_CALLS})"
+        ),
+    )
+    parser.add_argument(
         "--pre-replay-rejections",
         type=int,
         default=None,
@@ -587,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
         "--gate2-workers",
         "--replay-width",
         "--gate1-rounds",
+        "--max-lift-calls",
         "--pre-replay-rejections",
     )
     explicitly_scheduled = any(
@@ -617,6 +628,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if not 1 <= args.gate1_rounds <= 12:
         print("--gate1-rounds must be in [1, 12]", file=sys.stderr)
+        return 2
+    if not 1 <= args.max_lift_calls <= MAX_LIFT_CALLS:
+        print(
+            f"--max-lift-calls must be in [1, {MAX_LIFT_CALLS}]",
+            file=sys.stderr,
+        )
         return 2
     if not 0 <= args.pre_replay_rejections <= 12:
         print(
@@ -777,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_branch_workers": args.max_branch_workers,
             "gate2_workers": args.gate2_workers,
             "gate1_rounds": args.gate1_rounds,
+            "max_lift_calls": args.max_lift_calls,
             "pre_replay_rejections": args.pre_replay_rejections,
         }
         progress = _LiveProgressEmitter(
@@ -975,6 +993,7 @@ def main(argv: list[str] | None = None) -> int:
                 lift_backend=args.lift_backend,
                 lift_workflow=args.lift_workflow,
                 replay_backend=args.replay_backend,
+                max_lift_calls=args.max_lift_calls,
             )
             callback = progress.callback(entry.case_id, entry.ordinal, 1)
             try:
@@ -990,6 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
                     replay_backend=args.replay_backend,
                     replay_width=args.replay_width,
                     max_gate1_rounds=args.gate1_rounds,
+                    max_lift_calls=args.max_lift_calls,
                     max_pre_replay_rejections=args.pre_replay_rejections,
                     progress_callback=callback,
                 )
@@ -1017,6 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
                             None,
                             None,
                             search.report.call_budget,
+                            stage_metrics=search.report.stage_metrics,
                         ),
                         search.lift,
                         search.replay_writers,
@@ -1135,11 +1156,13 @@ def main(argv: list[str] | None = None) -> int:
                     lift_backend=args.lift_backend,
                     lift_workflow=args.lift_workflow,
                     replay_backend=args.replay_backend,
+                    max_lift_calls=args.max_lift_calls,
                     search_metadata={
                         "protocol": CANDIDATE_FANOUT_PROTOCOL,
                         "branch_id": branch_id,
                         "candidate_count": args.candidates,
                         "replay_width": args.replay_width,
+                        "max_lift_calls": args.max_lift_calls,
                         "selection_rule": CANDIDATE_SELECTION_RULE,
                     },
                 )
@@ -1167,6 +1190,7 @@ def main(argv: list[str] | None = None) -> int:
                         replay_backend=args.replay_backend,
                         replay_width=args.replay_width,
                         max_gate1_rounds=args.gate1_rounds,
+                        max_lift_calls=args.max_lift_calls,
                         max_pre_replay_rejections=(
                             args.pre_replay_rejections
                         ),
@@ -1314,6 +1338,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 lift_backend=args.lift_backend,
                 replay_backend=args.replay_backend,
+                max_lift_calls=args.max_lift_calls,
             )
             return case_result
 

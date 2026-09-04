@@ -19,8 +19,8 @@ from typing import Any, Sequence
 
 from intentir.ir.canonical_j import ContractExpr, elaborate_j, j_elaboration
 from intentir.ir.contract_ir import CanonicalContractIR, project_contract_ir
-from intentir.ir.model import IntentOp
-from intentir.verify.gate1.model import SemanticArchive
+from intentir.ir.model import IntentOp, walk_intent_op_paths
+from intentir.verify.gate1.model import AliasKind, SemanticArchive
 
 
 CONTRACT_MATERIALIZATION_PROTOCOL = (
@@ -32,31 +32,8 @@ class ContractMaterializationError(ValueError):
     """A typed contract fact required by M0 cannot be projected uniquely."""
 
 
-def _child_regions(
-    operation: IntentOp,
-) -> tuple[tuple[str, Sequence[IntentOp]], ...]:
-    regions: list[tuple[str, Sequence[IntentOp]]] = [("body", operation.body)]
-    for name, arm in (
-        ("positive.body", operation.positive),
-        ("negative.body", operation.negative),
-    ):
-        if arm is not None:
-            regions.append((name, arm.body))
-    return tuple(regions)
-
-
-def _path_nodes(body: Sequence[IntentOp], prefix: str = "body") -> dict[str, IntentOp]:
-    result: dict[str, IntentOp] = {}
-    for index, operation in enumerate(body):
-        path = f"{prefix}[{index}]"
-        result[path] = operation
-        for suffix, region in _child_regions(operation):
-            result.update(_path_nodes(region, f"{path}.{suffix}"))
-    return result
-
-
 def _canonical_nodes(j: SemanticArchive) -> dict[str, IntentOp]:
-    by_path = _path_nodes(j.intent.body)
+    by_path = dict(walk_intent_op_paths(j.intent.body))
     result = dict(by_path)
     for node_id, path in j.node_ids.items():
         if path not in by_path:
@@ -284,8 +261,9 @@ def project_contract_materialization(
             )
 
     parameters = {parameter.name: parameter for parameter in canonical.signature.parameters}
-    declared_aliases = {
-        frozenset((alias.left, alias.right)) for alias in canonical.boundary.aliases
+    declared_alias_kinds = {
+        frozenset((alias.left, alias.right)): alias.kind
+        for alias in canonical.boundary.aliases
     }
     for parameter in canonical.signature.parameters:
         if parameter.alias_of is None:
@@ -298,10 +276,15 @@ def project_contract_materialization(
             and aliased.logical_ref is not None
             else None
         )
-        if logical_pair is None or logical_pair not in declared_aliases:
+        if (
+            logical_pair is None
+            or len(logical_pair) != 2
+            or declared_alias_kinds.get(logical_pair) is not AliasKind.MUST_ALIAS
+        ):
             unsupported.add(
                 "typed contract projection does not implement physical alias ABI "
-                f"{parameter.name}->{parameter.alias_of}"
+                f"{parameter.name}->{parameter.alias_of}; expected one "
+                "distinct logical pair with Boundary kind='must_alias'"
             )
 
     def register_broadcast(

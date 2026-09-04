@@ -475,7 +475,8 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
             "contract reference requires one closed typed ContractIR"
         ) from exc
     input_names = {item.name for item in canonical.intent.inputs}
-    output_names = {item.name for item in canonical.intent.outputs}
+    output_names = tuple(item.name for item in canonical.intent.outputs)
+    output_name_set = set(output_names)
     graph_operands = {
         operand for operation in operations for operand in operation.operands
     }
@@ -641,7 +642,7 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
                 )
             )
         elif access.kind == "store":
-            if access.tensor not in output_names:
+            if access.tensor not in output_name_set:
                 raise ContractReferenceUnsupportedError(
                     "contract reference v1 stores only logical J outputs"
                 )
@@ -692,7 +693,7 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
     if consumed_index_bounds != authored_index_bounds:
         raise ValueError("contract reference left an authored index bound unconsumed")
     stores_by_output = {item.access.tensor for item in stores}
-    if stores_by_output != output_names:
+    if stores_by_output != output_name_set:
         raise ContractReferenceUnsupportedError(
             "contract reference v1 requires authored stores for every output"
         )
@@ -704,7 +705,7 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
     }
     output_assemblies: list[IndexedOutputAssembly] = []
     assembly_results: set[str] = set()
-    for output in sorted(output_names):
+    for output in output_names:
         binding = output_bindings.get(output)
         if binding == output:
             continue
@@ -887,6 +888,10 @@ def _evaluate_array_program(
                 if expression.op == "floordiv"
                 else np.mod(values[0], values[1])
             )
+        if expression.op == "left_shift":
+            return np.left_shift(values[0], values[1])
+        if expression.op == "right_shift":
+            return np.right_shift(values[0], values[1])
         if expression.op in {"lt", "le", "gt", "ge", "eq", "ne"}:
             return {
                 "lt": np.less,

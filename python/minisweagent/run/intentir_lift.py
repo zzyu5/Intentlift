@@ -60,6 +60,7 @@ class _IntentIRLiftStageResult:
     elapsed_ms: float
     physical_provider_calls: int
     transport_retries: int
+    stage_metrics: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     caught: Exception | None = None
 
 
@@ -71,13 +72,33 @@ def load_intentir_lift_config() -> dict[str, Any]:
     return value
 
 
+def _provider_model_turn_metrics(
+    trajectory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Summarize provider-turn timings already recorded by the model."""
+
+    info = trajectory.get("info", {})
+    runtime = info.get("agent_runtime", {}) if isinstance(info, Mapping) else {}
+    attempts = runtime.get("provider_attempts", []) if isinstance(runtime, Mapping) else []
+    elapsed_ms = 0.0
+    count = 0
+    for attempt in attempts if isinstance(attempts, list) else []:
+        if not isinstance(attempt, Mapping):
+            continue
+        value = attempt.get("elapsed_ms")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            elapsed_ms += max(0.0, float(value))
+            count += 1
+    return {"elapsed_ms": elapsed_ms, "count": count}
+
+
 def create_intentir_lift_model(
     *,
     model_name: str,
     api_base: str,
     api_key: str,
     reasoning_effort: str,
-    timeout_seconds: float,
+    timeout_seconds: float | None,
     prompt_cache_key: str | None = None,
 ) -> LitellmResponseModel:
     """Configure the existing Responses model for an OpenAI-compatible CPA."""
@@ -88,6 +109,10 @@ def create_intentir_lift_model(
         "api_base": api_base,
         "api_key": api_key,
         "reasoning_effort": reasoning_effort,
+        # Keep the config JSON-serializable.  The existing Responses model
+        # converts an explicit None to an all-unbounded httpx Timeout only at
+        # the provider call boundary, where LiteLLM's ``timeout or`` fallback
+        # cannot reintroduce its finite default.
         "timeout": timeout_seconds,
     }
     if prompt_cache_key:
@@ -110,10 +135,18 @@ def _run_agent_stage(
 ) -> _IntentIRLiftStageResult:
     """Run one fresh or branch-continuation context and read its opaque output."""
 
+    stage_started = time.monotonic()
+    reset_execution_metrics = getattr(
+        environment, "reset_stage_execution_metrics", None
+    )
+    if callable(reset_execution_metrics):
+        reset_execution_metrics()
     physical_before = getattr(model, "physical_provider_calls", None)
     retries_before = getattr(model, "transport_retries", None)
+    initialization_started = time.monotonic()
     agent = DefaultAgent(model, environment, **dict(agent_config))
-    started = time.monotonic()
+    initialization_elapsed_ms = (time.monotonic() - initialization_started) * 1000.0
+    agent_started = time.monotonic()
     caught: Exception | None = None
     try:
         terminal = (
@@ -124,8 +157,10 @@ def _run_agent_stage(
     except Exception as exc:
         caught = exc
         terminal = {"exit_status": type(exc).__name__, "submission": ""}
+    agent_elapsed_ms = (time.monotonic() - agent_started) * 1000.0
     exit_status = str(terminal.get("exit_status", ""))
     output_text: str | None = None
+    candidate_read_started = time.monotonic()
     if exit_status == "Submitted":
         try:
             output_text = output_reader()
@@ -145,8 +180,12 @@ def _run_agent_stage(
             else:
                 if output_text is not None:
                     exit_status = "SubmittedCheckpoint"
-    elapsed_ms = (time.monotonic() - started) * 1000.0
+    candidate_read_elapsed_ms = (
+        time.monotonic() - candidate_read_started
+    ) * 1000.0
+    serialization_started = time.monotonic()
     trajectory = agent.save(None)
+    serialization_elapsed_ms = (time.monotonic() - serialization_started) * 1000.0
     physical_after = getattr(model, "physical_provider_calls", None)
     retries_after = getattr(model, "transport_retries", None)
     physical_calls = (
@@ -163,14 +202,40 @@ def _run_agent_stage(
         and retries_after >= retries_before
         else 0
     )
+    action_metrics = getattr(environment, "stage_execution_metrics", None)
+    if callable(action_metrics):
+        action_metrics = action_metrics()
+    if not isinstance(action_metrics, Mapping):
+        action_metrics = {"elapsed_ms": 0.0, "count": 0, "failures": 0}
+    stage_metrics = {
+        "agent_initialization": {
+            "elapsed_ms": initialization_elapsed_ms,
+        },
+        "agent_loop": {
+            "elapsed_ms": agent_elapsed_ms,
+            "model_calls": agent.n_calls,
+        },
+        "provider_model_turn": _provider_model_turn_metrics(trajectory),
+        "tool_action": dict(action_metrics),
+        "candidate_read": {
+            "elapsed_ms": candidate_read_elapsed_ms,
+        },
+        "trajectory_serialization": {
+            "elapsed_ms": serialization_elapsed_ms,
+        },
+        "lift_stage_total": {
+            "elapsed_ms": (time.monotonic() - stage_started) * 1000.0,
+        },
+    }
     return _IntentIRLiftStageResult(
         output_text=output_text,
         trajectory=trajectory,
         exit_status=exit_status,
         model_calls=agent.n_calls,
-        elapsed_ms=elapsed_ms,
+        elapsed_ms=stage_metrics["lift_stage_total"]["elapsed_ms"],
         physical_provider_calls=physical_calls,
         transport_retries=transport_retries,
+        stage_metrics=stage_metrics,
         caught=caught,
     )
 
@@ -188,6 +253,7 @@ def _public_result(
         elapsed_ms=stage.elapsed_ms,
         physical_provider_calls=stage.physical_provider_calls,
         transport_retries=stage.transport_retries,
+        stage_metrics=stage.stage_metrics,
         continued_from_messages=continued_from_messages,
     )
 

@@ -15,11 +15,16 @@ The pass pipeline below is the empirically-verified path on **system MLIR
              nvvm-attach-target{chip=sm_120a}
              gpu-module-to-binary                 # translate + llc + ptxas -> cubin
 
-Notes: ``use-bare-ptr-memref-call-conv`` is locked from here on so kernel args
-are bare pointers (matches the CUDA Driver-API launch on torch pointers and
-sidesteps the memref-descriptor ABI). The elementwise add path carries no
-barrier/shuffle, so the MLIR-20-vs-21 ``gpu.barrier`` intrinsic divergence (see
-roadmap R5) does not bite here.
+Notes: ``use-bare-ptr-memref-call-conv`` is the default for statically shaped
+kernel arguments so dense kernel args are bare pointers (matching the CUDA
+Driver-API launch on torch pointers).  Ragged lowering explicitly disables the
+kernel bare-pointer calling convention: its dynamic destination is a ranked
+memref, and the device receives the flattened descriptor fields
+(allocated/aligned pointers, offset, sizes, and strides).  MLIR's CUDA
+bare-pointer conversion requires every memref shape to be static, while the
+host-side Ragged member allocation remains data-dependent.
+The elementwise add path carries no barrier/shuffle, so the MLIR-20-vs-21
+``gpu.barrier`` intrinsic divergence (see roadmap R5) does not bite here.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from intentir.backend.toolchain.tools import INTENT_OPT, MLIR_OPT
+from intentir.ir.intent_op_contract import RAGGED_OPS
 
 CUDA_BIN = os.environ.get("CUDA_BIN", "/usr/local/cuda-12.8/bin")
 CHIP = os.environ.get("INTENT_GPU_CHIP", "sm_120a")
@@ -41,9 +47,62 @@ CHIP = os.environ.get("INTENT_GPU_CHIP", "sm_120a")
 # artifact parsing must use the MLIR grammar instead of the narrower ``\w+``.
 _MLIR_BARE_SYMBOL_RE = r"[A-Za-z_][A-Za-z0-9_.$]*"
 
+
+def _has_ragged_ops(source: str) -> bool:
+    return any(f"intent.{name}" in source for name in RAGGED_OPS)
+
+
+def _has_structured_ragged_region(source: str) -> bool:
+    """Return whether Ragged is used inside a structured Intent region.
+
+    The dedicated CUDA Ragged pass owns the direct carrier/query ABI.  A
+    structured loop must first go through the shared Intent-to-Linalg lowering
+    so local Ragged producers/queries are rewritten before the loop is cloned;
+    routing it to the straight-line pass was the remaining backend split.
+    """
+
+    return _has_ragged_ops(source) and re.search(
+        r"\bintent\.loop\b", source
+    ) is not None
+
+
+def _validate_ragged_lowering(source: str, lowered: str) -> None:
+    if not _has_ragged_ops(source):
+        return
+    if _has_ragged_ops(lowered):
+        raise RuntimeError(
+            "CUDA Ragged capability boundary left an Intent Ragged operation "
+            "after -convert-intent-ragged-to-gpu"
+        )
+    if "tuple<" in lowered:
+        raise RuntimeError(
+            "CUDA Ragged capability boundary left a tuple descriptor in the "
+            "target ABI"
+        )
+    if "gpu.launch" not in lowered:
+        raise RuntimeError(
+            "CUDA Ragged lowering produced no gpu.launch for the admitted query"
+        )
+
+
+def _validate_shared_ragged_lowering(source: str, lowered: str) -> None:
+    """Check the common lowering's descriptor boundary before GPU passes."""
+
+    if not _has_ragged_ops(source):
+        return
+    if _has_ragged_ops(lowered):
+        raise RuntimeError(
+            "CUDA structured Ragged lowering left a high-level Ragged operation"
+        )
+    if "tuple<" in lowered:
+        raise RuntimeError(
+            "CUDA structured Ragged lowering left a tuple descriptor in the ABI"
+        )
+
 _FRONT_PASSES = [
     "-one-shot-bufferize=bufferize-function-boundaries=true "
-    "function-boundary-type-conversion=identity-layout-map",
+    "function-boundary-type-conversion=identity-layout-map "
+    "allow-return-allocs-from-loops=true",
     "-convert-linalg-to-parallel-loops",
     "-gpu-map-parallel-loops",
     "-convert-parallel-loops-to-gpu",
@@ -67,11 +126,12 @@ _DEVICE_PREP_PASSES = [
 # ourselves: the integrated `cubin-format=bin` serializer silently drops kernels
 # that call an LLVM intrinsic (e.g. our ex2.approx exp), producing a cubin with
 # no `.text` section. Manual ptxas on the identical PTX is correct.
-def _device_pipeline() -> str:
-    return (
+def _device_pipeline(*, kernel_bare_ptr: bool = True) -> str:
+    pipeline = (
         f'--gpu-lower-to-nvvm-pipeline=cubin-chip={CHIP} cubin-format=isa '
-        "kernel-bare-ptr-calling-convention=true"
+        f"kernel-bare-ptr-calling-convention={'true' if kernel_bare_ptr else 'false'}"
     )
+    return pipeline
 
 
 @dataclass
@@ -112,10 +172,26 @@ def _unescape_mlir_bytes(s: str) -> bytes:
 def lower_to_binary_mlir(intent_mlir: str | os.PathLike) -> str:
     """intent MLIR file -> module with one gpu.binary (PTX assembly) per kernel."""
     src = Path(intent_mlir).read_text()
-    linalg = _run([INTENT_OPT, "-convert-intent-to-linalg"], stdin=src)
-    front = _run([MLIR_OPT, *_FRONT_PASSES], stdin=linalg)
+    has_ragged = _has_ragged_ops(src)
+    if has_ragged and not _has_structured_ragged_region(src):
+        lowered = _run(
+            [INTENT_OPT, "-convert-intent-ragged-to-gpu"],
+            stdin=src,
+        )
+        _validate_ragged_lowering(src, lowered)
+    else:
+        lowered = _run([INTENT_OPT, "-convert-intent-to-linalg"], stdin=src)
+        if has_ragged:
+            _validate_shared_ragged_lowering(src, lowered)
+    front = _run([MLIR_OPT, *_FRONT_PASSES], stdin=lowered)
     prepped = _run([INTENT_OPT, *_DEVICE_PREP_PASSES], stdin=front)
-    return _run([MLIR_OPT, _device_pipeline()], stdin=prepped)
+    return _run(
+        [
+            MLIR_OPT,
+            _device_pipeline(kernel_bare_ptr=not has_ragged),
+        ],
+        stdin=prepped,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -156,6 +232,11 @@ def lower_to_binary_mlir_fused(
     """Like ``lower_to_binary_mlir`` but fuses the pointwise chain into ONE tiled
     GPU kernel (see ``_fused_front_passes``)."""
     src = Path(intent_mlir).read_text()
+    if _has_ragged_ops(src):
+        raise RuntimeError(
+            "CUDA Ragged graphs require the descriptor-aware CUDA lowering; "
+            "the elementwise fusion pipeline is not an ABI-compatible path"
+        )
     linalg = _run([INTENT_OPT, "-convert-intent-to-linalg"], stdin=src)
     front = _run([MLIR_OPT, *_fused_front_passes(tile)], stdin=linalg)
     prepped = _run([INTENT_OPT, *_DEVICE_PREP_PASSES], stdin=front)
@@ -206,8 +287,12 @@ def lower_memref_module_to_kernels(
     src = Path(mlir).read_text() if os.path.exists(str(mlir)) else str(mlir)
     front = _run([MLIR_OPT, *_DEVICE_FRONT_PASSES], stdin=src)
     prepped = _run([INTENT_OPT, *_DEVICE_PREP_PASSES], stdin=front)
-    pipeline = (["-convert-scf-to-cf", _device_pipeline()] if scf_to_cf
-                else [_device_pipeline()])
+    device_pipeline = _device_pipeline(kernel_bare_ptr="memref<?" not in src)
+    pipeline = (
+        ["-convert-scf-to-cf", device_pipeline]
+        if scf_to_cf
+        else [device_pipeline]
+    )
     return _extract_kernels(_run([MLIR_OPT, *pipeline], stdin=prepped))
 
 

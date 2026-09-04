@@ -4,11 +4,25 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping
 
 from intentir.ir.canonical_j import canonicalize_gate1_artifact
-from .model import Frontend, Gate1Artifact, SchemaError
+from .codegen import (
+    TRITON_REPLAY_ABI_CONTRACT,
+    TRITON_REPLAY_API_CONTRACT,
+    TRITON_REPLAY_CONTROL_CONTRACT,
+    TRITON_REPLAY_STRUCTURE_CONTRACT,
+)
+from .model import (
+    Frontend,
+    Gate1Artifact,
+    ImplementationConfig,
+    SchemaError,
+    _nested_root_owned_field_paths,
+    opaque_replay_representation,
+)
 
 
 REPLAY_PACKET_SCHEMA = "intentir.scrc.replay-input.v3"
@@ -22,21 +36,34 @@ PUBLIC_FRONTEND_CONTEXT = {
         "compile_entry_contract": (
             "Write one self-contained public Triton module with exactly one "
             "@triton.jit function named scrc_k0. Its parameters are the declared "
-            "J.signature handles, followed in order by MaskC(C) slots whose kind "
-            "is constexpr and which remain annotated tl.constexpr; kind=compiler "
-            "slots belong only to the external invocation. J alone supplies "
-            "semantics. Physical realization remains the Replay compiler's "
-            "source-blind target choice and is checked only outside this packet."
+            "J.signature handles, followed in order by complete C slots whose kind "
+            "is constexpr and which remain annotated tl.constexpr. Their C values "
+            "are exact compile bindings, not replacements for the callable handles; "
+            "kind=compiler slots belong only to the external invocation. When C is "
+            "absent, compile the parameterized J directly. J alone supplies semantics. "
+            "Physical realization remains the Replay compiler's source-blind target "
+            "choice and is checked only outside this packet. If U_f contains a "
+            "representation_contract, it is a closed typed ABI/launch binding; "
+            "use it exactly and do not infer a replacement from parameter order. "
+            + TRITON_REPLAY_API_CONTRACT.strip()
+            + " "
+            + TRITON_REPLAY_ABI_CONTRACT.strip()
+            + " "
+            + TRITON_REPLAY_CONTROL_CONTRACT.strip()
+            + " "
+            + TRITON_REPLAY_STRUCTURE_CONTRACT.strip()
         ),
     },
     "cute": {
-        "retrieval_scope": "public NVIDIA CuTe DSL documentation and public examples",
+        "retrieval_scope": "public NVIDIA CuTe documentation and public examples",
         "tool_access": ["public_document_lookup"],
         "compile_entry": "scrc_entry",
         "compile_entry_contract": (
             "Define one @cute.jit scrc_entry after the requested @cute.kernel. "
             "Its positional arguments are J tensor inputs, inouts, then outputs, "
-            "followed by stream; construct representation-only descriptors inside it."
+            "followed by stream; construct representation-only descriptors inside it. "
+            "Optional C values may configure representation or launch choices but "
+            "never add device or entry runtime parameters."
         ),
     },
     "tilelang": {
@@ -96,7 +123,7 @@ _REPLAY_COMPONENT_KEYS = {
             "dimension_relations",
         }
     ),
-    "c": frozenset({"slots"}),
+    "c": frozenset({"slots", "values"}),
 }
 _LEGACY_PI_KEYS = frozenset(
     {
@@ -132,9 +159,187 @@ _U_F_KEYS = frozenset(
         "tool_access",
         "compile_entry",
         "compile_entry_contract",
+        "representation_contract",
     }
 )
 _U_F_PACKET_KEYS = frozenset({"protocol", "frontend", "replay_function"})
+
+_REPRESENTATION_CONTRACT_KEYS = frozenset(
+    {"address_bindings", "program_bindings"}
+)
+_ADDRESS_BINDING_KEYS = frozenset(
+    {"carrier", "access_ref", "tensor", "axis", "role"}
+)
+_PROGRAM_BINDING_KEYS = frozenset({"domain_ref", "axis"})
+
+
+def _validate_representation_contract(
+    value: Any,
+    *,
+    j: Mapping[str, Any],
+    path: str,
+) -> None:
+    """Validate the closed source-blind ABI/launch representation view."""
+
+    if not isinstance(value, Mapping):
+        raise SchemaError(f"{path} must be an object")
+    unknown = sorted(set(value) - _REPRESENTATION_CONTRACT_KEYS)
+    if unknown:
+        raise SchemaError(
+            f"{path} has unknown field(s): {unknown}"
+        )
+    if not any(value.get(key) for key in _REPRESENTATION_CONTRACT_KEYS):
+        raise SchemaError(f"{path} must contain at least one binding")
+
+    signature = j.get("signature")
+    raw_parameters = (
+        signature.get("parameters")
+        if isinstance(signature, Mapping)
+        else None
+    )
+    parameters = {
+        str(item.get("name")): item
+        for item in raw_parameters or []
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+    boundary = j.get("boundary")
+    raw_accesses = (
+        boundary.get("accesses")
+        if isinstance(boundary, Mapping)
+        else None
+    )
+    accesses = {
+        str(item.get("access_id")): item
+        for item in raw_accesses or []
+        if isinstance(item, Mapping) and isinstance(item.get("access_id"), str)
+    }
+    raw_domains = boundary.get("domains") if isinstance(boundary, Mapping) else None
+    domains = set(raw_domains) if isinstance(raw_domains, Mapping) else set()
+    intent = j.get("intent")
+    intent_function = (
+        intent.get("intent_function")
+        if isinstance(intent, Mapping)
+        else None
+    )
+    tensor_ranks = {
+        str(item.get("name")): len(item.get("shape", []))
+        for key in ("inputs", "outputs")
+        for item in (
+            intent_function.get(key, [])
+            if isinstance(intent_function, Mapping)
+            else []
+        )
+        if isinstance(item, Mapping)
+        and isinstance(item.get("name"), str)
+        and isinstance(item.get("shape"), list)
+    }
+
+    def require_handle(raw: Any, pattern: str, field_path: str) -> str:
+        if not isinstance(raw, str) or re.fullmatch(pattern, raw) is None:
+            raise SchemaError(
+                f"{field_path} must be an anonymous declaration-order handle"
+            )
+        return raw
+
+    address_bindings = value.get("address_bindings", [])
+    if not isinstance(address_bindings, list):
+        raise SchemaError(f"{path}.address_bindings must be an array")
+    seen_address_rows: set[tuple[str, str, int, str]] = set()
+    seen_access_axes: dict[tuple[str, int], str] = {}
+    for index, raw in enumerate(address_bindings):
+        item_path = f"{path}.address_bindings[{index}]"
+        if not isinstance(raw, Mapping):
+            raise SchemaError(f"{item_path} must be an object")
+        actual = set(raw)
+        if actual != _ADDRESS_BINDING_KEYS:
+            missing = sorted(_ADDRESS_BINDING_KEYS - actual)
+            extra = sorted(actual - _ADDRESS_BINDING_KEYS)
+            detail = []
+            if missing:
+                detail.append(f"missing={missing}")
+            if extra:
+                detail.append(f"unknown={extra}")
+            raise SchemaError(f"{item_path} has invalid fields ({', '.join(detail)})")
+        carrier = require_handle(
+            raw["carrier"], r"p[0-9]+", f"{item_path}.carrier"
+        )
+        access_ref = require_handle(
+            raw["access_ref"], r"a[0-9]+", f"{item_path}.access_ref"
+        )
+        tensor = require_handle(
+            raw["tensor"], r"t[0-9]+", f"{item_path}.tensor"
+        )
+        parameter = parameters.get(carrier)
+        if (
+            parameter is None
+            or parameter.get("kind") != "scalar"
+            or parameter.get("logical_ref") is not None
+        ):
+            raise SchemaError(
+                f"{item_path}.carrier must be a null-logical-ref scalar parameter"
+            )
+        access = accesses.get(access_ref)
+        if access is None:
+            raise SchemaError(f"{item_path}.access_ref references unknown access")
+        if access.get("tensor") != tensor:
+            raise SchemaError(
+                f"{item_path}.tensor must equal the referenced access tensor"
+            )
+        axis = raw["axis"]
+        if isinstance(axis, bool) or not isinstance(axis, int) or axis < 0:
+            raise SchemaError(f"{item_path}.axis must be a non-negative integer")
+        rank = tensor_ranks.get(tensor)
+        if rank is None or axis >= rank:
+            raise SchemaError(f"{item_path}.axis exceeds the referenced tensor rank")
+        if raw["role"] != "stride":
+            raise SchemaError(f"{item_path}.role must be 'stride'")
+        row_key = (carrier, access_ref, axis, raw["role"])
+        if row_key in seen_address_rows:
+            raise SchemaError(f"{item_path} duplicates an address ownership row")
+        seen_address_rows.add(row_key)
+        access_axis = (access_ref, axis)
+        previous = seen_access_axes.get(access_axis)
+        if previous is not None and previous != carrier:
+            raise SchemaError(
+                f"{item_path} conflicts with another carrier for the same access axis"
+            )
+        seen_access_axes[access_axis] = carrier
+
+    program_bindings = value.get("program_bindings", [])
+    if not isinstance(program_bindings, list):
+        raise SchemaError(f"{path}.program_bindings must be an array")
+    seen_program_domains: set[str] = set()
+    for index, raw in enumerate(program_bindings):
+        item_path = f"{path}.program_bindings[{index}]"
+        if not isinstance(raw, Mapping):
+            raise SchemaError(f"{item_path} must be an object")
+        actual = set(raw)
+        if actual != _PROGRAM_BINDING_KEYS:
+            missing = sorted(_PROGRAM_BINDING_KEYS - actual)
+            extra = sorted(actual - _PROGRAM_BINDING_KEYS)
+            detail = []
+            if missing:
+                detail.append(f"missing={missing}")
+            if extra:
+                detail.append(f"unknown={extra}")
+            raise SchemaError(f"{item_path} has invalid fields ({', '.join(detail)})")
+        domain_ref = require_handle(
+            raw["domain_ref"], r"d[0-9]+", f"{item_path}.domain_ref"
+        )
+        if domain_ref not in domains:
+            raise SchemaError(
+                f"{item_path}.domain_ref references an unknown J domain"
+            )
+        axis = raw["axis"]
+        if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis <= 2:
+            raise SchemaError(
+                f"{item_path}.axis must be a launch axis in [0, 2]"
+            )
+        if domain_ref in seen_program_domains:
+            raise SchemaError(
+                f"{item_path}.domain_ref duplicates a program ownership row"
+            )
+        seen_program_domains.add(domain_ref)
 
 
 def _walk(value: Any, path: str = "$" ):
@@ -155,29 +360,72 @@ def _validate_source_isolated_payload(
     if not isinstance(payload, Mapping):
         raise SchemaError("Replay payload must be an object")
     root = set(payload)
-    active_root = {"j", "c", "u_f"}
+    active_roots = ({"j", "u_f"}, {"j", "c", "u_f"})
     historical_root = {"j", "c", "pi", "u_f"}
-    if root != active_root and not (
-        not require_active_context and root == historical_root
-    ):
+    u_f = payload.get("u_f")
+    protocol = u_f.get("protocol") if isinstance(u_f, Mapping) else None
+    c = payload.get("c")
+    historical = (
+        not require_active_context
+        and protocol in LEGACY_REPLAY_PACKET_SCHEMAS
+    )
+    expected_roots = (historical_root,) if historical else active_roots
+    if root not in expected_roots:
         raise SchemaError(
-            "Replay payload root must contain exactly j, c, and u_f"
+            "Replay payload root must contain j and u_f, with c only when "
+            "implementation parameters are present"
         )
+    j = payload.get("j")
+    if isinstance(j, Mapping):
+        nested_root_owned = _nested_root_owned_field_paths(
+            j,
+            path="Replay payload j",
+        )
+        if nested_root_owned:
+            raise SchemaError(
+                f"{nested_root_owned[0]} is a root-owned field nested under J; "
+                "root.c and root.pi must be siblings of root.j"
+            )
     for component, expected in _REPLAY_COMPONENT_KEYS.items():
+        if component not in payload:
+            if component == "c":
+                continue
+            raise SchemaError(f"Replay payload is missing {component}")
         value = payload[component]
         actual = set(value) if isinstance(value, Mapping) else set()
         historical_j = (
-            not require_active_context
+            historical
             and component == "j"
             and frozenset(actual) in _HISTORICAL_J_KEY_SETS
         )
+        historical_c = (
+            historical
+            and component == "c"
+            and actual == {"slots"}
+        )
         if not isinstance(value, Mapping) or (
-            actual != expected and not historical_j
+            actual != expected and not historical_j and not historical_c
         ):
             raise SchemaError(
                 f"Replay payload {component} must contain exactly "
                 + ", ".join(sorted(expected))
             )
+    if not historical and c is not None:
+        assert isinstance(c, Mapping)
+        try:
+            config = ImplementationConfig.from_json(dict(c))
+        except (SchemaError, TypeError, ValueError) as exc:
+            raise SchemaError(f"Replay payload c is invalid: {exc}") from exc
+        if not config.slots:
+            raise SchemaError(
+                "Replay payload c requires at least one slot; omit c for J-only Replay"
+            )
+        expected_names = [f"c{index}" for index in range(len(config.slots))]
+        if [slot.name for slot in config.slots] != expected_names:
+            raise SchemaError(
+                "Replay payload c slots must use declaration-order handles c0, c1, ..."
+            )
+        config.validate_complete_values(path="Replay payload c")
     if "pi" in payload:
         pi = payload["pi"]
         actual_pi = set(pi) if isinstance(pi, Mapping) else set()
@@ -196,16 +444,19 @@ def _validate_source_isolated_payload(
         raise SchemaError(
             f"Replay payload u_f has unknown field(s): {unknown_u_f}"
         )
+    if "representation_contract" in u_f:
+        _validate_representation_contract(
+            u_f["representation_contract"],
+            j=payload["j"],
+            path="Replay payload u_f.representation_contract",
+        )
     required_u_f = set(_U_F_PACKET_KEYS)
     missing_u_f = sorted(required_u_f - set(u_f))
     if missing_u_f:
         raise SchemaError(
             f"Replay payload u_f is missing field(s): {missing_u_f}"
         )
-    if u_f["protocol"] != REPLAY_PACKET_SCHEMA and not (
-        not require_active_context
-        and u_f["protocol"] in LEGACY_REPLAY_PACKET_SCHEMAS
-    ):
+    if u_f["protocol"] != REPLAY_PACKET_SCHEMA and not historical:
         raise SchemaError("Replay payload u_f uses an unsupported protocol")
     try:
         frontend = Frontend(u_f["frontend"])
@@ -268,8 +519,8 @@ class ReplayPacket:
     """Typed source-isolated request; this is not a fourth proof artifact."""
 
     j: Mapping[str, Any]
-    c: Mapping[str, Any]
     u_f: Mapping[str, Any]
+    c: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         assert_source_isolated_payload(self.to_json(validate=False))
@@ -277,9 +528,10 @@ class ReplayPacket:
     def to_json(self, *, validate: bool = True) -> dict[str, Any]:
         payload = {
             "j": copy.deepcopy(dict(self.j)),
-            "c": copy.deepcopy(dict(self.c)),
             "u_f": copy.deepcopy(dict(self.u_f)),
         }
+        if self.c is not None:
+            payload["c"] = copy.deepcopy(dict(self.c))
         if validate:
             assert_source_isolated_payload(payload)
         return payload
@@ -293,13 +545,15 @@ def build_rewriter_packet(
     frontend: Frontend | str = Frontend.TRITON,
     masked: bool = False,
 ) -> ReplayPacket:
-    """Build the one canonical ``J + MaskC(C) + U_f`` Replay packet."""
+    """Build a J-only packet or add complete C when implementation slots exist."""
 
     # Local import avoids a package initialization cycle: TypeCheck depends on
     # the Gate1 data model, while this builder is its first production consumer.
     from intentir.verify.typecheck import type_check
 
     artifact = canonicalize_gate1_artifact(artifact)
+    if artifact.c.slots:
+        artifact.c.validate_complete_values(path="Replay active C")
     report = type_check(
         artifact.j,
         artifact.c,
@@ -321,7 +575,11 @@ def build_rewriter_packet(
             "replay_function": "scrc_k0",
         }
     )
-    return ReplayPacket(view["j"], view["c"], context)
+    representation_contract = opaque_replay_representation(artifact)
+    if representation_contract:
+        context["representation_contract"] = representation_contract
+    c_view = view["c"] if artifact.c.slots else None
+    return ReplayPacket(j=view["j"], u_f=context, c=c_view)
 
 
 def build_rewriter_payload(
@@ -330,7 +588,7 @@ def build_rewriter_payload(
     frontend: Frontend | str = Frontend.TRITON,
     masked: bool = False,
 ) -> dict[str, Any]:
-    """Build exactly ``J + MaskC(C) + U_f``."""
+    """Build exactly ``J + U_f`` or ``J + C + U_f``."""
 
     return build_rewriter_packet(
         artifact, frontend=frontend, masked=masked
@@ -361,24 +619,176 @@ def build_masked_rewriter_view(
     )
 
 
-def _concise_instructions(*, frontend: Frontend, masked: bool) -> str:
+def _source_blind_structure_ledger(artifact: Gate1Artifact) -> str:
+    """Render a compact, exact structural view derived only from J.
+
+    The full J remains the semantic authority, but its boundary and operation
+    records are deliberately distributed across several fields.  Responses
+    Replay has no episode-local query tool, so repeat the source-independent
+    occurrence ledger in the instruction channel.  This makes distinct
+    ``access_ref`` rows mechanically visible without exposing Source, pi, or
+    any observation from the other arm.
+    """
+    j_view = artifact.rewriter_view(masked=False)
+    j = j_view.get("j") if isinstance(j_view, Mapping) else None
+    boundary = j.get("boundary") if isinstance(j, Mapping) else None
+    accesses_value = (
+        boundary.get("accesses") if isinstance(boundary, Mapping) else None
+    )
+    effects_value = (
+        boundary.get("effects") if isinstance(boundary, Mapping) else None
+    )
+    accesses = {
+        str(item.get("access_id")): item
+        for item in accesses_value or []
+        if isinstance(item, Mapping) and isinstance(item.get("access_id"), str)
+    }
+    ordered_refs: list[str] = []
+    for effect in effects_value or []:
+        if not isinstance(effect, Mapping):
+            continue
+        access_ref = effect.get("access_ref")
+        if isinstance(access_ref, str) and access_ref in accesses:
+            ordered_refs.append(access_ref)
+    if not ordered_refs:
+        ordered_refs = list(accesses)
+    access_rows = [
+        {
+            "access_ref": access_ref,
+            "kind": accesses[access_ref].get("kind"),
+            "tensor": accesses[access_ref].get("tensor"),
+            "index_expression": accesses[access_ref].get("index_expression"),
+        }
+        for access_ref in ordered_refs
+    ]
+
+    intent = j.get("intent") if isinstance(j, Mapping) else None
+    intent_function = (
+        intent.get("intent_function")
+        if isinstance(intent, Mapping)
+        else None
+    )
+    body = (
+        intent_function.get("body")
+        if isinstance(intent_function, Mapping)
+        else None
+    )
+    reductions = [
+        {
+            "result": item.get("result"),
+            "operand": (
+                item.get("operands", [None])[0]
+                if isinstance(item.get("operands"), list)
+                and item.get("operands")
+                else None
+            ),
+            "fn": (item.get("attrs") or {}).get("fn")
+            if isinstance(item.get("attrs"), Mapping)
+            else None,
+            "axes": (item.get("attrs") or {}).get("axes", [])
+            if isinstance(item.get("attrs"), Mapping)
+            else [],
+            "input_shape": (
+                (item.get("type") or {}).get("shape", [])
+                if isinstance(item.get("type"), Mapping)
+                else []
+            ),
+            "result_shape": [],
+        }
+        for item in body or []
+        if isinstance(item, Mapping) and item.get("op") == "reduce"
+    ]
+    body_by_result = {
+        str(item.get("result")): item
+        for item in body or []
+        if isinstance(item, Mapping) and isinstance(item.get("result"), str)
+    }
+    for reduction in reductions:
+        result = reduction.get("result")
+        producer = body_by_result.get(str(result))
+        if isinstance(producer, Mapping) and isinstance(
+            producer.get("type"), Mapping
+        ):
+            reduction["result_shape"] = producer["type"].get("shape", [])
+
+    payload = {
+        "boundary_transfer_count": len(access_rows),
+        "boundary_transfers_in_effect_order": access_rows,
+        "reductions_in_J_order": reductions,
+    }
+    return (
+        "Exact source-blind J structural ledger (derived only from the packet; "
+        "not a Source recipe): emit one distinct target memory transfer for each "
+        "boundary row, in this order. Distinct access_ref values are distinct "
+        "occurrences even when tensor and address are equal; never cache, hoist, "
+        "or merge one row into another. Emit one target local reduction for each "
+        "listed J reduction and preserve its operand/dataflow. The ledger is "
+        "closed input, not optional advice:\n"
+        + json.dumps(payload, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        + "\n"
+    )
+
+
+def _concise_instructions(
+    *, frontend: Frontend, masked: bool, uses_c: bool, structure_ledger: str
+) -> str:
     output = "CUDA C++" if frontend is Frontend.CUDA else "Python"
     masked_clause = (
         " J is masked for this representation audit; do not reconstruct it."
         if masked
         else ""
     )
+    if not uses_c:
+        implementation_clause = (
+            " No C is required: compile the parameterized J directly and retain "
+            "its declared ABI placeholders."
+        )
+    elif frontend is Frontend.TRITON:
+        implementation_clause = (
+            " Complete C is present: use its values as implementation bindings "
+            "while retaining every constexpr c* callable handle."
+        )
+    else:
+        implementation_clause = (
+            " Complete C is present: use its values only for implementation and "
+            "compile choices according to U_f; do not add logical runtime parameters."
+        )
+    frontend_clause = {
+        Frontend.TRITON: (
+            " This episode targets Triton Python; apply the Triton callable and "
+            "program-id rules in U_f."
+        ),
+        Frontend.CUTE: (
+            " This episode targets NVIDIA CuTe; use the CuTe callable entry "
+            "contract in U_f and do not assume Triton TTIR."
+        ),
+        Frontend.TILELANG: (
+            " This episode targets TileLang, not Triton; emit the canonical "
+            "TileLang PrimFunc in U_f and do not use Triton APIs or TTIR."
+        ),
+        Frontend.CUDA: (
+            " This episode targets CUDA C++, not Triton; emit the canonical "
+            "extern C __global__ kernel in U_f and do not use Python, tl.* APIs, "
+            "or Triton TTIR assumptions."
+        ),
+    }[frontend]
     return (
         "You are one fresh source-blind Replay coding agent. Return one complete "
         f"self-contained {output} source module and no prose. J is the sole semantic "
-        "authority and C exposes only anonymous slots. Compile the whole typed J "
+        "authority. Compile the whole typed J "
         "without adding value semantics. Physical layout, program mapping, loops, "
         "control and target APIs are your source-blind compiler choices, not extra "
         "semantic inputs. Use only public frontend APIs and the canonical "
-        "J.signature/MaskC(C) handles. Source, Gate feedback, previous Replay and "
-        "kernel templates are unavailable. The packet's U_f gives only the callable "
-        "ABI."
+        "J.signature and optional C handles. Source, Gate feedback, previous Replay and "
+        "kernel templates are unavailable. The packet's U_f gives the callable ABI "
+        "and, when present, a closed source-blind representation contract."
+        + TRITON_REPLAY_ABI_CONTRACT
+        + TRITON_REPLAY_CONTROL_CONTRACT
+        + TRITON_REPLAY_STRUCTURE_CONTRACT
+        + structure_ledger
+        + implementation_clause
         + masked_clause
+        + frontend_clause
     )
 
 
@@ -394,7 +804,12 @@ def build_rewriter_prompt(
         masked=masked,
     )
     frontend = Frontend(frontend)
-    return _concise_instructions(frontend=frontend, masked=masked), json.dumps(
+    return _concise_instructions(
+        frontend=frontend,
+        masked=masked,
+        uses_c=bool(artifact.c.slots),
+        structure_ledger=_source_blind_structure_ledger(artifact),
+    ), json.dumps(
         payload, sort_keys=True, ensure_ascii=False, allow_nan=False
     )
 

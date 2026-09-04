@@ -14,6 +14,14 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from intentir.ir.value_dimension import (
+    RaggedRuntimeError,
+    materialize_ragged_constant,
+    ragged_member_length,
+    validate_ragged_runtime_carrier,
+    validate_ragged_runtime_invocation,
+)
+from intentir.ir.model import walk_intent_op_scopes
 from intentir.runtime_dtype import is_numpy_bfloat16, numpy_bfloat16_dtype
 
 
@@ -62,6 +70,16 @@ _DTYPE_ALIASES = {
     "i16": "int16",
     "i32": "int32",
     "i64": "int64",
+    "index": "int64",
+    "u8": "uint8",
+    "u16": "uint16",
+    "u32": "uint32",
+    "uint8": "uint8",
+    "uint16": "uint16",
+    "uint32": "uint32",
+    "ui8": "uint8",
+    "ui16": "uint16",
+    "ui32": "uint32",
     "f16": "float16",
     "bf16": "bfloat16",
     "f32": "float32",
@@ -204,7 +222,12 @@ def generate_tensor_input(
             )
             count = int(np.prod(shape, dtype=np.int64))
             return np.resize(pattern, count).reshape(shape)
-        low = 0 if spec.distribution is InputDistribution.POSITIVE else -bound
+        low = (
+            0
+            if dtype.kind == "u"
+            or spec.distribution is InputDistribution.POSITIVE
+            else -bound
+        )
         return generator.integers(low, bound + 1, size=shape, dtype=dtype)
     raise ValueError(f"unsupported Gate2 input dtype {spec.dtype!r}")
 
@@ -260,6 +283,340 @@ def generate_input_matrix(
     return tuple(generated)
 
 
+def materialize_ragged_input_values(
+    j: Any,
+    values: Mapping[str, Any],
+    input_bindings: Mapping[str, str],
+) -> dict[str, Any]:
+    """Make direct Ragged carrier inputs valid for every Gate2 leg.
+
+    Generic integer generation cannot satisfy the offsets prefix contract by
+    chance.  This workload-boundary helper derives the carrier shapes from the
+    accepted J graph, creates a balanced non-decreasing offsets prefix, keeps
+    the terminal offset equal to the indices length, and chooses outer group
+    zero for direct selectors.  Source, Replay, and RefJ therefore consume the
+    same J-derived values; no backend is asked to repair malformed input.
+
+    Constant carriers/selectors are left untouched because the shared runtime
+    validator already materializes and checks them.  A direct carrier that
+    cannot be made valid is rejected as an invalid workload valuation.
+    """
+
+    if not hasattr(j, "intent") or not hasattr(j.intent, "body"):
+        raise TypeError("Ragged workload input materialization requires canonical J")
+    result = dict(values)
+    j_inputs = {item.name: item for item in j.intent.inputs}
+
+    scoped_operations = tuple(
+        walk_intent_op_scopes(
+            j.intent.body,
+            visible=(item.name for item in j.intent.inputs),
+        )
+    )
+    operations = tuple(item[1] for item in scoped_operations)
+    has_ragged_operations = any(
+        getattr(operation, "op", None) in {"ragged", "ragged_outer", "ragged_member"}
+        for operation in operations
+    )
+    descriptors: dict[int, tuple[str, str]] = {}
+    descriptor_names: set[str] = set()
+    descriptor_contexts: dict[int, Mapping[str, Any]] = {}
+    selectors: list[tuple[Any, str, Mapping[str, Any]]] = []
+    for _path, operation, visible_bindings in scoped_operations:
+        op_name = getattr(operation, "op", None)
+        operands = tuple(getattr(operation, "operands", ()) or ())
+        result_name = getattr(operation, "result", None)
+        if op_name == "ragged":
+            if (
+                not isinstance(result_name, str)
+                or len(operands) != 2
+                or result_name in descriptor_names
+            ):
+                raise ValueError("Ragged workload contains an incomplete descriptor")
+            descriptors[id(operation)] = (operands[0], operands[1])
+            descriptor_names.add(result_name)
+            descriptor_contexts[id(operation)] = visible_bindings
+        elif op_name == "ragged_member":
+            if len(operands) != 2:
+                raise ValueError("Ragged workload contains an incomplete member query")
+            descriptor_producer = visible_bindings.get(operands[0])
+            if (
+                descriptor_producer is None
+                or getattr(descriptor_producer, "op", None) != "ragged"
+            ):
+                raise ValueError(
+                    "Ragged member selector has no visible local descriptor producer"
+                )
+            selectors.append(
+                (descriptor_producer, operands[1], visible_bindings)
+            )
+
+    if not descriptors:
+        if selectors:
+            raise ValueError("Ragged member selector has no descriptor producer")
+        if not has_ragged_operations:
+            # This helper is shared by dense and Ragged Gate2 workloads.  A
+            # dense J has nothing to materialize; treating it as a malformed
+            # Ragged graph would block every ordinary Gate2 case before any
+            # source/replay/reference comparison can run.
+            return result
+        raise ValueError("Ragged operation set has no descriptor producer")
+
+    # Derive the symbolic extents already fixed by direct workload values.  A
+    # constant carrier is allowed to use those same J dimensions, but it must
+    # still be materialized and checked before a direct selector is rewritten.
+    dimensions: dict[str, int] = {}
+    for name, tensor in j_inputs.items():
+        runtime_name = input_bindings.get(name)
+        if runtime_name is None or runtime_name not in result:
+            continue
+        value = np.asarray(result[runtime_name])
+        if value.ndim != len(tensor.shape):
+            continue
+        for declared, actual in zip(tensor.shape, value.shape, strict=True):
+            if isinstance(declared, str) and declared != "?":
+                previous = dimensions.setdefault(declared, int(actual))
+                if previous != int(actual):
+                    raise ValueError(
+                        f"Ragged workload dimension {declared!r} is inconsistent"
+                    )
+
+    def declared_field_dtype(operation: Any, field_index: int) -> str | None:
+        operation_type = getattr(operation, "type", None)
+        fields = (
+            operation_type.get("fields")
+            if isinstance(operation_type, Mapping)
+            else None
+        )
+        if not isinstance(fields, list) or len(fields) != 2:
+            return None
+        field = fields[field_index]
+        field_type = field.get("type") if isinstance(field, Mapping) else None
+        dtype = field_type.get("dtype") if isinstance(field_type, Mapping) else None
+        return dtype if isinstance(dtype, str) else None
+
+    def constant_array(name: str, operation: Any, *, expected: str | None) -> np.ndarray:
+        raw_shape = getattr(operation, "attrs", {}).get("shape", [])
+        attrs = getattr(operation, "attrs", {})
+        raw_value = attrs.get("value") if isinstance(attrs, Mapping) else None
+        dtype = expected
+        if dtype is None:
+            operation_type = getattr(operation, "type", None)
+            if isinstance(operation_type, Mapping):
+                dtype = operation_type.get("dtype")
+        try:
+            return materialize_ragged_constant(
+                raw_shape,
+                raw_value,
+                dtype=dtype,
+                dims=dimensions,
+                context=f"Ragged constant {name!r}",
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(f"Ragged constant {name!r} cannot be materialized") from exc
+
+    def value_for(
+        name: str,
+        *,
+        expected: str | None,
+        role: str,
+        visible_bindings: Mapping[str, Any],
+    ) -> tuple[np.ndarray, str | None]:
+        tensor = j_inputs.get(name)
+        runtime_name = input_bindings.get(name)
+        if tensor is not None and runtime_name is not None:
+            if runtime_name not in result:
+                raise ValueError(f"Ragged {role} input {name!r} lacks its workload value")
+            return np.asarray(result[runtime_name]), runtime_name
+        operation = visible_bindings.get(name)
+        if operation is not None and getattr(operation, "op", None) == "const":
+            return constant_array(name, operation, expected=expected), None
+        raise ValueError(
+            f"Ragged {role} {name!r} must be a direct input or a materializable const"
+        )
+
+    # Resolve each carrier once.  In particular, two descriptors sharing an
+    # offsets vector must agree on the member-vector length because the final
+    # offset is part of that shared carrier's value contract.
+    carrier_records: dict[str, dict[str, Any]] = {}
+    descriptor_records: dict[int, tuple[str, str]] = {}
+    for descriptor_id, (offsets_name, indices_name) in descriptors.items():
+        producer_context = descriptor_contexts[descriptor_id]
+        producer = next(
+            operation
+            for _path, operation, _visible in scoped_operations
+            if id(operation) == descriptor_id
+        )
+        expected_offsets = (
+            declared_field_dtype(producer, 0) if producer is not None else None
+        )
+        expected_indices = (
+            declared_field_dtype(producer, 1) if producer is not None else None
+        )
+        offsets, offsets_runtime = value_for(
+            offsets_name,
+            expected=expected_offsets or getattr(j_inputs.get(offsets_name), "dtype", None),
+            role="offsets",
+            visible_bindings=producer_context,
+        )
+        indices, indices_runtime = value_for(
+            indices_name,
+            expected=expected_indices or getattr(j_inputs.get(indices_name), "dtype", None),
+            role="indices",
+            visible_bindings=producer_context,
+        )
+        if offsets.ndim != 1 or offsets.dtype.kind not in {"i", "u"}:
+            raise ValueError(
+                f"Ragged offsets input {offsets_name!r} is not a rank-1 integer carrier"
+            )
+        if indices.ndim != 1 or indices.dtype.kind not in {"i", "u"}:
+            raise ValueError(
+                f"Ragged indices input {indices_name!r} is not a rank-1 integer carrier"
+            )
+        record = carrier_records.setdefault(
+            offsets_name,
+            {
+                "offsets": offsets,
+                "runtime": offsets_runtime,
+                "indices": [],
+            },
+        )
+        if record["offsets"].shape != offsets.shape or record["offsets"].dtype != offsets.dtype:
+            raise ValueError(
+                f"Ragged shared offsets carrier {offsets_name!r} is inconsistent"
+            )
+        record["indices"].append(
+            (indices_name, indices, indices_runtime, expected_indices)
+        )
+        descriptor_records[descriptor_id] = (offsets_name, indices_name)
+
+    group_counts: dict[str, int] = {}
+    for offsets_name, record in carrier_records.items():
+        offsets = record["offsets"]
+        index_records = record["indices"]
+        if offsets.size == 0:
+            raise ValueError("Ragged offsets input must contain at least one value")
+        index_counts = {int(indices.size) for _name, indices, _runtime, _dtype in index_records}
+        if len(index_counts) != 1:
+            raise ValueError(
+                f"Ragged descriptors sharing offsets {offsets_name!r} disagree on index count"
+            )
+        index_count = next(iter(index_counts))
+        group_count = int(offsets.size) - 1
+        if group_count == 0 and index_count != 0:
+            raise ValueError(
+                "Ragged offsets with no outer groups cannot carry indices"
+            )
+
+        valid = True
+        for _indices_name, indices, _runtime, expected_indices in index_records:
+            try:
+                validate_ragged_runtime_carrier(
+                    offsets,
+                    indices,
+                    context=f"Gate2 ragged {offsets_name}",
+                    offsets_dtype=(
+                        j_inputs[offsets_name].dtype
+                        if offsets_name in j_inputs
+                        else None
+                    ),
+                    indices_dtype=expected_indices,
+                )
+            except RaggedRuntimeError:
+                valid = False
+                break
+
+        if not valid and record["runtime"] is not None:
+            if group_count:
+                base, remainder = divmod(index_count, group_count)
+                lengths = np.full(group_count, base, dtype=np.int64)
+                if remainder:
+                    lengths[:remainder] += 1
+                rebuilt = np.concatenate(
+                    (
+                        np.asarray([0], dtype=np.int64),
+                        np.cumsum(lengths, dtype=np.int64),
+                    )
+                )
+            else:
+                rebuilt = np.asarray([0], dtype=np.int64)
+            limits = np.iinfo(offsets.dtype)
+            if rebuilt[-1] > limits.max:
+                raise ValueError(
+                    f"Ragged offsets input {offsets_name!r} cannot represent its index count"
+                )
+            rebuilt = rebuilt.astype(offsets.dtype, copy=False)
+            result[record["runtime"]] = rebuilt
+            offsets = rebuilt
+            record["offsets"] = offsets
+        elif not valid:
+            raise ValueError(
+                f"Ragged constant offsets carrier {offsets_name!r} violates its runtime contract"
+            )
+        group_counts[offsets_name] = group_count
+
+    for descriptor_producer, selector_name, selector_context in selectors:
+        descriptor_id = id(descriptor_producer)
+        carrier = descriptor_records.get(descriptor_id)
+        if carrier is None:
+            raise ValueError(
+                "Ragged member selector references an unknown descriptor producer"
+            )
+        offsets_name, indices_name = carrier
+        if selector_name in {offsets_name, indices_name}:
+            raise ValueError("Ragged selector cannot alias a carrier field")
+        selector_tensor = j_inputs.get(selector_name)
+        expected_selector = getattr(selector_tensor, "dtype", None)
+        selector, selector_runtime = value_for(
+            selector_name,
+            expected=expected_selector,
+            role="selector",
+            visible_bindings=selector_context,
+        )
+        if selector.shape != () or selector.dtype.kind not in {"i", "u"}:
+            raise ValueError(
+                f"Ragged selector input {selector_name!r} must be a rank-0 integer"
+            )
+        group_count = group_counts[offsets_name]
+        if group_count <= 0:
+            raise ValueError("Ragged member requires at least one outer group")
+        try:
+            ragged_member_length(
+                carrier_records[offsets_name]["offsets"],
+                next(
+                    indices
+                    for name, indices, _runtime, _dtype in carrier_records[offsets_name]["indices"]
+                    if name == indices_name
+                ),
+                selector,
+                context=(
+                    "Gate2 ragged member "
+                    f"{getattr(descriptor_producer, 'result', '<anonymous>')}"
+                ),
+            )
+        except (RaggedRuntimeError, StopIteration) as exc:
+            if selector_runtime is None:
+                raise ValueError(
+                    f"Ragged constant selector {selector_name!r} is invalid"
+                ) from exc
+            result[selector_runtime] = np.asarray(0, dtype=selector.dtype).reshape(())
+
+    runtime_inputs = {
+        name: result[input_bindings[name]]
+        for name in j_inputs
+        if name in input_bindings and input_bindings[name] in result
+    }
+    try:
+        validate_ragged_runtime_invocation(
+            j.intent,
+            runtime_inputs,
+            dims=dimensions,
+        )
+    except RaggedRuntimeError as exc:
+        raise ValueError(f"Gate2 Ragged input contract failed: {exc}") from exc
+    return result
+
+
 __all__ = [
     "BoundaryExtent",
     "GeneratedInputCase",
@@ -269,4 +626,5 @@ __all__ = [
     "boundary_1d_extents",
     "generate_input_matrix",
     "generate_tensor_input",
+    "materialize_ragged_input_values",
 ]

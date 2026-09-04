@@ -1,9 +1,14 @@
 """CUDA Driver-API launch for intent-compiled kernels (M4).
 
 Loads a cubin/PTX module and launches a kernel on torch device pointers, with no
-dependency on libmlir_cuda_runtime. Kernels are compiled with bare-ptr calling
-convention, so each tensor arg marshals to a single device pointer and the memref
-must be statically shaped (R3 finding); index/scalar kernel args pass by value.
+dependency on libmlir_cuda_runtime. Ordinary dense kernels use the bare-pointer
+calling convention, so each static tensor argument marshals to one device
+pointer and index/scalar kernel arguments pass by value. Ragged member kernels
+are the explicit exception at the compile boundary: their host allocation is
+resolved from the validated runtime carrier and their dynamic ranked memref is
+launched through the complete flattened descriptor ABI. This module's generic
+marshal helpers remain for the dense pointer path; Ragged descriptor fields are
+marshaled by the descriptor-aware orchestrator.
 """
 
 from __future__ import annotations
@@ -39,6 +44,18 @@ class I64Arg(int):
 
 class I32Arg(int):
     """A kernel argument passed by value as a 32-bit integer."""
+
+
+class U8Arg(int):
+    """A kernel argument passed by value as an 8-bit unsigned integer."""
+
+
+class U16Arg(int):
+    """A kernel argument passed by value as a 16-bit unsigned integer."""
+
+
+class U32Arg(int):
+    """A kernel argument passed by value as a 32-bit unsigned integer."""
 
 
 @dataclass
@@ -79,6 +96,12 @@ def _marshal(args: Sequence[int]):
     for a in args:
         if isinstance(a, I32Arg):
             cvals.append(ctypes.c_int32(int(a)))
+        elif isinstance(a, U8Arg):
+            cvals.append(ctypes.c_uint8(int(a)))
+        elif isinstance(a, U16Arg):
+            cvals.append(ctypes.c_uint16(int(a)))
+        elif isinstance(a, U32Arg):
+            cvals.append(ctypes.c_uint32(int(a)))
         elif isinstance(a, I64Arg):
             cvals.append(ctypes.c_int64(int(a)))
         else:  # PtrArg or plain int -> device pointer

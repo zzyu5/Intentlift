@@ -459,6 +459,10 @@ def _save_lift_records_on_failure(
             continue
         extraction = record.extraction
         _write_json(call_dir / "artifact.json", extraction.artifact.to_json())
+        _write_json(
+            call_dir / "layer_c_interface.json",
+            extraction.layer_c_interface_payload,
+        )
         provenance = extraction.provenance
         _write_json(
             call_dir / "receipt.json",
@@ -491,6 +495,9 @@ def _save_report(
         attempt_dir.mkdir()
         if attempt.artifact is not None:
             _write_json(attempt_dir / "artifact.json", attempt.artifact.to_json())
+        interface = attempt.lift_metadata.get("layer_c_interface")
+        if isinstance(interface, Mapping):
+            _write_json(attempt_dir / "layer_c_interface.json", interface)
         if attempt.gate1 is not None:
             _write_json(attempt_dir / "gate1.json", attempt.gate1.to_json())
             if attempt.gate1.normal.generation is not None:

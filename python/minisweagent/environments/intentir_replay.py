@@ -21,7 +21,11 @@ from typing import Any, Callable, Mapping
 from pydantic import BaseModel, ConfigDict
 
 from minisweagent.exceptions import Submitted
-from intentir.verify.gate1.replay_semantic_core import query_replay_semantics
+from intentir.verify.gate1.replay_semantic_core import (
+    materialize_replay_compiler_index,
+    materialize_replay_semantics,
+    query_replay_semantics,
+)
 
 
 INTENTIR_REPLAY_SUBMIT = "INTENTIR_REPLAY_SUBMIT"
@@ -38,7 +42,7 @@ REPLAY_TRANSACTION_PROTOCOL = "intentir.replay-transaction.v1"
 REPLAY_APPLY_PATCH_PROTOCOL = "intentir.replay-exact-text-patch.v1"
 REPLAY_DIRECT_SUBMIT_PROTOCOL = "intentir.replay-direct-submit.v1"
 MULTI_ACTION_PROTOCOL = "intentir.agent-multi-action.v1"
-REPLAY_INPUT_FILES = frozenset(
+REPLAY_REQUIRED_INPUT_FILES = frozenset(
     {
         "README.md",
         "packet.json",
@@ -46,12 +50,13 @@ REPLAY_INPUT_FILES = frozenset(
         "semantic-program.intent",
         "compiler-index.json",
         "compiler-index.intent",
-        "mask-c.json",
         "frontend.json",
         "REPLAY_CONTRACT.md",
         "TOOL.md",
     }
 )
+REPLAY_OPTIONAL_INPUT_FILES = frozenset({"c.json"})
+REPLAY_INPUT_FILES = REPLAY_REQUIRED_INPUT_FILES | REPLAY_OPTIONAL_INPUT_FILES
 REPLAY_SANDBOX_PROTOCOL = "intentir.replay-busybox-empty-root.v1"
 REPLAY_SANDBOX_HOSTNAME = "intentir-replay"
 REPLAY_BWRAP = Path("/usr/bin/bwrap")
@@ -106,6 +111,53 @@ REPLAY_TOOL_APPLETS = (
     "which",
     "xargs",
 )
+
+
+def _input_text(value: str | bytes, name: str) -> str:
+    if isinstance(value, str):
+        return value
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Replay input {name} is not UTF-8") from exc
+
+
+def _validate_replay_derived_inputs(
+    packet: Mapping[str, Any],
+    read_text: Callable[[str], str],
+) -> None:
+    if json.loads(read_text("frontend.json")) != packet["u_f"]:
+        raise ValueError("Replay frontend.json differs from packet U_f")
+
+    semantic_program = materialize_replay_semantics(packet["j"])
+    expected_semantic_json = json.dumps(
+        semantic_program.to_json(),
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ) + "\n"
+    if read_text("semantic-program.json") != expected_semantic_json:
+        raise ValueError("Replay semantic-program.json differs from packet J")
+    if read_text("semantic-program.intent") != semantic_program.text:
+        raise ValueError("Replay semantic-program.intent differs from packet J")
+
+    compiler_index = materialize_replay_compiler_index(
+        semantic_program.to_json(), packet.get("c")
+    )
+    expected_index_json = json.dumps(
+        compiler_index.to_json(),
+        sort_keys=True,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+    ) + "\n"
+    if read_text("compiler-index.json") != expected_index_json:
+        raise ValueError("Replay compiler-index.json differs from packet J/C")
+    if read_text("compiler-index.intent") != compiler_index.text:
+        raise ValueError("Replay compiler-index.intent differs from packet J/C")
+
+
 MAX_REPLAY_BYTES = 1024 * 1024
 MAX_ACTION_OUTPUT_BYTES = 1024 * 1024
 MAX_WORKSPACE_BYTES = 64 * 1024 * 1024
@@ -303,7 +355,7 @@ def _packet_overview(packet: Mapping[str, Any]) -> dict[str, Any]:
             "This overview contains the compact ABI/op inventory and exact "
             "root section sizes; do not query whole j/u_f sections.",
             f"Query `{INTENTIR_PACKET_QUERY} abi 0 48` for full parameter "
-            "fields, Intent I/O, U_f entry metadata, and MaskC slots.",
+            "fields, Intent I/O, U_f entry metadata, and optional complete C.",
             f"Query `{INTENTIR_PACKET_QUERY} graph 0 12` for full op fields; "
             "page only if `next_start` is non-null.",
             "Use `section PATH` only for a named field omitted by these views.",
@@ -377,7 +429,7 @@ def _packet_abi(packet: Mapping[str, Any], start: int, count: int) -> Any:
             for key in ("name", "inputs", "outputs", "returns")
             if isinstance(function, Mapping) and key in function
         },
-        "mask_c": packet.get("c"),
+        "c": packet.get("c"),
         "parameter_total": len(parameters),
         "parameter_start": start,
         "parameters": items,
@@ -887,10 +939,28 @@ class IntentIRReplayWorkspace:
     @classmethod
     def create(cls, files: Mapping[str, str | bytes]) -> "IntentIRReplayWorkspace":
         file_names = set(files)
-        if file_names != REPLAY_INPUT_FILES:
+        if not REPLAY_REQUIRED_INPUT_FILES <= file_names or not file_names <= REPLAY_INPUT_FILES:
             raise ValueError(
-                "Replay input must contain exactly the fixed allowlisted files"
+                "Replay input does not match the closed required/optional allowlist"
             )
+        packet_content = _input_text(files["packet.json"], "packet.json")
+        packet = json.loads(packet_content)
+        if not isinstance(packet, Mapping):
+            raise ValueError("Replay packet must be an object")
+        from intentir.verify.gate1.prompt import assert_source_isolated_payload
+
+        assert_source_isolated_payload(packet)
+        has_c = "c" in packet
+        if has_c != ("c.json" in files):
+            raise ValueError("Replay packet C presence differs from c.json")
+        if has_c:
+            c_content = _input_text(files["c.json"], "c.json")
+            if json.loads(c_content) != packet["c"]:
+                raise ValueError("Replay packet C differs from c.json")
+        _validate_replay_derived_inputs(
+            packet,
+            lambda name: _input_text(files[name], name),
+        )
         root = Path(tempfile.mkdtemp(prefix="intentir-replay-"))
         workspace = cls(
             root=root,
@@ -1015,6 +1085,7 @@ class IntentIRReplayEnvironment:
         self._direct_submit_audit: list[dict[str, Any]] = []
         self._multi_action_rejections = 0
         self._validate_paths()
+        self._read_closed_packet()
         self._probe()
 
     def validate_actions(self, actions: list[dict[str, Any]]) -> str | None:
@@ -1523,12 +1594,15 @@ class IntentIRReplayEnvironment:
                 "test ! -e /lib64; test ! -e /usr/local; "
                 "for name in python python3 gcc g++ clang ld as nvcc ptxas "
                 "triton torch intentir; do ! command -v \"$name\"; done; "
-                "test \"$(find /input -type f | wc -l)\" -eq 10; "
+                "count=$(find /input -type f | wc -l); "
                 "for name in README.md packet.json semantic-program.json "
                 "semantic-program.intent compiler-index.json "
-                "compiler-index.intent mask-c.json "
+                "compiler-index.intent "
                 "frontend.json REPLAY_CONTRACT.md TOOL.md; do "
-                "test -f \"/input/$name\" || exit 1; done"
+                "test -f \"/input/$name\" || exit 1; done; "
+                "test ! -e /input/c.json || test -f /input/c.json; "
+                "if test -f /input/c.json; then "
+                "test \"$count\" -eq 10; else test \"$count\" -eq 9; fi"
             ),
         ]
         try:
@@ -1800,8 +1874,23 @@ class IntentIRReplayEnvironment:
         packet = json.loads(
             (self.config.input_dir / "packet.json").read_text(encoding="utf-8")
         )
-        if not isinstance(packet, Mapping) or set(packet) != {"j", "c", "u_f"}:
+        if not isinstance(packet, Mapping):
             raise ValueError("Replay packet has an invalid closed root")
+        from intentir.verify.gate1.prompt import assert_source_isolated_payload
+
+        assert_source_isolated_payload(packet)
+        c_path = self.config.input_dir / "c.json"
+        if ("c" in packet) != c_path.is_file():
+            raise ValueError("Replay packet C presence differs from c.json")
+        if (
+            c_path.is_file()
+            and json.loads(c_path.read_text(encoding="utf-8")) != packet["c"]
+        ):
+            raise ValueError("Replay packet C differs from c.json")
+        _validate_replay_derived_inputs(
+            packet,
+            lambda name: (self.config.input_dir / name).read_text(encoding="utf-8"),
+        )
         return packet
 
     def _read_closed_semantic_program(self) -> Mapping[str, Any]:
@@ -2270,6 +2359,8 @@ __all__ = [
     "REPLAY_DIRECT_SUBMIT_PROTOCOL",
     "REPLAY_TRANSACTION_PROTOCOL",
     "REPLAY_INPUT_FILES",
+    "REPLAY_OPTIONAL_INPUT_FILES",
+    "REPLAY_REQUIRED_INPUT_FILES",
     "IntentIRReplayEnvironment",
     "IntentIRReplayEnvironmentConfig",
     "IntentIRReplayWorkspace",

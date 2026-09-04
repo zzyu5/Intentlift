@@ -14,7 +14,7 @@ from typing import Any, Iterable
 
 from intentir.backend.materialize import MaterializedJ
 from intentir.ir.canonical_j import j_elaboration
-from intentir.ir.model import IntentOp
+from intentir.ir.model import IntentOp, walk_intent_ops
 
 
 J_WORKLOAD_COST_PROTOCOL = "intentir.backend.j-workload-cost.v1"
@@ -30,6 +30,9 @@ _DTYPE_BITS = {
     "i16": 16,
     "i32": 32,
     "i64": 64,
+    "u8": 8,
+    "u16": 16,
+    "u32": 32,
     "f16": 16,
     "bf16": 16,
     "f32": 32,
@@ -67,6 +70,7 @@ class _Counts:
     type_conversion_ops: int = 0
     select_ops: int = 0
     data_movement_elements: int = 0
+    atomic_rmw_ops: int = 0
     control_iterations: int = 0
     unsupported: list[str] = field(default_factory=list)
     dynamic_branches: int = 0
@@ -80,6 +84,7 @@ class _Counts:
             "type_conversion_ops",
             "select_ops",
             "data_movement_elements",
+            "atomic_rmw_ops",
             "control_iterations",
             "dynamic_branches",
         ):
@@ -89,8 +94,8 @@ class _Counts:
 
 @dataclass(frozen=True)
 class JWorkloadCost:
-    boundary_input_bytes: int
-    boundary_output_bytes: int
+    boundary_input_bytes: int | None
+    boundary_output_bytes: int | None
     floating_point_ops: int
     comparison_ops: int
     special_function_ops: int
@@ -98,16 +103,21 @@ class JWorkloadCost:
     type_conversion_ops: int
     select_ops: int
     data_movement_elements: int
+    atomic_rmw_ops: int
     control_iterations: int
     dynamic_branches: int
     unsupported_semantic_ops: tuple[str, ...]
 
     @property
-    def boundary_io_bytes(self) -> int:
+    def boundary_io_bytes(self) -> int | None:
+        if self.boundary_input_bytes is None or self.boundary_output_bytes is None:
+            return None
         return self.boundary_input_bytes + self.boundary_output_bytes
 
     @property
-    def arithmetic_intensity_flop_per_byte(self) -> float:
+    def arithmetic_intensity_flop_per_byte(self) -> float | None:
+        if self.boundary_io_bytes is None:
+            return None
         return (
             self.floating_point_ops / self.boundary_io_bytes
             if self.boundary_io_bytes
@@ -116,7 +126,12 @@ class JWorkloadCost:
 
     @property
     def complete(self) -> bool:
-        return not self.unsupported_semantic_ops and self.dynamic_branches == 0
+        return (
+            self.boundary_input_bytes is not None
+            and self.boundary_output_bytes is not None
+            and not self.unsupported_semantic_ops
+            and self.dynamic_branches == 0
+        )
 
     def to_record(self) -> dict[str, Any]:
         caveats = [
@@ -142,6 +157,7 @@ class JWorkloadCost:
             "type_conversion_ops": self.type_conversion_ops,
             "select_ops": self.select_ops,
             "data_movement_elements": self.data_movement_elements,
+            "atomic_rmw_ops": self.atomic_rmw_ops,
             "control_iterations": self.control_iterations,
             "dynamic_branches": self.dynamic_branches,
             "unsupported_semantic_ops": list(self.unsupported_semantic_ops),
@@ -192,15 +208,30 @@ def derive_j_workload_cost(materialized: MaterializedJ) -> JWorkloadCost:
     elaboration = j_elaboration(materialized.j)
     value_types = elaboration.value_type_by_name
     runtime_inputs = set(materialized.runtime_input_names)
-    input_bytes = sum(
-        _tensor_bytes(item.dtype, item.shape, extents)
-        for item in materialized.j.intent.inputs
-        if item.name in runtime_inputs
+    boundary_shape_issues: list[str] = []
+
+    def boundary_bytes(items: Iterable[Any], *, kind: str) -> int | None:
+        total = 0
+        dynamic = False
+        for item in items:
+            if any(dimension == "?" for dimension in item.shape):
+                boundary_shape_issues.append(
+                    f"dynamic_{kind}_shape:{item.name}"
+                )
+                dynamic = True
+                continue
+            total += _tensor_bytes(item.dtype, item.shape, extents)
+        return None if dynamic else total
+
+    input_bytes = boundary_bytes(
+        (
+            item
+            for item in materialized.j.intent.inputs
+            if item.name in runtime_inputs
+        ),
+        kind="input",
     )
-    output_bytes = sum(
-        _tensor_bytes(item.dtype, item.shape, extents)
-        for item in materialized.j.intent.outputs
-    )
+    output_bytes = boundary_bytes(materialized.j.intent.outputs, kind="output")
     constexpr = dict(materialized.constexpr_bindings)
 
     def result_type(operation: IntentOp) -> Any | None:
@@ -209,6 +240,20 @@ def derive_j_workload_cost(materialized: MaterializedJ) -> JWorkloadCost:
             if isinstance(operation.result, str)
             else None
         )
+
+    def ragged_field_elements(
+        operation: IntentOp,
+        field_name: str,
+    ) -> int | None:
+        if not operation.operands:
+            return None
+        descriptor = value_types.get(operation.operands[0])
+        if descriptor is None or not descriptor.is_ragged:
+            return None
+        field = descriptor.field(field_name)
+        if not field.is_tensor or field.dtype is None:
+            return None
+        return _numel(field.shape, extents)
 
     def body_spans_axis(body: list[IntentOp], axis: str) -> bool:
         """Whether the functional body already materializes the loop axis.
@@ -219,22 +264,28 @@ def derive_j_workload_cost(materialized: MaterializedJ) -> JWorkloadCost:
         count a second time turns linear elementwise work into a quadratic cost.
         """
 
-        for operation in body:
-            value_type = result_type(operation)
-            if value_type is not None and axis in value_type.shape:
-                return True
-            if operation.body and body_spans_axis(operation.body, axis):
-                return True
-            for arm in (operation.positive, operation.negative):
-                if arm is not None and body_spans_axis(arm.body, axis):
-                    return True
-        return False
+        return any(
+            (value_type := result_type(operation)) is not None
+            and axis in value_type.shape
+            for operation in walk_intent_ops(body)
+        )
 
     def visit(body: list[IntentOp]) -> _Counts:
         counts = _Counts()
         for operation in body:
             if operation.op == "loop":
-                if operation.trip is None or operation.trip.axis not in extents:
+                if operation.trip is None:
+                    counts.unsupported.append(
+                        f"{operation.node_id or 'anonymous'}:loop_trip"
+                    )
+                    continue
+                if operation.trip.is_dynamic:
+                    counts.unsupported.append(
+                        f"{operation.node_id or 'anonymous'}:dynamic_loop_trip"
+                    )
+                    counts.add(visit(operation.body))
+                    continue
+                if operation.trip.axis not in extents:
                     counts.unsupported.append(
                         f"{operation.node_id or 'anonymous'}:loop_trip"
                     )
@@ -262,7 +313,59 @@ def derive_j_workload_cost(materialized: MaterializedJ) -> JWorkloadCost:
                     counts.add(positive)
                     counts.add(negative)
                 continue
+            if operation.op == "ragged":
+                offsets = value_types.get(operation.operands[0]) if len(
+                    operation.operands
+                ) == 2 else None
+                indices = value_types.get(operation.operands[1]) if len(
+                    operation.operands
+                ) == 2 else None
+                if (
+                    offsets is None
+                    or indices is None
+                    or not offsets.is_tensor
+                    or not indices.is_tensor
+                ):
+                    counts.unsupported.append(
+                        f"{operation.node_id or 'anonymous'}:ragged_shape"
+                    )
+                    continue
+                counts.data_movement_elements += _numel(offsets.shape, extents)
+                counts.data_movement_elements += _numel(indices.shape, extents)
+                continue
+            if operation.op == "ragged_outer":
+                offsets = ragged_field_elements(operation, "offsets")
+                if offsets is None:
+                    counts.unsupported.append(
+                        f"{operation.node_id or 'anonymous'}:ragged_outer_shape"
+                    )
+                    continue
+                counts.data_movement_elements += 1
+                continue
+            if operation.op == "ragged_member":
+                offsets = ragged_field_elements(operation, "offsets")
+                if offsets is None:
+                    counts.unsupported.append(
+                        f"{operation.node_id or 'anonymous'}:ragged_member_shape"
+                    )
+                    continue
+                counts.data_movement_elements += 2
+                continue
             value_type = result_type(operation)
+            if value_type is not None and (
+                not value_type.is_tensor or value_type.dtype is None
+            ):
+                counts.unsupported.append(
+                    f"{operation.node_id or 'anonymous'}:{operation.op}_record_type"
+                )
+                continue
+            if value_type is not None and any(
+                dimension == "?" for dimension in value_type.shape
+            ):
+                counts.unsupported.append(
+                    f"{operation.node_id or 'anonymous'}:dynamic_result_shape"
+                )
+                continue
             elements = (
                 _numel(value_type.shape, extents) if value_type is not None else 0
             )
@@ -273,7 +376,10 @@ def derive_j_workload_cost(materialized: MaterializedJ) -> JWorkloadCost:
                     counts.comparison_ops += elements
                 elif function in {"and", "or", "xor"} or dtype not in _FLOAT_DTYPES:
                     counts.integer_logic_ops += elements
-                elif function in {"add", "sub", "mul", "div"}:
+                elif function in {
+                    "add", "sub", "mul", "div", "floordiv", "remainder",
+                    "copysign",
+                }:
                     counts.floating_point_ops += elements
                 else:
                     counts.unsupported.append(
@@ -286,8 +392,50 @@ def derive_j_workload_cost(materialized: MaterializedJ) -> JWorkloadCost:
                         counts.floating_point_ops += elements
                     else:
                         counts.integer_logic_ops += elements
-                elif function in {"exp", "log", "rsqrt", "sigmoid", "tanh"}:
+                elif function in {
+                    "exp",
+                    "log",
+                    "log2",
+                    "sqrt",
+                    "rsqrt",
+                    "tanh",
+                    "sigmoid",
+                    "cos",
+                    "sin",
+                    "tan",
+                    "exp2",
+                    "atan",
+                    "erf",
+                    "acos",
+                    "asin",
+                    "cbrt",
+                    "ceil",
+                    "floor",
+                    "round",
+                    "roundeven",
+                    "trunc",
+                    "log10",
+                    "log1p",
+                    "expm1",
+                    "erfc",
+                }:
                     counts.special_function_ops += elements
+                elif function in {"isnan", "isinf", "isfinite"}:
+                    counts.comparison_ops += elements
+                elif function == "logical_not":
+                    counts.integer_logic_ops += elements
+                elif function == "identity":
+                    pass
+                elif function == "sign":
+                    if dtype in _FLOAT_DTYPES:
+                        counts.floating_point_ops += elements
+                    else:
+                        counts.integer_logic_ops += elements
+                elif function in {"neg", "recip"}:
+                    if dtype in _FLOAT_DTYPES:
+                        counts.floating_point_ops += elements
+                    else:
+                        counts.integer_logic_ops += elements
                 else:
                     counts.unsupported.append(
                         f"{operation.node_id or 'anonymous'}:map_unary:{function}"
@@ -349,8 +497,28 @@ def derive_j_workload_cost(materialized: MaterializedJ) -> JWorkloadCost:
                 counts.type_conversion_ops += elements
             elif operation.op == "select":
                 counts.select_ops += elements
-            elif operation.op in {"gather", "pad"}:
+            elif operation.op in {"gather", "pad", "reshape"}:
                 counts.data_movement_elements += elements
+            elif operation.op == "scatter":
+                if len(operation.operands) != 3:
+                    counts.unsupported.append(
+                        f"{operation.node_id or 'anonymous'}:scatter_shape"
+                    )
+                    continue
+                source_type = value_types.get(operation.operands[2])
+                if (
+                    source_type is None
+                    or not source_type.is_tensor
+                    or source_type.dtype is None
+                ):
+                    counts.unsupported.append(
+                        f"{operation.node_id or 'anonymous'}:scatter_shape"
+                    )
+                    continue
+                source_elements = _numel(source_type.shape, extents)
+                counts.data_movement_elements += source_elements
+                if operation.attrs.get("atomic") is not None:
+                    counts.atomic_rmw_ops += source_elements
             elif operation.op == "iota":
                 counts.integer_logic_ops += elements
             elif operation.op != "const":
@@ -370,9 +538,12 @@ def derive_j_workload_cost(materialized: MaterializedJ) -> JWorkloadCost:
         type_conversion_ops=counts.type_conversion_ops,
         select_ops=counts.select_ops,
         data_movement_elements=counts.data_movement_elements,
+        atomic_rmw_ops=counts.atomic_rmw_ops,
         control_iterations=counts.control_iterations,
         dynamic_branches=counts.dynamic_branches,
-        unsupported_semantic_ops=tuple(sorted(set(counts.unsupported))),
+        unsupported_semantic_ops=tuple(
+            sorted(set((*boundary_shape_issues, *counts.unsupported)))
+        ),
     )
 
 

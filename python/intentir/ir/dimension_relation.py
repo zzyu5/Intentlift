@@ -12,23 +12,67 @@ from collections.abc import Mapping
 import re
 from typing import Any
 
+from .dim_expr import dimension_expression_references
+
+
+DIMENSION_INT64_MIN = -(2**63)
+DIMENSION_INT64_MAX = 2**63 - 1
+DIMENSION_RELATION_CONST_OPS = frozenset(
+    {
+        "add_const",
+        "sub_const",
+        "mul_const",
+        "floordiv_const",
+        "mod_const",
+        "ceil_div_const",
+        "round_up_const",
+    }
+)
+DIMENSION_RELATION_OPS = frozenset(
+    {"identity", "mul_dims", *DIMENSION_RELATION_CONST_OPS}
+)
+
 
 class DimensionRelationError(ValueError):
     """A J dimension relation or its public valuation is not closed."""
 
 
-def _declared_dimensions(j: Any) -> frozenset[str]:
+def declared_dimension_handles(j: Any) -> frozenset[str]:
+    """Return every symbolic dimension handle declared by canonical J.
+
+    Shapes, logical signature bindings, and derived-dimension relation results
+    declare the same J-owned namespace.  Relation operands and
+    value/dimension equalities only refer to that namespace; they do not create
+    declarations.  Keep this collection in one place so TypeCheck and runtime
+    relation consumers cannot disagree about whether an expression is closed.
+    ``?`` is a data-dependent extent marker, not a public symbolic dimension.
+    """
+
     dimensions = {
-        dimension
+        reference
         for tensor in [*j.intent.inputs, *j.intent.outputs]
         for dimension in tensor.shape
-        if isinstance(dimension, str)
+        # ``?`` is the closed dynamic-extent marker for a data-dependent
+        # result (currently ragged_member).  It is not a J dimension handle and
+        # must not become a missing public dimension valuation.
+        for reference in dimension_expression_references(dimension)
+        if reference != "?"
     }
     signature = getattr(j, "signature", None)
     for parameter in getattr(signature, "parameters", ()):
         logical_ref = getattr(parameter, "logical_ref", None)
         if isinstance(logical_ref, str) and re.fullmatch(r"x[0-9]+", logical_ref):
             dimensions.add(logical_ref)
+    # A relation result is a declaration of a derived dimension.  Expression
+    # arguments are references to declarations, not declarations themselves;
+    # treating them as declarations would make a misspelled or self-referential
+    # x* handle appear closed.  The same rule applies to a value/dimension
+    # equality: its dimension_ref consumes an already declared dimension and
+    # must never bootstrap one.
+    for relation in getattr(j, "dimension_relations", ()):
+        reference = getattr(relation, "result", None)
+        if isinstance(reference, str) and reference != "?":
+            dimensions.add(reference)
     return frozenset(dimensions)
 
 
@@ -47,7 +91,7 @@ def _relation_map(j: Any) -> dict[str, Any]:
 def validate_dimension_relations(j: Any) -> None:
     """Validate references, closed operations, unique results, and acyclicity."""
 
-    declared = _declared_dimensions(j)
+    declared = declared_dimension_handles(j)
     relations = _relation_map(j)
     for index, relation in enumerate(j.dimension_relations):
         path = f"j.dimension_relations[{index}]"
@@ -73,19 +117,15 @@ def validate_dimension_relations(j: Any) -> None:
                 raise DimensionRelationError(
                     f"{path}.expr mul_dims requires rhs and forbids value"
                 )
-        elif relation.expr.op in {
-            "add_const",
-            "mul_const",
-            "ceil_div_const",
-            "round_up_const",
-        }:
+        elif relation.expr.op in DIMENSION_RELATION_CONST_OPS:
             if (
                 isinstance(relation.expr.value, bool)
                 or not isinstance(relation.expr.value, int)
                 or relation.expr.value <= 0
+                or relation.expr.value > DIMENSION_INT64_MAX
             ):
                 raise DimensionRelationError(
-                    f"{path}.expr requires a positive integer constant"
+                    f"{path}.expr requires a positive signed-int64 constant"
                 )
         else:
             raise DimensionRelationError(
@@ -119,11 +159,92 @@ def validate_dimension_relations(j: Any) -> None:
 
 
 def _closed_extent(value: Any, *, context: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > DIMENSION_INT64_MAX
+    ):
         raise DimensionRelationError(
-            f"{context} must be a non-negative integer dimension"
+            f"{context} must be a non-negative signed-int64 dimension"
         )
     return value
+
+
+def evaluate_dimension_relation_operation(
+    op: str,
+    argument: int,
+    *,
+    value: int | None = None,
+    rhs_argument: int | None = None,
+    context: str = "dimension relation",
+) -> int:
+    """Evaluate one operation in the shared closed dimension grammar."""
+
+    if op not in DIMENSION_RELATION_OPS:
+        raise DimensionRelationError(
+            f"{context} uses unsupported dimension relation operation {op!r}"
+        )
+    argument = _closed_extent(argument, context=f"{context}.arg")
+
+    def result_extent(result: int) -> int:
+        if result < 0:
+            raise DimensionRelationError(
+                f"{context} produces a negative dimension extent"
+            )
+        if result < DIMENSION_INT64_MIN or result > DIMENSION_INT64_MAX:
+            raise DimensionRelationError(
+                f"{context} exceeds the signed 64-bit dimension domain"
+            )
+        return result
+
+    if op == "identity":
+        if value is not None or rhs_argument is not None:
+            raise DimensionRelationError(
+                f"{context} identity forbids value/rhs"
+            )
+        return argument
+    if op == "mul_dims":
+        if value is not None or rhs_argument is None:
+            raise DimensionRelationError(
+                f"{context} mul_dims requires rhs and forbids value"
+            )
+        rhs_argument = _closed_extent(
+            rhs_argument, context=f"{context}.rhs"
+        )
+        return result_extent(argument * rhs_argument)
+    if op not in DIMENSION_RELATION_CONST_OPS:
+        raise DimensionRelationError(
+            f"{context} uses unsupported dimension relation operation {op!r}"
+        )
+    if (
+        value is None
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value <= 0
+        or value > DIMENSION_INT64_MAX
+        or rhs_argument is not None
+    ):
+        raise DimensionRelationError(
+            f"{context} {op} requires one positive signed-int64 value"
+        )
+    if op == "add_const":
+        result = argument + value
+    elif op == "sub_const":
+        result = argument - value
+    elif op == "mul_const":
+        result = argument * value
+    elif op == "floordiv_const":
+        result = argument // value
+    elif op == "mod_const":
+        result = argument % value
+    elif op == "ceil_div_const":
+        # Avoid argument + value - 1 overflowing before the checked result.
+        result = argument // value + int(argument % value != 0)
+    else:
+        quotient = argument // value + int(argument % value != 0)
+        result = quotient * value
+    return result_extent(result)
 
 
 def evaluate_dimension_relation_expr(
@@ -131,31 +252,12 @@ def evaluate_dimension_relation_expr(
 ) -> int:
     """Evaluate one already-validated closed expression."""
 
-    argument = _closed_extent(argument, context=f"dimension {expr.arg!r}")
-    if expr.op == "identity":
-        return argument
-    if expr.op == "mul_dims":
-        if rhs_argument is None:
-            raise DimensionRelationError("mul_dims requires a concrete rhs dimension")
-        rhs_argument = _closed_extent(
-            rhs_argument, context=f"dimension {expr.rhs!r}"
-        )
-        return argument * rhs_argument
-    constant = expr.value
-    if isinstance(constant, bool) or not isinstance(constant, int) or constant <= 0:
-        raise DimensionRelationError(
-            f"{expr.op} requires a positive integer constant"
-        )
-    if expr.op == "add_const":
-        return argument + constant
-    if expr.op == "mul_const":
-        return argument * constant
-    if expr.op == "ceil_div_const":
-        return (argument + constant - 1) // constant
-    if expr.op == "round_up_const":
-        return ((argument + constant - 1) // constant) * constant
-    raise DimensionRelationError(
-        f"unsupported closed dimension relation operation {expr.op!r}"
+    return evaluate_dimension_relation_operation(
+        expr.op,
+        argument,
+        value=expr.value,
+        rhs_argument=rhs_argument,
+        context=f"dimension relation {expr.op}",
     )
 
 
@@ -171,7 +273,7 @@ def resolve_dimension_relations(
     """
 
     validate_dimension_relations(j)
-    declared = _declared_dimensions(j)
+    declared = declared_dimension_handles(j)
     resolved = {
         name: _closed_extent(value, context=f"dimension {name!r}")
         for name, value in dimensions.items()
@@ -251,8 +353,14 @@ def validate_dimension_relation_instantiation(
 
 
 __all__ = [
+    "DIMENSION_INT64_MAX",
+    "DIMENSION_INT64_MIN",
+    "DIMENSION_RELATION_CONST_OPS",
+    "DIMENSION_RELATION_OPS",
     "DimensionRelationError",
+    "declared_dimension_handles",
     "evaluate_dimension_relation_expr",
+    "evaluate_dimension_relation_operation",
     "resolve_dimension_relations",
     "validate_dimension_relation_instantiation",
     "validate_dimension_relations",

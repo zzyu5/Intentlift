@@ -12,6 +12,9 @@
         "outputs": [
           {"name": "t2", "dtype": "f32", "shape": []}
         ],
+        "returns": [
+          {"output": "t2", "value": "t2"}
+        ],
         "body": [
           {
             "op": "reduce",
@@ -165,82 +168,15 @@
         "axis_ref": 0
       }
     ],
-    "values": {"c0": 1024}
+    "values": {}
   },
   "pi": {
-    "regions": [
-      {"id": "r0", "parent": null, "placement": "root"}
-    ],
-    "instances": [
-      {
-        "id": "i0",
-        "semantic_ref": "a0",
-        "region": "r0",
-        "mechanism": "transfer_direct"
-      },
-      {
-        "id": "i1",
-        "semantic_ref": "n0",
-        "region": "r0",
-        "mechanism": "realize"
-      },
-      {
-        "id": "i2",
-        "semantic_ref": "n1",
-        "region": "r0",
-        "mechanism": "realize"
-      },
-      {
-        "id": "i3",
-        "semantic_ref": "n2",
-        "region": "r0",
-        "mechanism": "realize"
-      },
-      {
-        "id": "i4",
-        "semantic_ref": "a1",
-        "region": "r0",
-        "mechanism": "transfer_direct"
-      },
-      {
-        "id": "i5",
-        "semantic_ref": "p0",
-        "region": "r0",
-        "mechanism": "realize"
-      },
-      {
-        "id": "i6",
-        "semantic_ref": "p1",
-        "region": "r0",
-        "mechanism": "realize"
-      }
-    ],
-    "routes": [
-      {"source": "i5", "target": "i0", "slots": [0]},
-      {"source": "i0", "target": "i1", "slots": [0]},
-      {"source": "i1", "target": "i3", "slots": [0]},
-      {"source": "i2", "target": "i3", "slots": [1]},
-      {"source": "i3", "target": "i4", "slots": [0]},
-      {"source": "i6", "target": "i4", "slots": [0]}
-    ],
+    "schema": "intentir.pi.normalization-witness.v1",
     "program_axes": [],
-    "order": [
-      {"before": "i0", "after": "i1"},
-      {"before": "i1", "after": "i3"},
-      {"before": "i2", "after": "i3"},
-      {"before": "i3", "after": "i4"},
-      {"before": "i5", "after": "i0"},
-      {"before": "i6", "after": "i4"}
-    ],
-    "sharing": [],
-    "refinements": [
-      {"instance": "i2", "kind": "numeric_cast", "auth_ref": "u0"}
-    ],
-    "iterations": [],
-    "loop_carriers": [],
-    "physical_iterations": [],
-    "physical_loop_carriers": [],
-    "terminal_controls": [],
-    "route_extent_transforms": []
+    "program_bindings": [],
+    "iteration_bindings": [],
+    "control_bindings": [],
+    "materialization_bindings": [],
+    "access_representation_bindings": []
   }
 }

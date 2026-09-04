@@ -20,7 +20,9 @@ ROW_FAST_PATH_ID = "cuda.row_reduction.normalization_loss.read_once.v1"
 ELEMENTWISE_FAST_PATH_ID = "cuda.elementwise.row.vectorized.v1"
 PADDED_ROW_FAST_PATH_ID = "cuda.padded_row_reduction.masked_short_dot.v1"
 _BLOCK_THREADS = frozenset({32, 64, 128, 256, 512, 1024})
-_SIGNED_INTEGER_DTYPES = frozenset({"i8", "i16", "i32", "i64"})
+_INTEGER_DTYPES = frozenset({
+    "i8", "i16", "i32", "i64", "u8", "u16", "u32",
+})
 
 
 @dataclass(frozen=True)
@@ -440,7 +442,7 @@ def resolve_row_schedule(
     integer_scalar_inputs = [
         item
         for item in inputs
-        if item.dtype_str in _SIGNED_INTEGER_DTYPES and tuple(item.shape) == ()
+        if item.dtype_str in _INTEGER_DTYPES and tuple(item.shape) == ()
     ]
     per_row_results = [
         item for item in results if item[1] == "f32" and len(item[0]) == 1

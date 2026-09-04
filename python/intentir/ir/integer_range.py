@@ -17,7 +17,7 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 from .canonical_j import elaborate_j, j_elaboration
-from .model import IntentOp
+from .model import IntentOp, walk_intent_ops
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,10 @@ class IntegerInterval:
 
 def _dtype_bounds(dtype: str) -> tuple[int, int] | None:
     normalized = dtype.removeprefix("torch.").lower()
+    if normalized == "index":
+        # The logical index dtype uses the same signed 64-bit carrier as the
+        # host/native ABI and the MLIR emitter.
+        return -(1 << 63), (1 << 63) - 1
     aliases = {
         "byte": "uint8",
         "char": "int8",
@@ -61,12 +65,7 @@ def _dtype_bounds(dtype: str) -> tuple[int, int] | None:
 
 
 def _walk_ops(body: Sequence[IntentOp]) -> Iterable[IntentOp]:
-    for operation in body:
-        yield operation
-        yield from _walk_ops(operation.body)
-        for arm in (operation.positive, operation.negative):
-            if arm is not None:
-                yield from _walk_ops(arm.body)
+    yield from walk_intent_ops(body)
 
 
 def _result_names(operation: IntentOp) -> tuple[str, ...]:
@@ -163,7 +162,12 @@ def infer_integer_value_intervals(
     intervals: dict[str, IntegerInterval] = {}
     for name, value in dict(logical_inputs or {}).items():
         value_type = value_types.get(name)
-        if value_type is None or _dtype_bounds(value_type.dtype) is None:
+        if (
+            value_type is None
+            or not value_type.is_tensor
+            or value_type.dtype is None
+            or _dtype_bounds(value_type.dtype) is None
+        ):
             continue
         array = np.asarray(value)
         if array.size == 0 or array.dtype.kind not in {"i", "u"}:
@@ -177,15 +181,56 @@ def infer_integer_value_intervals(
         "broadcast", "concat", "flip", "reshape", "tile", "transpose",
     }
     operations = tuple(_walk_ops(canonical.intent.body))
+    ragged_offsets_by_name: dict[str, str] = {}
+    ragged_indices_by_name: dict[str, str] = {}
+    for operation in operations:
+        results = _result_names(operation)
+        if operation.op != "ragged" or len(results) != 1:
+            continue
+        if len(operation.operands) != 2:
+            continue
+        ragged_offsets_by_name[results[0]] = operation.operands[0]
+        ragged_indices_by_name[results[0]] = operation.operands[1]
+
+    resolved_dimensions = dict(dimension_extents or {})
     for _ in range(len(operations) + 1):
         changed = False
         for operation in operations:
+            if operation.op == "loop" and operation.trip is not None:
+                if operation.trip.is_dynamic:
+                    index_name = operation.trip.index
+                    upper_name = operation.trip.upper_bound
+                    upper_interval = (
+                        intervals.get(upper_name)
+                        if isinstance(upper_name, str)
+                        else None
+                    )
+                    if (
+                        isinstance(index_name, str)
+                        and index_name not in intervals
+                        and upper_interval is not None
+                        and upper_interval.upper > 0
+                    ):
+                        index_type = value_types.get(index_name)
+                        if index_type is not None and index_type.dtype is not None:
+                            index_interval = _within_dtype(
+                                IntegerInterval(0, upper_interval.upper - 1),
+                                index_type.dtype,
+                            )
+                            if index_interval is not None:
+                                intervals[index_name] = index_interval
+                                changed = True
             results = _result_names(operation)
             if len(results) != 1 or results[0] in intervals:
                 continue
             result_name = results[0]
             result_type = value_types.get(result_name)
-            if result_type is None or _dtype_bounds(result_type.dtype) is None:
+            if (
+                result_type is None
+                or not result_type.is_tensor
+                or result_type.dtype is None
+                or _dtype_bounds(result_type.dtype) is None
+            ):
                 continue
             interval: IntegerInterval | None = None
             if operation.op == "const":
@@ -195,9 +240,25 @@ def infer_integer_value_intervals(
             elif operation.op == "iota":
                 extent = operation.attrs.get("n")
                 if isinstance(extent, str):
-                    extent = dict(dimension_extents or {}).get(extent)
+                    extent = resolved_dimensions.get(extent)
                 if type(extent) is int and extent > 0:
                     interval = IntegerInterval(0, extent - 1)
+            elif operation.op == "ragged_outer" and len(operation.operands) == 1:
+                offsets_name = ragged_offsets_by_name.get(operation.operands[0])
+                offsets_type = value_types.get(offsets_name or "")
+                if offsets_type is not None and len(offsets_type.shape) == 1:
+                    extent = offsets_type.shape[0]
+                    if isinstance(extent, str):
+                        extent = resolved_dimensions.get(extent)
+                    if type(extent) is int and extent > 0:
+                        interval = IntegerInterval(extent - 1, extent - 1)
+            elif operation.op == "ragged_member" and len(operation.operands) == 2:
+                indices_name = ragged_indices_by_name.get(operation.operands[0])
+                indices_interval = intervals.get(indices_name or "")
+                if indices_interval is not None:
+                    # Selecting one ragged group cannot produce an index outside
+                    # the descriptor's complete indices carrier.
+                    interval = indices_interval
             elif operation.op == "map_unary" and len(operation.operands) == 1:
                 operand = intervals.get(operation.operands[0])
                 fn = operation.attrs.get("fn")
@@ -232,7 +293,7 @@ def infer_integer_value_intervals(
                 ):
                     extent: Any = data_type.shape[axis]
                     if isinstance(extent, str):
-                        extent = dict(dimension_extents or {}).get(extent)
+                        extent = resolved_dimensions.get(extent)
                     if (
                         type(extent) is int
                         and extent > 0

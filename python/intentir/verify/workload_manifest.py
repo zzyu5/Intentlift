@@ -168,6 +168,125 @@ def _installed_module_path(module: str) -> Path | None:
     return None
 
 
+def _configured_external_source_roots() -> tuple[Path, ...]:
+    """Return stable source roots used by the external library catalog.
+
+    The active Dataset keeps the canonical ``dataset://`` layout, while some
+    source archives retain their upstream or normalized layout.  Explicit
+    roots let the resolver consume those existing archives without copying
+    files into the Dataset or importing the third-party packages.  The
+    workspace's existing sibling source archive is discovered by default so
+    callers do not need to recreate an environment or export a transient
+    shell variable for every invocation.
+    """
+
+    raw_roots = os.environ.get("INTENTIR_EXTERNAL_SOURCE_ROOTS", "")
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    configured = [value for value in raw_roots.split(os.pathsep) if value]
+    configured.append(
+        str(_repo_root().parent / "intent-dsl" / "source" / "triton")
+    )
+    for raw_root in configured:
+        value = raw_root.strip()
+        if not value:
+            continue
+        root = Path(value).expanduser().resolve()
+        if root in seen or not root.is_dir():
+            continue
+        seen.add(root)
+        roots.append(root)
+    return tuple(roots)
+
+
+def _external_module_paths(
+    module: str,
+    symbol: str,
+    suite: str,
+    roots: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    """Find configured source files in the requested library only.
+
+    External archives may normalize different libraries into the same
+    directory shape.  A basename-only recursive lookup can therefore select,
+    for example, FlashAttention's ``layer_norm.py`` for a Liger workload.  The
+    resolver keeps candidates under a suite path hint and requires the exact
+    top-level entry symbol before returning a path.  Source files are still
+    read-only; this function never copies or imports them.
+    """
+
+    suite_hints = {
+        "liger": {"liger", "liger-kernel", "liger_kernel"},
+        "flash_attention": {
+            "flash-attention",
+            "flash_attention",
+            "flash-attn",
+            "flash_attn",
+        },
+        "xformers": {"xformers"},
+    }
+    try:
+        hints = suite_hints[suite]
+    except KeyError as exc:
+        raise ValueError(f"unsupported external source suite {suite!r}") from exc
+
+    def has_suite_hint(path: Path) -> bool:
+        parts = {part.casefold() for part in path.parts}
+        return bool(parts & hints)
+
+    def has_cuda_triton_layout(path: Path) -> bool:
+        if suite != "liger":
+            return True
+        # The Liger repository also carries Triton-shaped implementations for
+        # non-CUDA backends.  This registry is the CUDA/Triton workload catalog;
+        # accepting an identically named Ascend or cuTile kernel would make a
+        # syntactically valid but target-incompatible source look resolved.
+        parts = {part.casefold() for part in path.parts}
+        return not parts.intersection({"_ascend", "ascend", "_cutile", "cutile"})
+
+    def has_top_level_symbol(path: Path) -> bool:
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError, UnicodeError):
+            # Preserve a path with a real source parse failure so the caller
+            # can report the source as invalid instead of hiding the failure.
+            return True
+        return sum(
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == symbol
+            for node in tree.body
+        ) == 1
+
+    relative = Path(*module.split(".")).with_suffix(".py")
+    basename = relative.name
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        direct = root / relative
+        candidates = [direct] if direct.is_file() else []
+        try:
+            candidates.extend(
+                path
+                for path in sorted(root.rglob(basename), key=lambda item: item.as_posix())
+                if path != direct
+            )
+        except OSError:
+            candidates = [direct] if direct.is_file() else []
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            if (
+                resolved in seen
+                or not resolved.is_file()
+                or not has_suite_hint(resolved)
+                or not has_cuda_triton_layout(resolved)
+                or not has_top_level_symbol(resolved)
+            ):
+                continue
+            seen.add(resolved)
+            result.append(resolved)
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class SourceResolution:
     status: SourceResolutionStatus
@@ -243,17 +362,34 @@ class SCRCWorkloadEntry:
         installed = _installed_module_path(self.source_module)
         fallback = _dataset_candidate(self.suite, self.source_module, root)
         candidates: list[tuple[str, Path, str]] = []
-        if installed is not None:
-            candidates.append(
-                ("installed", installed, f"module://{self.source_module}")
+        try:
+            relative = fallback.relative_to(root)
+            dataset_location = f"dataset://{relative.as_posix()}"
+        except ValueError:
+            dataset_location = f"dataset://{fallback.name}"
+
+        external_roots = _configured_external_source_roots()
+        if external_roots:
+            if fallback.is_file():
+                candidates.append(("dataset", fallback, dataset_location))
+            candidates.extend(
+                ("external", path, dataset_location)
+                for path in _external_module_paths(
+                    self.source_module,
+                    self.symbol,
+                    self.suite,
+                    external_roots,
+                )
             )
-        if installed is None or fallback.resolve() != installed:
-            try:
-                relative = fallback.relative_to(root)
-                location = f"dataset://{relative.as_posix()}"
-            except ValueError:
-                location = f"dataset://{fallback.name}"
-            candidates.append(("dataset", fallback, location))
+            if installed is not None:
+                candidates.append(("installed", installed, dataset_location))
+        else:
+            if installed is not None:
+                candidates.append(
+                    ("installed", installed, f"module://{self.source_module}")
+                )
+            if installed is None or fallback.resolve() != installed:
+                candidates.append(("dataset", fallback, dataset_location))
 
         failures: list[str] = []
         found_source = False

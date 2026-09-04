@@ -1,7 +1,10 @@
-"""Strict transport snapshot for the production ``J + optional C`` boundary.
+"""Strict transport snapshot for J plus an optional legacy Source-C prior.
 
 The snapshot is not a new semantic or proof artifact.  It is a content-addressed
-serialization of the already canonical J and the separate, erasable C prior.
+serialization of the already canonical J and a separate, erasable Source/search
+prior retained for benchmark/export compatibility.  The ``ImplementationConfig``
+stored here is not a target Layer-C plugin and is never accepted by the public
+``LoweringRequest`` boundary.
 It deliberately has no fields for source, replay, pi, comparison policy, or
 certification evidence.  Consumers that need to establish acceptance do so
 before constructing this object.
@@ -32,7 +35,7 @@ class ProductionSnapshotError(ValueError):
 
 @dataclass(frozen=True)
 class ProductionCatalogEntry:
-    """Content-addressed location of one accepted J+C snapshot."""
+    """Content-addressed location of one accepted J+Source-prior snapshot."""
 
     name: str
     case_id: str
@@ -114,7 +117,12 @@ def content_digest(value: Any) -> str:
 
 @dataclass(frozen=True)
 class ProductionSnapshot:
-    """One immutable-by-content backend input containing only J and optional C."""
+    """Immutable J plus an optional legacy Source-C/search prior.
+
+    The field remains named ``c`` for the persisted compatibility schema.  New
+    production lowering must derive a ``TargetLayerCPlugin`` with ``BindTarget``
+    instead of forwarding this value as target C.
+    """
 
     j: SemanticArchive
     c: ImplementationConfig | None = None
@@ -135,7 +143,8 @@ class ProductionSnapshot:
         if self.c is not None:
             if not isinstance(self.c, ImplementationConfig):
                 raise ProductionSnapshotError(
-                    "production snapshot C must use the canonical schedule schema"
+                    "production snapshot compatibility C must use the canonical "
+                    "Source/search-prior schema"
                 )
             detached_c = ImplementationConfig.from_json(self.c.to_json())
             object.__setattr__(self, "c", detached_c)
@@ -246,7 +255,7 @@ def load_production_snapshot(
 
     Acceptance exports retain human-readable ``<name>.json`` files.  Frozen
     catalogs retain only digest-named immutable objects.  Catalog metadata and
-    the decoded J+C object are cross-checked before either is returned.
+    the decoded J+Source-prior object are cross-checked before either is returned.
     """
 
     if not isinstance(directory, Path):

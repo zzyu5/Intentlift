@@ -151,12 +151,16 @@ class _ContractMLIRBuilder:
             result = self._append(
                 f"arith.xori {operand_values[0]}, {true} : i1", "i1"
             )
-        elif expression.op in {"add", "sub", "mul", "floordiv"}:
+        elif expression.op in {
+            "add", "sub", "mul", "floordiv", "left_shift", "right_shift"
+        }:
             opcode = {
                 "add": "addi",
                 "sub": "subi",
                 "mul": "muli",
                 "floordiv": "floordivsi",
+                "left_shift": "shli",
+                "right_shift": "shrsi",
             }[expression.op]
             result = self._append(
                 f"arith.{opcode} {operand_values[0]}, {operand_values[1]} "

@@ -92,7 +92,7 @@ def _opaque_cute_interface(
             )
         if observed == "unspecified" and expected in {"tensor", "opaque"}:
             raise ValueError(
-                f"CuTe device argument {index} requires an explicit public DSL type"
+                f"CuTe device argument {index} requires an explicit public type"
             )
         normalized_device.append(
             {
@@ -138,6 +138,7 @@ class CuteGate1Runner:
         *,
         compiler: CuteCompiler,
         writer: ReplayWriter,
+        masked_writer: ReplayWriter | None = None,
         comparator: CuteComparator | None = None,
         config: Gate1Config | None = None,
     ) -> None:
@@ -145,6 +146,14 @@ class CuteGate1Runner:
         self.writer = writer
         self.comparator = comparator or CuteComparator()
         self.config = config or Gate1Config()
+        if self.config.run_masked_j:
+            if masked_writer is None:
+                raise ValueError("masked-J requires a fresh independent Replay writer")
+            if masked_writer is writer:
+                raise ValueError("masked-J writer must differ from the normal writer")
+        elif masked_writer is not None:
+            raise ValueError("masked-J writer was provided while the audit is disabled")
+        self.masked_writer = masked_writer
 
     def _fingerprint(
         self,
@@ -165,6 +174,7 @@ class CuteGate1Runner:
 
     def _arm(
         self,
+        writer: ReplayWriter,
         artifact: Gate1Artifact,
         source_fingerprint: CuteFingerprint,
         case: CuteCompileCase,
@@ -173,7 +183,7 @@ class CuteGate1Runner:
     ) -> Gate1ArmEvidence:
         mode = "masked_j" if masked else "normal"
         try:
-            generation = self.writer.generate(artifact, masked=masked)
+            generation = writer.generate(artifact, masked=masked)
         except Exception as exc:
             return Gate1ArmEvidence(
                 mode,
@@ -240,6 +250,8 @@ class CuteGate1Runner:
         source: CuteKernelSource,
         source_case: CuteCompileCase,
     ) -> Gate1ExecutionResult:
+        if artifact.c.slots:
+            artifact.c.validate_complete_values(path="Gate1 active C")
         digest = canonical_artifact_digest(
             artifact, observer_level=self.config.observer_level
         )
@@ -282,7 +294,11 @@ class CuteGate1Runner:
                 observer_profile=CUTE_OBSERVER_PROFILE,
             )
         normal = self._arm(
-            artifact, source_fingerprint, source_case, masked=False
+            self.writer,
+            artifact,
+            source_fingerprint,
+            source_case,
+            masked=False,
         )
         if not normal.hard_closed:
             return Gate1ExecutionResult(
@@ -300,9 +316,14 @@ class CuteGate1Runner:
         masked_calls = 0
         status = Gate1Status.REPLAY_CLOSED
         if self.config.run_masked_j:
+            assert self.masked_writer is not None
             masked_calls = 1
             masked_evidence = self._arm(
-                artifact, source_fingerprint, source_case, masked=True
+                self.masked_writer,
+                artifact,
+                source_fingerprint,
+                source_case,
+                masked=True,
             )
         return Gate1ExecutionResult(
             status,

@@ -16,7 +16,11 @@ from typing import Any, Mapping, Sequence
 
 from intentir.ir.canonical_j import elaborate_j, j_elaboration
 
-from .model import SemanticArchive
+from .model import (
+    ImplementationConfig,
+    SemanticArchive,
+    _nested_root_owned_field_paths,
+)
 
 
 REPLAY_SEMANTIC_PROGRAM_PROTOCOL = "intentir.replay-semantic-program.v3"
@@ -56,7 +60,25 @@ def _contains_mask(value: Any) -> bool:
     return False
 
 
+def _reject_nested_root_owned_fields(j: Mapping[str, Any]) -> None:
+    """Keep the source-blind J entrance aligned with the Gate1 envelope.
+
+    Normal J is parsed through ``SemanticArchive`` below, but masked J is
+    intentionally kept as a value-free mapping and therefore bypasses that
+    parser.  The bypass must not reintroduce the old shape where C/pi were
+    nested under ``j`` or ``j.intent`` and later interpreted as part of J.
+    """
+
+    nested_root_owned = _nested_root_owned_field_paths(j, path="Replay J")
+    if nested_root_owned:
+        raise ValueError(
+            f"{nested_root_owned[0]} is a root-owned field nested under J; "
+            "root.c and root.pi are siblings of root.j"
+        )
+
+
 def _intent_function(j: Mapping[str, Any]) -> Mapping[str, Any]:
+    _reject_nested_root_owned_fields(j)
     intent = _object(j.get("intent"), "J.intent")
     return _object(
         intent.get("intent_function", intent),
@@ -631,9 +653,9 @@ class ReplaySemanticProgram:
 class ReplayCompilerIndex:
     """Compact cross-reference over the already-authorized Replay inputs.
 
-    This is not a schedule and contains no fact beyond ``S_J`` and ``MaskC(C)``.
-    It only places existing domain dependencies and anonymous C attachments next
-    to each other so a coding agent need not reconstruct those joins repeatedly.
+    This contains no fact beyond ``S_J`` and optional complete ``C``. It places
+    existing domain dependencies, C bindings, and their attachments next to each
+    other so a coding agent need not reconstruct those joins repeatedly.
     """
 
     value: dict[str, Any]
@@ -645,9 +667,9 @@ class ReplayCompilerIndex:
 
 def materialize_replay_compiler_index(
     semantic_program: Mapping[str, Any],
-    masked_c: Mapping[str, Any],
+    c: Mapping[str, Any] | None,
 ) -> ReplayCompilerIndex:
-    """Materialize a source-neutral, proof-irrelevant ``S_J + MaskC`` index."""
+    """Materialize a source-neutral, proof-irrelevant ``S_J + optional C`` index."""
 
     if semantic_program.get("protocol") != REPLAY_SEMANTIC_PROGRAM_PROTOCOL:
         raise ValueError("unsupported Replay semantic-program protocol")
@@ -659,14 +681,29 @@ def materialize_replay_compiler_index(
         ownership.get("domain_axis_refs", {}),
         "S_J.boundary_ownership.domain_axis_refs",
     )
-    slots = _array(masked_c.get("slots", []), "MaskC.slots")
+    if c is None:
+        slots: list[Any] = []
+        values: Mapping[str, Any] = {}
+    else:
+        config = ImplementationConfig.from_json(copy.deepcopy(dict(c)))
+        if not config.slots:
+            raise ValueError("empty C must be omitted from Replay")
+        expected_names = [f"c{index}" for index in range(len(config.slots))]
+        if [slot.name for slot in config.slots] != expected_names:
+            raise ValueError("Replay C slots must use c0, c1, ... declaration order")
+        config.validate_complete_values(path="Replay C")
+        slots = [slot.to_json() for slot in config.slots]
+        values = config.values
     attachments: list[dict[str, Any]] = []
     for raw in slots:
-        slot = _object(raw, "MaskC.slots[]")
+        slot = _object(raw, "C.slots[]")
         subject = slot.get("subject_ref")
+        name = slot.get("name")
+        assert isinstance(name, str)
         attachments.append(
             {
                 "slot": copy.deepcopy(dict(slot)),
+                "value": copy.deepcopy(values[name]),
                 "subject_domain_refs": copy.deepcopy(
                     domain_axis_refs.get(subject)
                     if isinstance(subject, str)
@@ -691,14 +728,14 @@ def materialize_replay_compiler_index(
         ),
         "anonymous_c_attachments": attachments,
         "authority": (
-            "deterministic cross-reference of exact S_J and MaskC(C) declarations "
+            "deterministic cross-reference of exact S_J and optional complete C "
             "only; dependency subsets are syntactic and no program mapping, loop, "
-            "lane, guard, target API, value, Source, pi, or Gate fact is inferred"
+            "lane, guard, target API, Source, pi, or Gate fact is inferred"
         ),
     }
     lines = [
         f"compiler_index {REPLAY_COMPILER_INDEX_PROTOCOL}",
-        "authority exact_S_J_plus_MaskC_cross_reference; not_schedule; no_values; no_pi",
+        "authority exact_S_J_plus_optional_C_cross_reference; no_source; no_pi",
     ]
     for name, refs in value["domain_axis_refs"].items():
         lines.append(f"domain_axes {name} = " + _compact(refs))
@@ -740,11 +777,15 @@ def materialize_replay_semantics(j_value: Mapping[str, Any]) -> ReplaySemanticPr
     nodes = _node_stream(j)
     boundary = copy.deepcopy(dict(_object(j.get("boundary", {}), "J.boundary")))
     node_ids = {str(node["id"]) for node in nodes}
-    output_bindings = (
-        copy.deepcopy(structured_boundary["output_bindings"])
-        if structured_boundary is not None
-        else copy.deepcopy(function.get("returns", []))
-    )
+    if structured_boundary is not None:
+        output_bindings = copy.deepcopy(structured_boundary["output_bindings"])
+    else:
+        raw_returns = function.get("returns")
+        if not isinstance(raw_returns, list):
+            raise ValueError(
+                "masked J.intent.intent_function.returns must be a complete array"
+            )
+        output_bindings = copy.deepcopy(raw_returns)
     boundary_ownership = _boundary_ownership_view(
         boundary,
         structured_boundary=structured_boundary,

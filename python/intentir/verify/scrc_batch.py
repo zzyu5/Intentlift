@@ -13,6 +13,7 @@ from .workload_manifest import (
     SCRCWorkloadEntry,
     SourceResolutionStatus,
 )
+from .scrc_runner import MAX_LIFT_CALLS
 
 
 SCRC_BATCH_PROTOCOL = "intentir.scrc.batch.v3"
@@ -24,6 +25,7 @@ _SCHEDULING_KEYS = (
     "max_branch_workers",
     "gate2_workers",
     "gate1_rounds",
+    "max_lift_calls",
     "pre_replay_rejections",
 )
 
@@ -143,6 +145,10 @@ def _validate_scheduling(
                 f"scheduling.{key} must be a {requirement} integer"
             )
         normalized[key] = value
+    if normalized["max_lift_calls"] > MAX_LIFT_CALLS:
+        raise ValueError(
+            f"scheduling.max_lift_calls must be in [1, {MAX_LIFT_CALLS}]"
+        )
     if (
         normalized["case_workers"] * normalized["candidates"]
         > normalized["max_branch_workers"]

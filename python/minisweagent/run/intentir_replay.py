@@ -166,13 +166,14 @@ def _replay_startup_context(workspace: IntentIRReplayWorkspace) -> str:
             "semantic_program": "/input/semantic-program.intent",
             "semantic_program_json": "/input/semantic-program.json",
             "packet": "/input/packet.json",
-            "mask_c": "/input/mask-c.json",
             "frontend": "/input/frontend.json",
             "contract": "/input/REPLAY_CONTRACT.md",
             "tools": "/input/TOOL.md",
             "replay": "/output/replay.source",
         },
     }
+    if (workspace.input_dir / "c.json").is_file():
+        exact["paths"]["c"] = "/input/c.json"
     return json.dumps(
         exact,
         sort_keys=True,

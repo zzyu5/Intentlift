@@ -98,6 +98,7 @@ def _dtype(value: str | None) -> str:
         "int16": "i16",
         "int32": "i32",
         "int64": "i64",
+        "index": "i64",
         "uint8": "u8",
         "uint16": "u16",
         "uint32": "u32",
@@ -152,14 +153,57 @@ def _validate_compiled_interface(
     observed: Mapping[str, Any],
     *,
     frontend: str,
+    expected_parameters: tuple[FrontendParameter, ...] | None = None,
 ) -> None:
-    """Fail closed when compiled native ABI differs from exact J.signature.
+    """Fail closed when compiled native ABI differs from its owned contract.
 
-    The hard fingerprint interface is intentionally anonymous, but it must be
-    backed by the compiler-observed ABI rather than merely restating the Harness
-    case.  Symbol names and symbolic-dimension spellings are alpha-renamable;
-    kind, dtype, rank, mode, and every static extent are not.
+    CUDA C++ has a physical declaration ABI and a separate logical J/Harness
+    ABI.  The former is checked against ``expected_parameters`` (the trusted
+    source view for a module file, or the logical replay view for Replay).  The
+    latter is built independently by ``_artifact_interface`` below.  This
+    prevents a compiler result from passing by simply echoing the Harness case,
+    while still allowing a trusted CUDA source to expose a CUtensorMap slot.
+
+    TileLang's PrimFunc observer already reports the logical tensor interface,
+    so its existing rank/shape/mode checks remain unchanged.
     """
+
+    if frontend == "cuda":
+        if expected_parameters is None:
+            raise ValueError("CUDA compiled interface requires an expected ABI view")
+        raw_parameters = observed.get("parameters")
+        if not isinstance(raw_parameters, list):
+            raise ValueError("CUDA compiler did not report a parameter interface")
+        if len(raw_parameters) != len(expected_parameters):
+            raise ValueError(
+                "CUDA compiled physical parameter count differs from its ABI view"
+            )
+        expected_kind = {
+            ParameterKind.POINTER: "pointer",
+            ParameterKind.TENSOR: "pointer",
+            ParameterKind.SCALAR: "scalar",
+            ParameterKind.OPAQUE: "opaque",
+        }
+        for index, (expected, raw) in enumerate(
+            zip(expected_parameters, raw_parameters, strict=True)
+        ):
+            if not isinstance(raw, Mapping):
+                raise ValueError(f"CUDA compiled parameter {index} is not an object")
+            if raw.get("kind") != expected_kind[expected.kind]:
+                raise ValueError(
+                    f"CUDA compiled physical parameter {index} kind differs from its ABI view"
+                )
+            if _dtype(str(raw.get("dtype"))) != _dtype(expected.dtype):
+                raise ValueError(
+                    f"CUDA compiled physical parameter {index} dtype differs from its ABI view"
+                )
+            if expected.kind in {ParameterKind.POINTER, ParameterKind.TENSOR} and not isinstance(
+                raw.get("pointee_const"), bool
+            ):
+                raise ValueError(
+                    f"CUDA compiled pointer parameter {index} lacks pointee constness"
+                )
+        return
 
     raw_parameters = observed.get("parameters")
     if not isinstance(raw_parameters, list):
@@ -212,10 +256,9 @@ def _validate_schedule(
     """Bind C to native Harness schedule and explicit grid-enable slots.
 
     Native compile cases historically expose non-unit block extents as their
-    opaque schedule.  A J-only Replay sometimes also needs to know that the
-    Harness enables a non-leading grid coordinate, without learning its held
-    extent.  ``launch_grid_{x,y,z}`` is that pure implementation-selection bit;
-    its value is checked against the real Harness grid and remains MaskC-hidden.
+    opaque schedule. A Replay that uses a non-leading grid coordinate receives
+    that implementation binding through C. ``launch_grid_{x,y,z}`` identifies
+    the coordinate and its value is checked against the real Harness grid.
     """
 
     observed = dict(case.schedule)
@@ -324,10 +367,24 @@ class CudaGate1Runner:
         artifact: Gate1Artifact,
         result: CudaCompileResult,
         case: CudaCompileCase,
+        *,
+        source_kind: str,
     ) -> PTXFingerprint:
         if result.ptx is None or result.entry is None:
             raise ValueError("CUDA compile result lacks PTX/entry")
-        _validate_compiled_interface(artifact, result.interface, frontend="cuda")
+        if source_kind not in {"source", "replay"}:
+            raise ValueError(f"unknown CUDA observation source kind {source_kind!r}")
+        expected_parameters = (
+            case.physical_parameters
+            if source_kind == "source" and case.physical_parameters is not None
+            else case.parameters
+        )
+        _validate_compiled_interface(
+            artifact,
+            result.interface,
+            frontend="cuda",
+            expected_parameters=expected_parameters,
+        )
         interface = _artifact_interface(artifact, case.parameters)
         return fingerprint_ptx(
             result.ptx,
@@ -386,7 +443,12 @@ class CudaGate1Runner:
                 generation.attempts,
             )
         try:
-            replay_fingerprint = self._fingerprint(artifact, compiled, case)
+            replay_fingerprint = self._fingerprint(
+                artifact,
+                compiled,
+                case,
+                source_kind="replay",
+            )
         except Exception as exc:
             return Gate1ArmEvidence(
                 mode,
@@ -424,6 +486,8 @@ class CudaGate1Runner:
         source: CudaKernelSource,
         source_case: CudaCompileCase,
     ) -> Gate1ExecutionResult:
+        if artifact.c.slots:
+            artifact.c.validate_complete_values(path="Gate1 active C")
         digest = canonical_artifact_digest(artifact, observer_level=self.config.observer_level)
         source_compile = self.compiler.compile(source, source_case)
         empty = Gate1ArmEvidence("normal", None, None, None, None)
@@ -441,7 +505,12 @@ class CudaGate1Runner:
             )
         try:
             _validate_schedule(artifact, source_case)
-            source_fingerprint = self._fingerprint(artifact, source_compile, source_case)
+            source_fingerprint = self._fingerprint(
+                artifact,
+                source_compile,
+                source_case,
+                source_kind="source",
+            )
         except Exception as exc:
             normal = Gate1ArmEvidence(
                 "normal", None, None, None, None,
@@ -507,9 +576,6 @@ class CudaGate1Runner:
             observer_profile=CUDA_OBSERVER_PROFILE,
             normal_candidates=normal_candidates,
             selected_normal_index=selected_normal_index,
-            masked_j_independent_writer=(
-                True if self.config.run_masked_j else None
-            ),
             source_normalization=_normalization_receipt(
                 artifact,
                 frontend="cuda",
@@ -633,6 +699,8 @@ class TileLangGate1Runner:
         source: TileLangKernelSource,
         source_case: TileLangCompileCase,
     ) -> Gate1ExecutionResult:
+        if artifact.c.slots:
+            artifact.c.validate_complete_values(path="Gate1 active C")
         digest = canonical_artifact_digest(artifact, observer_level=self.config.observer_level)
         source_compile = self.compiler.compile(source, source_case)
         empty = Gate1ArmEvidence("normal", None, None, None, None)
@@ -716,9 +784,6 @@ class TileLangGate1Runner:
             observer_profile=TILELANG_OBSERVER_PROFILE,
             normal_candidates=normal_candidates,
             selected_normal_index=selected_normal_index,
-            masked_j_independent_writer=(
-                True if self.config.run_masked_j else None
-            ),
             source_normalization=_normalization_receipt(
                 artifact,
                 frontend="tilelang",

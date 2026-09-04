@@ -1,4 +1,4 @@
-"""Isolated compile-only CuTe DSL frontend for strict Gate1 observation."""
+"""Isolated compile-only CuTe frontend for strict Gate1 observation."""
 
 from __future__ import annotations
 

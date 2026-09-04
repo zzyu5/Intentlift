@@ -17,10 +17,12 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import intentir.backend.cuda.compile as backend_compile
+from intentir.ir.intent_op_contract import RAGGED_OPS
 
 
 _INTENT_OP_NAMES = (
     "arg_reduce",
+    "atomic_scatter",
     "cast",
     "concat",
     "const",
@@ -40,6 +42,7 @@ _INTENT_OP_NAMES = (
     "polar",
     "pool",
     "rand",
+    *sorted(RAGGED_OPS),
     "reduce",
     "scan",
     "scatter",
@@ -160,9 +163,32 @@ class VariantSelection:
         elif self.fast_path_id is not None or self.pass_argument is not None:
             raise ValueError("generic selection cannot carry a specialized pass")
 
+    @property
+    def pipeline_id(self) -> str:
+        """Return the exact compiler pipeline selected by this probe.
+
+        Ragged lowering remains in the generic candidate class because it is a
+        mandatory ABI consumer rather than an optional tunable specialization.
+        Its descriptor-aware pass still has a distinct pipeline identity, and
+        that identity must survive the selection boundary instead of being
+        collapsed into the ordinary tensor-to-Linalg fallback.
+        """
+
+        if any(
+            attempt.fast_path_id == RAGGED_FAST_PATH_ID
+            for attempt in self.attempts
+        ):
+            return RAGGED_FAST_PATH_ID
+        return (
+            "cuda.pipeline.direct-specialized.v1"
+            if self.pipeline_kind == "specialized"
+            else "cuda.pipeline.linalg-materialized.v1"
+        )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "pipeline_kind": self.pipeline_kind,
+            "pipeline_id": self.pipeline_id,
             "target": self.target.to_dict(),
             "fast_path_id": self.fast_path_id,
             "pass_argument": self.pass_argument,
@@ -1012,7 +1038,7 @@ DEFAULT_PASSES: tuple[PassDescriptor, ...] = (
         fast_path_id="cuda.upsample.nearest.v1",
         pass_argument="-convert-intent-upsample-to-gpu",
         supported_chips=("sm_120a",),
-        description="nearest-neighbor upsample lowering",
+        description="nearest-neighbor/bicubic upsample lowering",
     ),
     PassDescriptor(
         fast_path_id="cuda.polar.elementwise.v1",
@@ -1020,6 +1046,15 @@ DEFAULT_PASSES: tuple[PassDescriptor, ...] = (
         supported_chips=("sm_120a",),
         description="polar real/imag pair lowering",
     ),
+)
+
+
+RAGGED_FAST_PATH_ID = "cuda.ragged.descriptor-aware"
+_RAGGED_DESCRIPTOR_PASS = PassDescriptor(
+    fast_path_id=RAGGED_FAST_PATH_ID,
+    pass_argument="-convert-intent-ragged-to-gpu",
+    supported_chips=_PORTABLE_BLOCK_CUDA_CHIPS,
+    description="descriptor-aware lowering of a closed local Ragged query",
 )
 
 
@@ -1075,6 +1110,86 @@ def select_variant(
 
     text = read_intent_module(intent_module)
     selected_target = target or LoweringTarget()
+    # Ragged descriptors use the descriptor-aware CUDA C++ lowering.  The
+    # existing specialized flat-tensor probes must not see the tuple, while
+    # the generic compiler entry still owns the pass selection and launch ABI.
+    has_ragged = any(
+        f"intent.{name}" in text
+        for name in RAGGED_OPS
+    )
+    if has_ragged:
+        if only_fast_path not in (None, RAGGED_FAST_PATH_ID):
+            raise ValueError(
+                "CUDA Ragged modules admit only the descriptor-aware lowering"
+            )
+        overrides = dict(pass_overrides or {})
+        unknown_overrides = sorted(set(overrides) - {RAGGED_FAST_PATH_ID})
+        if unknown_overrides:
+            raise ValueError(
+                "Ragged pass overrides reference unknown fast paths: "
+                f"{unknown_overrides}"
+            )
+        pass_argument = overrides.get(
+            RAGGED_FAST_PATH_ID, _RAGGED_DESCRIPTOR_PASS.pass_argument
+        )
+        if pass_argument != _RAGGED_DESCRIPTOR_PASS.pass_argument:
+            raise ValueError(
+                "CUDA Ragged lowering has no tunable pass override; use the "
+                "registered descriptor-aware pass"
+            )
+        if selected_target.chip not in _RAGGED_DESCRIPTOR_PASS.supported_chips:
+            attempt = ProbeAttempt(
+                fast_path_id=RAGGED_FAST_PATH_ID,
+                pass_argument=pass_argument,
+                target_match=False,
+                status="rejected_target",
+                direct_hit=False,
+                reason=f"target {selected_target.chip!r} is unsupported",
+            )
+        else:
+            try:
+                probe = backend_compile._run(
+                    [backend_compile.INTENT_OPT, pass_argument], stdin=text
+                )
+            except Exception as error:
+                attempt = ProbeAttempt(
+                    fast_path_id=RAGGED_FAST_PATH_ID,
+                    pass_argument=pass_argument,
+                    target_match=True,
+                    status="probe_error",
+                    direct_hit=False,
+                    reason=f"{type(error).__name__}: {error}",
+                )
+            else:
+                residuals = residual_intent_ops(probe)
+                launch_count = gpu_launch_count(probe)
+                direct_hit = not residuals and launch_count >= 1
+                attempt = ProbeAttempt(
+                    fast_path_id=RAGGED_FAST_PATH_ID,
+                    pass_argument=pass_argument,
+                    target_match=True,
+                    status="selected" if direct_hit else "rejected_structure",
+                    direct_hit=direct_hit,
+                    residual_ops=residuals,
+                    gpu_launch_count=launch_count,
+                    reason=(
+                        "descriptor-aware Ragged lowering consumed the complete graph"
+                        if direct_hit
+                        else "descriptor-aware Ragged lowering did not consume the complete graph"
+                    ),
+                )
+        # This pass is required ABI lowering, not an optional flat-tensor
+        # specialization.  Therefore allow_specialized=False must not bypass
+        # its probe, and the result stays in the generic pipeline class.
+        return VariantSelection(
+            pipeline_kind="generic",
+            target=selected_target,
+            fast_path_id=None,
+            pass_argument=None,
+            scf_to_cf=False,
+            attempts=(attempt,),
+            generic_fallback=False,
+        )
     if not allow_specialized:
         return VariantSelection(
             pipeline_kind="generic",

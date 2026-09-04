@@ -20,6 +20,7 @@ from ..toolchain.tools import (
     MLIR_OPT,
     MLIR_TRANSLATE,
 )
+from ...ir.intent_op_contract import RAGGED_OPS
 from .abi import CPU_MEMREF_ABI_PROTOCOL
 
 
@@ -93,10 +94,31 @@ def _run_text(argv: Sequence[str], source: str, *, stage: str) -> str:
     return completed.stdout
 
 
+def _has_ragged_ops(source: str) -> bool:
+    return any(f"intent.{name}" in source for name in RAGGED_OPS)
+
+
+def _validate_ragged_lowering(source: str, lowered: str, *, stage: str) -> None:
+    if not _has_ragged_ops(source):
+        return
+    if _has_ragged_ops(lowered) or "tuple<" in lowered:
+        raise RuntimeError(
+            f"{stage} left a Ragged descriptor or Intent Ragged operation in "
+            "the CPU native ABI"
+        )
+
+
 @dataclass(frozen=True)
 class CompiledCPUModule:
     shared_object: Path
     toolchain: tuple[tuple[str, str], ...]
+    # Keep the actual compiler-stage outputs available until the execution
+    # boundary has recorded which target realization record consumed them.
+    # The final shared object alone cannot prove that the preceding pipeline
+    # record was consumed independently.
+    intent_mlir: str = ""
+    llvm_mlir: str = ""
+    llvm_ir: str = ""
 
     @property
     def evidence(self) -> dict[str, Any]:
@@ -126,11 +148,13 @@ def compile_cpu_module(source: str) -> CompiledCPUModule:
         source,
         stage="intent-opt",
     )
+    _validate_ragged_lowering(source, intent_mlir, stage="intent-opt")
     llvm_mlir = _run_text(
         [str(mlir_opt), *CPU_LOWERING_PIPELINE],
         intent_mlir,
         stage="mlir-opt",
     )
+    _validate_ragged_lowering(source, llvm_mlir, stage="mlir-opt")
     llvm_ir = _run_text(
         [str(mlir_translate), "--mlir-to-llvmir"],
         llvm_mlir,
@@ -180,6 +204,9 @@ def compile_cpu_module(source: str) -> CompiledCPUModule:
             ("clang", str(clang)),
             ("mlir_c_runner_utils", str(c_runner_utils)),
         ),
+        intent_mlir=intent_mlir,
+        llvm_mlir=llvm_mlir,
+        llvm_ir=llvm_ir,
     )
 
 

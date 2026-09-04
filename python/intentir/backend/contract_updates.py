@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from intentir.ir.model import IntentOp
+from intentir.ir.model import IntentOp, walk_intent_op_paths
 from intentir.verify.gate1.model import (
     DuplicatePolicy,
     LogicalUpdateSpec,
@@ -17,20 +17,7 @@ from intentir.verify.gate1.model import (
 def canonical_node_table(j: SemanticArchive) -> dict[str, IntentOp]:
     """Resolve canonical node ids to their typed Layer-A operations."""
 
-    by_path: dict[str, IntentOp] = {}
-
-    def visit(body: Sequence[IntentOp], prefix: str = "body") -> None:
-        for index, operation in enumerate(body):
-            path = f"{prefix}[{index}]"
-            by_path[path] = operation
-            visit(operation.body, f"{path}.body")
-            if operation.op in {"effect_if", "value_if"}:
-                if operation.positive is not None:
-                    visit(operation.positive.body, f"{path}.positive.body")
-                if operation.negative is not None:
-                    visit(operation.negative.body, f"{path}.negative.body")
-
-    visit(j.intent.body)
+    by_path = dict(walk_intent_op_paths(j.intent.body))
     return {
         node_ref: by_path[path]
         for node_ref, path in j.node_ids.items()

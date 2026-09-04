@@ -12,9 +12,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 import json
 import re
-from typing import Any, Callable, Mapping, Protocol
+import time
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from intentir.ir.canonical_j import canonicalize_gate1_artifact
+from intentir.ir.layer_c import (
+    LayerCInterface,
+    binding_interface_digest,
+    source_layer_c_interface,
+)
 from .gate1.model import Gate1Artifact, Gate1Status, JNecessityStatus
 from .gate1.orchestrate import (
     Gate1ExecutionResult,
@@ -25,6 +31,11 @@ from .typecheck import TypeCheckReport, TypeCheckStatus, type_check
 
 
 MAX_GATE1_ROUNDS = 3
+# One logical Lift invocation produces one complete candidate artifact (or one
+# rejected candidate transaction).  This is deliberately separate from the
+# formal Replay/Gate1-round budget and from an adapter's physical provider
+# retry count.  It is the shared temporary cap for every branch lifecycle.
+MAX_LIFT_CALLS = 3
 # Zero means that pre-Replay construction is governed by the Lift owner's
 # terminal resource signal rather than a semantic-attempt count.  A positive
 # value remains available as an explicit legacy/diagnostic override.
@@ -84,6 +95,31 @@ def _feedback_item(value: Any) -> Any:
             for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
         }
     return value
+
+
+def _prune_relift_diagnostics(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain the current frontier without recursively replaying old envelopes."""
+
+    copied = json.loads(json.dumps(dict(value), allow_nan=False))
+    envelope_keys = {UNRESOLVED_GATE1_DIAGNOSTIC, UNRESOLVED_GATE2_DIAGNOSTIC}
+
+    def visit(item: Any, depth: int) -> Any:
+        if isinstance(item, list):
+            return [visit(child, depth + 1) for child in item]
+        if not isinstance(item, dict):
+            return item
+        result: dict[str, Any] = {}
+        for key, child in item.items():
+            key = str(key)
+            if depth > 0 and key in envelope_keys:
+                continue
+            result[key] = visit(child, depth + 1)
+        return result
+
+    result = visit(copied, 0)
+    if not isinstance(result, dict):
+        raise TypeError("relift diagnostics must remain an object")
+    return result
 
 
 def _changed_json_paths(
@@ -1032,6 +1068,7 @@ class CandidateLiftError(RuntimeError):
         *,
         physical_calls: int = 1,
         terminal: bool = False,
+        candidate_draft: Mapping[str, Any] | None = None,
     ) -> None:
         self.diagnostics = dict(diagnostics)
         if not isinstance(physical_calls, int) or physical_calls < 0:
@@ -1040,6 +1077,22 @@ class CandidateLiftError(RuntimeError):
             raise TypeError("CandidateLiftError.terminal must be boolean")
         self.physical_calls = physical_calls
         self.terminal = terminal
+        if candidate_draft is not None:
+            if not isinstance(candidate_draft, Mapping):
+                raise TypeError("CandidateLiftError.candidate_draft must be a mapping")
+            draft = json.loads(
+                json.dumps(dict(candidate_draft), sort_keys=True, allow_nan=False)
+            )
+            if not isinstance(draft, dict):
+                raise TypeError("CandidateLiftError.candidate_draft must be an object")
+            c = draft.get("c")
+            if isinstance(c, Mapping) and "values" in c and c.get("values") != {}:
+                raise ValueError(
+                    "CandidateLiftError.candidate_draft must be value-free"
+                )
+            self.candidate_draft = draft
+        else:
+            self.candidate_draft = None
         super().__init__(str(self.diagnostics.get("diagnostic", "Lift rejected")))
 
 
@@ -1062,10 +1115,30 @@ class HarnessBindingInstance:
         *,
         gate1_case: Any,
         gate2_context: Any = None,
+        slot_order: Sequence[str] | None = None,
     ) -> "HarnessBindingInstance":
         if not isinstance(c_values, Mapping):
             raise TypeError("Harness c0 values must be a mapping")
-        ordered = tuple(sorted(c_values.items()))
+        names = tuple(c_values)
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("Harness c0 slot names must be non-empty strings")
+        if slot_order is None:
+            ordered = tuple(c_values.items())
+        else:
+            if isinstance(slot_order, (str, bytes)):
+                raise TypeError("Harness c0 slot_order must be a sequence of names")
+            ordered_names = tuple(slot_order)
+            if any(
+                not isinstance(name, str) or not name for name in ordered_names
+            ):
+                raise ValueError("Harness c0 slot_order names must be non-empty strings")
+            if len(ordered_names) != len(set(ordered_names)):
+                raise ValueError("Harness c0 slot_order must be unique")
+            if set(ordered_names) != set(names):
+                raise ValueError(
+                    "Harness c0 slot_order must cover exactly the supplied bindings"
+                )
+            ordered = tuple((name, c_values[name]) for name in ordered_names)
         if any(not isinstance(name, str) or not name for name, _ in ordered):
             raise ValueError("Harness c0 slot names must be non-empty strings")
         return cls(ordered, gate1_case, gate2_context)
@@ -1084,14 +1157,75 @@ class HarnessBindingInstance:
 
 @dataclass(frozen=True)
 class SourceProgram:
-    """Privileged Source material shared by Lift and frontend execution only."""
+    """Privileged Source material shared by Lift and frontend execution only.
+
+    ``text`` is the selected source projection used by the Lift owner.  Native
+    frontends may need a language-specific projection (for example one CUDA
+    device entry) while ``gate_source`` retains the real module/file consumed
+    by the compiler and observer.  The optional fields keep that distinction
+    explicit instead of sending C++ through the Python AST anonymizer.
+    """
 
     text: str
     gate_source: Any
+    lift_source_kind: str = "python"
+    lift_source_symbol: str | None = None
+    lift_parameter_order: tuple[str, ...] = ()
+    lift_constexpr_parameters: tuple[str, ...] = ()
+    lift_source_to_opaque: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not self.text.strip():
             raise ValueError("SourceProgram.text must be non-empty")
+        if self.lift_source_kind not in {"python", "cuda"}:
+            raise ValueError(
+                "SourceProgram.lift_source_kind must be 'python' or 'cuda'"
+            )
+        parameter_order = tuple(self.lift_parameter_order)
+        constexpr_parameters = tuple(self.lift_constexpr_parameters)
+        if any(
+            not isinstance(name, str) or not name.isidentifier()
+            for name in (*parameter_order, *constexpr_parameters)
+        ):
+            raise ValueError("SourceProgram Lift parameter names must be identifiers")
+        if len(parameter_order) != len(set(parameter_order)):
+            raise ValueError("SourceProgram Lift parameter order must be unique")
+        if len(constexpr_parameters) != len(set(constexpr_parameters)):
+            raise ValueError("SourceProgram Lift constexpr parameters must be unique")
+        if not set(constexpr_parameters) <= set(parameter_order):
+            raise ValueError(
+                "SourceProgram Lift constexpr parameters must be in parameter order"
+            )
+        mapping = tuple(self.lift_source_to_opaque)
+        if len({source for source, _opaque in mapping}) != len(mapping):
+            raise ValueError("SourceProgram Lift source mapping must be one-to-one")
+        if len({opaque for _source, opaque in mapping}) != len(mapping):
+            raise ValueError("SourceProgram Lift opaque mapping must be one-to-one")
+        if any(
+            not isinstance(source, str)
+            or not source.isidentifier()
+            or not isinstance(opaque, str)
+            or not opaque.isidentifier()
+            for source, opaque in mapping
+        ):
+            raise ValueError("SourceProgram Lift mappings must contain identifiers")
+        if self.lift_source_kind == "cuda":
+            if not isinstance(self.lift_source_symbol, str) or not self.lift_source_symbol.isidentifier():
+                raise ValueError(
+                    "CUDA SourceProgram Lift projection requires a source symbol"
+                )
+            if not parameter_order:
+                raise ValueError(
+                    "CUDA SourceProgram Lift projection requires parameter order"
+                )
+            mapped_sources = {source for source, _opaque in mapping}
+            if not set(parameter_order) <= mapped_sources:
+                raise ValueError(
+                    "CUDA SourceProgram Lift mapping must cover every source parameter"
+                )
+        object.__setattr__(self, "lift_parameter_order", parameter_order)
+        object.__setattr__(self, "lift_constexpr_parameters", constexpr_parameters)
+        object.__setattr__(self, "lift_source_to_opaque", mapping)
 
 
 @dataclass(frozen=True)
@@ -1101,8 +1235,31 @@ class LiftFeedback:
     formal_round: int | None = None
     previous_artifact: Gate1Artifact | None = None
     selection_rank: tuple[int | float, ...] | None = None
+    previous_candidate: Mapping[str, Any] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.previous_candidate is not None:
+            if self.previous_artifact is not None:
+                raise ValueError(
+                    "LiftFeedback cannot carry both a previous artifact and a "
+                    "rejected candidate"
+                )
+            if not isinstance(self.previous_candidate, Mapping):
+                raise TypeError("previous_candidate must be a mapping")
+            candidate = json.loads(
+                json.dumps(
+                    dict(self.previous_candidate),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+            )
+            if not isinstance(candidate, dict):
+                raise TypeError("previous_candidate must be an object")
+            c = candidate.get("c")
+            if isinstance(c, Mapping) and "values" in c and c.get("values") != {}:
+                raise ValueError("previous_candidate must be value-free")
+            object.__setattr__(self, "previous_candidate", candidate)
         if self.selection_rank is None:
             return
         if self.kind is not FeedbackKind.GATE1:
@@ -1129,6 +1286,10 @@ class LiftFeedback:
                 list(self.selection_rank)
                 if self.selection_rank is not None else None
             ),
+            "previous_candidate": (
+                dict(self.previous_candidate)
+                if self.previous_candidate is not None else None
+            ),
         }
 
 
@@ -1147,21 +1308,46 @@ class LiftCallResult:
             raise ValueError("LiftCallResult.physical_calls must be positive")
         if not isinstance(self.metadata, Mapping):
             raise TypeError("LiftCallResult.metadata must be a mapping")
+        payload = self.metadata.get("layer_c_interface")
+        digest = self.metadata.get("layer_c_interface_digest")
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                "LiftCallResult requires a standalone Layer-C interface sidecar"
+            )
+        try:
+            interface = LayerCInterface.from_dict(payload)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "LiftCallResult Layer-C interface sidecar is malformed"
+            ) from exc
+        expected = source_layer_c_interface(self.artifact.j, self.artifact.c)
+        if interface != expected:
+            raise ValueError(
+                "LiftCallResult Layer-C interface differs from Source-C declarations"
+            )
+        expected_digest = binding_interface_digest(interface)
+        if digest != expected_digest:
+            raise ValueError(
+                "LiftCallResult Layer-C interface digest is missing or stale"
+            )
 
 
 @dataclass(frozen=True)
 class SCRCRunRequest:
     """Source and one real Harness binding instance (the same c0).
 
-    ``max_pre_replay_rejections == 0`` delegates termination to the branch-local
-    Lift owner's time/resource budget.  Only ``max_gate1_rounds`` bounds formal,
-    TypeCheck-valid candidates that enter a fresh Replay/Gate1 round.
+    ``max_lift_calls`` bounds logical Lift invocations for this branch.  It is
+    independent of physical provider retries inside one invocation and of the
+    formal Replay/Gate1-round budget.  ``max_pre_replay_rejections == 0`` still
+    delegates that narrower rejection policy to the branch-local Lift owner's
+    terminal resource signal, but it cannot bypass the Lift cap.
     """
 
     source: SourceProgram
     binding: HarnessBindingInstance
     frontend: str
     max_gate1_rounds: int = MAX_GATE1_ROUNDS
+    max_lift_calls: int = MAX_LIFT_CALLS
     max_pre_replay_rejections: int = MAX_PRE_REPLAY_REJECTIONS
 
     def __post_init__(self) -> None:
@@ -1173,6 +1359,14 @@ class SCRCRunRequest:
             raise TypeError("SCRC request requires one HarnessBindingInstance")
         if not isinstance(self.max_gate1_rounds, int) or self.max_gate1_rounds < 1:
             raise ValueError("max_gate1_rounds must be positive")
+        if (
+            not isinstance(self.max_lift_calls, int)
+            or self.max_lift_calls < 1
+            or self.max_lift_calls > MAX_LIFT_CALLS
+        ):
+            raise ValueError(
+                f"max_lift_calls must be in [1, {MAX_LIFT_CALLS}]"
+            )
         if (
             not isinstance(self.max_pre_replay_rejections, int)
             or self.max_pre_replay_rejections < 0
@@ -1273,6 +1467,7 @@ class SCRCGate1SearchReport:
     stop_reason: str | None = None
     winner_branch_id: int | None = None
     stop_observed_at: str | None = None
+    stage_metrics: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     @property
     def closed(self) -> bool:
@@ -1295,6 +1490,10 @@ class SCRCGate1SearchReport:
             "stop_reason": self.stop_reason,
             "winner_branch_id": self.winner_branch_id,
             "stop_observed_at": self.stop_observed_at,
+            "stage_metrics": {
+                str(key): dict(value)
+                for key, value in self.stage_metrics.items()
+            },
         }
 
 
@@ -1306,6 +1505,7 @@ class SCRCRunReport:
     gate2: Gate2SuiteResult | None
     j_necessity_status: JNecessityStatus | None
     call_budget: CallBudget
+    stage_metrics: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1318,6 +1518,10 @@ class SCRCRunReport:
                 if self.j_necessity_status is not None else None
             ),
             "call_budget": self.call_budget.to_json(),
+            "stage_metrics": {
+                str(key): dict(value)
+                for key, value in self.stage_metrics.items()
+            },
         }
 
 
@@ -1327,6 +1531,7 @@ class SCRCRunDependencies:
     gate1_factory: Callable[[int], Gate1AttemptAdapter]
     gate2: Gate2ExecutionAdapter
     type_checker: Callable[..., TypeCheckReport] = type_check
+    semantic_probe: Callable[[Gate1Artifact], Mapping[str, Any]] | None = None
 
 
 class SCRCGateRunner:
@@ -1334,6 +1539,35 @@ class SCRCGateRunner:
 
     def __init__(self, dependencies: SCRCRunDependencies) -> None:
         self.dependencies = dependencies
+
+    @staticmethod
+    def _run_semantic_probe(
+        callback: Callable[[Gate1Artifact], Mapping[str, Any]],
+        artifact: Gate1Artifact,
+    ) -> dict[str, Any]:
+        """Run the public Source-vs-J diagnostic without granting it authority."""
+
+        try:
+            raw = callback(artifact)
+            if not isinstance(raw, Mapping):
+                raise TypeError("semantic probe must return a mapping")
+            result = dict(raw)
+            if result.get("status") not in {"pass", "diverged", "unavailable"}:
+                raise ValueError(
+                    "semantic probe status must be pass, diverged, or unavailable"
+                )
+            json.dumps(result, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        except Exception as exc:
+            result = {
+                "protocol": "intentir.lift.public-semantic-probe.v1",
+                "status": "unavailable",
+                "diagnostic": f"{type(exc).__name__}: {exc}",
+            }
+        result.setdefault(
+            "authority",
+            "public diagnostic only; not CandidateCheck or certification",
+        )
+        return result
 
     @classmethod
     def _gate1_feedback(
@@ -1365,6 +1599,7 @@ class SCRCGateRunner:
         unresolved_gate2 = cls._unresolved_gate2(prior_feedback)
         if unresolved_gate2 is not None:
             diagnostics[UNRESOLVED_GATE2_DIAGNOSTIC] = unresolved_gate2
+        diagnostics = _prune_relift_diagnostics(diagnostics)
         return LiftFeedback(
             FeedbackKind.GATE1,
             diagnostics,
@@ -1504,7 +1739,7 @@ class SCRCGateRunner:
             return None
         return {
             "formal_round": formal_round,
-            "diagnostics": dict(diagnostics),
+            "diagnostics": _prune_relift_diagnostics(dict(diagnostics)),
         }
 
     @staticmethod
@@ -1521,7 +1756,7 @@ class SCRCGateRunner:
         diagnostics = retained.get("diagnostics")
         if not isinstance(diagnostics, Mapping):
             return None
-        return {"diagnostics": dict(diagnostics)}
+        return {"diagnostics": _prune_relift_diagnostics(dict(diagnostics))}
 
     @classmethod
     def _retain_gate1_diagnostic(
@@ -1536,7 +1771,7 @@ class SCRCGateRunner:
         unresolved_gate2 = cls._unresolved_gate2(feedback)
         if unresolved_gate2 is not None:
             combined[UNRESOLVED_GATE2_DIAGNOSTIC] = unresolved_gate2
-        return combined
+        return _prune_relift_diagnostics(combined)
 
     def search_gate1(
         self,
@@ -1556,6 +1791,41 @@ class SCRCGateRunner:
         parent; it never edits the artifact, and all new Replay/Gate work is
         counted in this search.
         """
+
+        search_started = time.monotonic()
+        stage_metrics: dict[str, dict[str, Any]] = {}
+
+        def record_stage(
+            name: str,
+            started: float,
+            status: str,
+            **details: Any,
+        ) -> None:
+            entry = stage_metrics.setdefault(
+                name,
+                {"elapsed_ms": 0.0, "runs": 0},
+            )
+            entry["elapsed_ms"] += max(
+                0.0,
+                (time.monotonic() - started) * 1000.0,
+            )
+            entry["runs"] += 1
+            entry["status"] = status
+            entry.update(details)
+
+        def completed_metrics(status: str) -> dict[str, Mapping[str, Any]]:
+            result = {
+                name: dict(value) for name, value in stage_metrics.items()
+            }
+            result["search_total"] = {
+                "elapsed_ms": max(
+                    0.0,
+                    (time.monotonic() - search_started) * 1000.0,
+                ),
+                "runs": 1,
+                "status": status,
+            }
+            return result
 
         if initial_feedback is not None:
             if not isinstance(initial_feedback, LiftFeedback):
@@ -1647,12 +1917,21 @@ class SCRCGateRunner:
                 stop_reason="first_gate1_closure",
                 winner_branch_id=winner,
                 stop_observed_at=observed_at,
+                stage_metrics=completed_metrics("superseded"),
             )
 
         while formal_rounds < request.max_gate1_rounds:
             stopped = superseded("before_lift")
             if stopped is not None:
                 return stopped
+            if (
+                pending_initial_artifact is None
+                and lift_calls >= request.max_lift_calls
+            ):
+                terminal_stop_reason = "lift_call_cap"
+                terminal_stop_observed_at = "before_lift"
+                break
+            lift_started = time.monotonic()
             if pending_initial_artifact is not None:
                 artifact = canonicalize_gate1_artifact(
                     pending_initial_artifact
@@ -1663,7 +1942,23 @@ class SCRCGateRunner:
                     "initial_artifact_gate1_retry": True,
                     "model_calls": 0,
                 }
+                initial_interface = source_layer_c_interface(
+                    artifact.j, artifact.c
+                )
+                lift_metadata = {
+                    **lift_metadata,
+                    "layer_c_interface": initial_interface.to_dict(),
+                    "layer_c_interface_digest": binding_interface_digest(
+                        initial_interface
+                    ),
+                }
                 last_artifact = artifact
+                record_stage(
+                    "lift",
+                    lift_started,
+                    "initial_artifact_retry",
+                    attempt=0,
+                )
             else:
                 lift_calls += 1
                 _notify_progress(
@@ -1676,6 +1971,12 @@ class SCRCGateRunner:
                 try:
                     lift_result = self.dependencies.lift.lift(request, feedback)
                 except CandidateLiftError as exc:
+                    record_stage(
+                        "lift",
+                        lift_started,
+                        "rejected",
+                        attempt=lift_calls,
+                    )
                     lift_physical_calls += exc.physical_calls
                     if not exc.terminal:
                         pre_replay_rejections += 1
@@ -1686,11 +1987,18 @@ class SCRCGateRunner:
                         None,
                         "rejected",
                     )
+                    previous_candidate = exc.candidate_draft
+                    if previous_candidate is None and (
+                        feedback is not None
+                        and feedback.kind is FeedbackKind.LIFT
+                    ):
+                        previous_candidate = feedback.previous_candidate
                     feedback = LiftFeedback(
                         FeedbackKind.LIFT,
                         self._retain_gate1_diagnostic(exc.diagnostics, feedback),
                         None,
-                        last_artifact,
+                        None if previous_candidate is not None else last_artifact,
+                        previous_candidate=previous_candidate,
                     )
                     attempts.append(
                         CandidateAttemptReport(
@@ -1724,6 +2032,12 @@ class SCRCGateRunner:
                         "Lift adapter must return LiftCallResult"
                     )
                 lift_physical_calls += lift_result.physical_calls
+                record_stage(
+                    "lift",
+                    lift_started,
+                    "finished",
+                    attempt=lift_calls,
+                )
                 _notify_progress(
                     progress_callback,
                     "lift",
@@ -1747,8 +2061,16 @@ class SCRCGateRunner:
                     )
                 )
                 return superseded("after_lift") or stopped
+            bind_started = time.monotonic()
             request.binding.validate_artifact(artifact)
+            record_stage(
+                "bind_source",
+                bind_started,
+                "finished",
+                attempt=attempt_lift_call,
+            )
             typecheck_calls += 1
+            typecheck_started = time.monotonic()
             _notify_progress(
                 progress_callback,
                 "typecheck",
@@ -1761,6 +2083,12 @@ class SCRCGateRunner:
                 artifact.c,
                 artifact.pi,
                 require_program_axes=artifact.wire_schema == artifact.SCHEMA,
+            )
+            record_stage(
+                "typecheck",
+                typecheck_started,
+                report.status.value,
+                attempt=attempt_lift_call,
             )
             _notify_progress(
                 progress_callback,
@@ -1803,6 +2131,81 @@ class SCRCGateRunner:
                     break
                 continue
 
+            semantic_probe = self.dependencies.semantic_probe
+            if semantic_probe is not None:
+                semantic_probe_started = time.monotonic()
+                _notify_progress(
+                    progress_callback,
+                    "semantic_probe",
+                    attempt_lift_call,
+                    None,
+                    "started",
+                )
+                probe_result = self._run_semantic_probe(semantic_probe, artifact)
+                lift_metadata = {
+                    **dict(lift_metadata),
+                    "semantic_probe": probe_result,
+                }
+                _notify_progress(
+                    progress_callback,
+                    "semantic_probe",
+                    attempt_lift_call,
+                    None,
+                    str(probe_result.get("status", "unavailable")),
+                )
+                record_stage(
+                    "semantic_probe",
+                    semantic_probe_started,
+                    str(probe_result.get("status", "unavailable")),
+                    attempt=attempt_lift_call,
+                )
+                if probe_result.get("status") == "diverged":
+                    pre_replay_rejections += 1
+                    feedback = LiftFeedback(
+                        FeedbackKind.LIFT,
+                        self._retain_gate1_diagnostic(
+                            {
+                                "diagnostic": (
+                                    "public Source-vs-J semantic probe found a "
+                                    "divergence"
+                                ),
+                                "failure_class": "lift_semantic_probe_diverged",
+                                "semantic_probe": probe_result,
+                                "authority": (
+                                    "diagnostic-only public Source-vs-J comparison; "
+                                    "it never edits or certifies the artifact"
+                                ),
+                            },
+                            feedback,
+                        ),
+                        None,
+                        artifact,
+                    )
+                    attempts.append(
+                        CandidateAttemptReport(
+                            lift_call=attempt_lift_call,
+                            formal_round=None,
+                            typecheck_status=TypeCheckStatus.PASS,
+                            artifact=artifact,
+                            typecheck=report,
+                            feedback=feedback,
+                            lift_metadata=lift_metadata,
+                        )
+                    )
+                    last_artifact = artifact
+                    stopped = superseded("after_semantic_probe")
+                    if stopped is not None:
+                        return stopped
+                    if (
+                        request.max_pre_replay_rejections > 0
+                        and pre_replay_rejections
+                        >= request.max_pre_replay_rejections
+                    ):
+                        terminal_stop_reason = "pre_replay_rejection_cap"
+                        terminal_stop_observed_at = "after_semantic_probe"
+                        break
+                    continue
+
             stopped = superseded("before_replay")
             if stopped is not None:
                 attempts.append(
@@ -1831,7 +2234,14 @@ class SCRCGateRunner:
                     "gate1_factory reused an attempt adapter; Replay must be fresh"
                 )
             gate1_adapters.append(gate1_adapter)
+            replay_gate1_started = time.monotonic()
             gate1 = gate1_adapter.run(artifact, request)
+            record_stage(
+                "replay_gate1",
+                replay_gate1_started,
+                gate1.status.value,
+                formal_round=next_formal_round,
+            )
             normal_arms_for_progress = (
                 gate1.normal_candidates
                 if gate1.normal_candidates
@@ -1961,6 +2371,7 @@ class SCRCGateRunner:
                         call_budget=budget(),
                         stop_reason="observer_unsupported",
                         stop_observed_at="after_gate1",
+                        stage_metrics=completed_metrics("no_closure"),
                     )
 
                 candidate_feedback = self._gate1_feedback(
@@ -2025,6 +2436,7 @@ class SCRCGateRunner:
                     if gate1.masked_j is not None else None
                 ),
                 call_budget=budget(),
+                stage_metrics=completed_metrics("gate1_closed"),
             )
 
         return SCRCGate1SearchReport(
@@ -2035,6 +2447,7 @@ class SCRCGateRunner:
             call_budget=budget(),
             stop_reason=terminal_stop_reason,
             stop_observed_at=terminal_stop_observed_at,
+            stage_metrics=completed_metrics("no_closure"),
         )
 
     @staticmethod
@@ -2073,6 +2486,7 @@ class SCRCGateRunner:
     ) -> SCRCRunReport:
         """Run Gate2 exactly once for a winner selected without Gate2 evidence."""
 
+        gate2_total_started = time.monotonic()
         accepted = self._accepted_search_attempt(search)
         artifact = accepted.artifact
         typecheck_report = accepted.typecheck
@@ -2080,6 +2494,7 @@ class SCRCGateRunner:
         assert artifact is not None
         assert typecheck_report is not None
         assert gate1 is not None
+        gate2_started = time.monotonic()
         try:
             gate2 = self.dependencies.gate2.execute(artifact, gate1, request)
         except Exception as exc:
@@ -2092,8 +2507,24 @@ class SCRCGateRunner:
                     "gate1": gate1.to_json(),
                     "attempts": [item.to_json() for item in search.attempts],
                     "formal_round": search.accepted_attempt,
+                    "stage_metrics": dict(search.stage_metrics),
                 },
             ) from exc
+        stage_metrics = {
+            name: dict(value) for name, value in search.stage_metrics.items()
+        }
+        gate2_elapsed_ms = (time.monotonic() - gate2_started) * 1000.0
+        stage_metrics["gate2"] = {
+            "elapsed_ms": gate2_elapsed_ms,
+            "runs": 1,
+            "status": "passed" if gate2.passed else "failed",
+            "cases": len(gate2.cases),
+        }
+        stage_metrics["gate2_total"] = {
+            "elapsed_ms": (time.monotonic() - gate2_total_started) * 1000.0,
+            "runs": 1,
+            "status": "passed" if gate2.passed else "failed",
+        }
         budget = search.call_budget
         case_count = len(gate2.cases)
         return SCRCRunReport(
@@ -2118,6 +2549,7 @@ class SCRCGateRunner:
                 replay_executions=case_count,
                 refeval_executions=case_count,
             ),
+            stage_metrics=stage_metrics,
         )
 
     def run(
@@ -2139,6 +2571,7 @@ class SCRCGateRunner:
             gate2=None,
             j_necessity_status=None,
             call_budget=search.call_budget,
+            stage_metrics=dict(search.stage_metrics),
         )
 
 
@@ -2156,6 +2589,7 @@ __all__ = [
     "LiftFeedback",
     "MainStatus",
     "MAX_GATE1_ROUNDS",
+    "MAX_LIFT_CALLS",
     "MAX_PRE_REPLAY_REJECTIONS",
     "SCRCGateRunner",
     "SCRCGate1SearchReport",

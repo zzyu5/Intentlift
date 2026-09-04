@@ -5,12 +5,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 from .compare import TTIRComparator, TTIRComparison
 from .compiler import CompileCase, CompileResult, KernelSource, TritonCompiler
 from .model import (
+    Frontend,
     Gate1Artifact,
     Gate1Status,
     JNecessityStatus,
@@ -19,7 +20,8 @@ from .model import (
     opaque_replay_abi,
 )
 from .normalize import normalize_ttir_for_gate1
-from .replay import ReplayGeneration, ReplayWriter
+from .prompt import build_rewriter_payload
+from .replay import ReplayGeneration, ReplayWriter, replay_source_ingress
 from .profile import ObserverProfile, TRITON_OBSERVER_PROFILE
 from .ttir import TTIRFingerprint, TTIRParseError, fingerprint_ttir
 
@@ -249,11 +251,16 @@ def _opaque_python_interface(
         ]
     if sorted(constexpr_indices) != expected_constexpr:
         raise ValueError("compiled constexpr identities differ from artifact harness")
-    # TTIR may drop specialized scalar carriers independently on Source and
-    # Replay.  Preserve their J/Harness ABI identity by Python argument name;
-    # the fingerprint consumes this map only for leaf naming and deliberately
-    # excludes it from the hard public-interface payload.
-    result["ttir_argument_aliases"] = dict(zip(raw_names, aliases, strict=True))
+    # TTIR exposes function arguments as positional ``argN`` names even when
+    # the Python compiler metadata retains the authored/opaque parameter names
+    # (p*/c*).  Bridge those two namespaces by declaration position.  The
+    # fingerprint consumes this map only for leaf naming and deliberately
+    # excludes it from the hard public-interface payload.  Specialized scalar
+    # carriers may disappear from TTIR; the remaining function arguments still
+    # retain their compiler declaration order.
+    result["ttir_argument_aliases"] = {
+        f"arg{index}": alias for index, alias in enumerate(aliases)
+    }
     result["arg_names"] = aliases
     result["constexpr_indices"] = expected_constexpr
     result["constexprs"] = [aliases[index] for index in expected_constexpr]
@@ -322,6 +329,7 @@ def _replay_case(
         "i16": "int16",
         "i32": "int32",
         "i64": "int64",
+        "index": "int64",
         "u8": "uint8",
         "u16": "uint16",
         "u32": "uint32",
@@ -397,7 +405,7 @@ def _replay_case(
     for slot, source_name in zip(c_constexprs, c_source_names, strict=True):
         if source_name not in source_case.schedule:
             raise ValueError(f"source C constexpr {source_name!r} is unbound")
-        expected = artifact.c.values.get(slot.name)
+        expected = artifact.c.values[slot.name]
         if source_case.schedule[source_name] != expected:
             raise ValueError(
                 f"source constexpr position for {slot.name!r} differs from C"
@@ -423,8 +431,12 @@ def _replay_case(
             raise ValueError("artifact compiler slot has the wrong C kind")
         if slot.role in compiler_roles:
             raise ValueError("active compiler C roles must be unique")
+        if slot.role in arguments or slot.role in schedule:
+            raise ValueError(
+                f"compiler C role {slot.role!r} collides with a Replay binding"
+            )
         compiler_roles.add(slot.role)
-        expected = artifact.c.values.get(slot_name)
+        expected = artifact.c.values[slot_name]
         if source_case.schedule[source_name] != expected:
             raise ValueError(
                 f"source compiler-option position for {slot_name!r} differs from C"
@@ -480,11 +492,59 @@ class Gate1Runner:
                 f"generation failed: {type(exc).__name__}: {exc}",
                 physical_calls,
             )
-        replay_source = KernelSource.from_replay(
-            generation.code, generation.function_name
-        )
         physical_calls = (
             generation.physical_provider_calls or generation.attempts
+        )
+
+        try:
+            packet = build_rewriter_payload(
+                artifact,
+                frontend=Frontend.TRITON,
+                masked=masked,
+            )
+            function_name = str(packet["u_f"]["replay_function"])
+            ingress = replay_source_ingress(
+                generation.code,
+                artifact=artifact,
+                frontend=Frontend.TRITON,
+                function_name=function_name,
+                packet=packet,
+            )
+        except Exception as exc:
+            return Gate1ArmEvidence(
+                mode,
+                generation,
+                None,
+                None,
+                None,
+                f"replay ingress failed: {type(exc).__name__}: {exc}",
+                physical_calls,
+            )
+        if ingress.status != "pass" or ingress.code is None:
+            return Gate1ArmEvidence(
+                mode,
+                generation,
+                None,
+                None,
+                None,
+                "replay ingress failed: "
+                + json.dumps(
+                    list(ingress.diagnostics),
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ),
+                physical_calls,
+            )
+        generation = replace(
+            generation,
+            code=ingress.code,
+            function_name=function_name,
+            entry_function_name=ingress.entry_function_name,
+        )
+        replay_source = KernelSource.from_replay(
+            generation.code, generation.function_name
         )
         compile_result = self.compiler.compile(replay_source, replay_case)
         if not compile_result.ok or compile_result.ttir is None:
@@ -546,9 +606,11 @@ class Gate1Runner:
                     masked=False,
                 ),
             )
-        # Replay workers receive identical J/MaskC(C) packets and no Source, pi, or
-        # Gate1 feedback.  Running them concurrently changes only completeness
-        # and latency; the ordered result list remains deterministic.
+        # Replay workers receive identical J/optional-C packets and no Source or
+        # Gate1 feedback.  pi_source remains host-owned by the two independent
+        # Gate1 normalizer calls and is not mounted in a Replay episode. Running
+        # them concurrently changes only completeness and latency; the ordered
+        # result list remains deterministic.
         with ThreadPoolExecutor(max_workers=len(self.writers)) as executor:
             futures = [
                 executor.submit(
@@ -576,6 +638,8 @@ class Gate1Runner:
         source: KernelSource,
         source_case: CompileCase,
     ) -> Gate1ExecutionResult:
+        if artifact.c.slots:
+            artifact.c.validate_complete_values(path="Gate1 active C")
         digest = canonical_artifact_digest(
             artifact, observer_level=self.config.observer_level
         )

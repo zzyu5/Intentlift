@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 
 import litellm
+import httpx
 
 from minisweagent.exceptions import FormatError, MiniSWERequestCancelled
 from minisweagent.models import GLOBAL_MODEL_STATS
@@ -101,8 +102,8 @@ class LitellmResponseModel(LitellmModel):
             and self.config.routine_timeout_seconds <= 0
         ):
             raise ValueError("routine_timeout_seconds must be positive when set")
-        if not 1 <= self.config.semantic_initial_turns <= 4:
-            raise ValueError("semantic_initial_turns must be in [1, 4]")
+        if not 0 <= self.config.semantic_initial_turns <= 4:
+            raise ValueError("semantic_initial_turns must be in [0, 4]")
         self._physical_provider_calls = 0
         self._transport_retries = 0
         self._history_compaction_packets = 0
@@ -728,11 +729,14 @@ class LitellmResponseModel(LitellmModel):
                 else self.config.routine_timeout_seconds
             )
         try:
+            model_kwargs = self.config.model_kwargs | kwargs
+            if model_kwargs.get("timeout") is None:
+                model_kwargs["timeout"] = httpx.Timeout(None)
             return litellm.responses(
                 model=self.config.model_name,
                 input=messages,
                 tools=self._response_tools(response_count=response_count),
-                **(self.config.model_kwargs | kwargs),
+                **model_kwargs,
             )
         except litellm.exceptions.AuthenticationError as e:
             e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."

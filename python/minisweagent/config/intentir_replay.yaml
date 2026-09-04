@@ -4,22 +4,23 @@ agent:
     episode. Read the deterministic cross-reference `/input/compiler-index.intent`
     and the complete read-only semantic program S_J from
     `/input/semantic-program.intent`; read `/input/frontend.json` and
-    `/input/mask-c.json` for the callable ABI. Exact J and MaskC(C) remain available
-    in `/input/packet.json`. No Source, pi,
-    Harness valuation, Gate result, previous Replay, repository, or network exists.
+    read `/input/c.json` when that optional complete C file exists. Exact J and
+    optional complete C remain available in `/input/packet.json`. No Source, pi,
+    Harness fact beyond C, Gate result, previous Replay, repository, or network exists.
 
     J/S_J is the sole semantic authority. Program mapping, layout, loops, control,
     carrier representation, target API, and materialization are source-blind compiler
     choices; they may not add or alter J-owned value semantics. Follow
     `/input/REPLAY_CONTRACT.md`.
 
-    `compiler-index.intent` only places existing J dependency sets beside anonymous
-    MaskC attachments. It is not a schedule: preserve each authored access/effect,
-    keep logical domain guards distinct from access-local predicates, and choose every
-    target realization yourself. First factor J effect axes into axes shared across
-    affected tensors, tensor-specific alternatives, and C-tiled axes. A tile attachment
-    permits local tiling but supplies no launch cardinality; do not infer
-    `program_id * tile` or an extra program axis from that attachment alone.
+    `compiler-index.intent` only places existing J dependency sets beside optional
+    complete-C bindings and attachments. Preserve each authored access/effect, keep
+    logical domain guards distinct from access-local predicates, and choose every target
+    realization yourself. First factor J effect axes into axes shared across affected
+    tensors, tensor-specific alternatives, and C-tiled axes. A tile attachment permits
+    local tiling but supplies no launch cardinality; do not infer `program_id * tile` or
+    an extra program axis from that attachment alone. C values may select implementation
+    details but never replace J semantics or a callable constexpr c* handle.
 
     Compile the whole S_J into one complete target program at
     `/output/replay.source`. You may globally choose target APIs, addressing,
@@ -37,7 +38,7 @@ agent:
   instance_template: |
     The startup object below contains paths and byte counts only. Read
     `/input/compiler-index.intent`, `/input/semantic-program.intent`,
-    `/input/frontend.json`, and `/input/mask-c.json` first, then
+    `/input/frontend.json`, optional `/input/c.json` when present, then
     `/input/REPLAY_CONTRACT.md` and `/input/TOOL.md`.
     Query only to cross-reference one named handle; do not reload the whole packet.
 
@@ -64,8 +65,9 @@ agent:
   # This is not a call budget: only three consecutive identical requests with
   # identical Replay bytes and identical closed output terminate as a stall.
   max_consecutive_stagnant_steps: 3
-  # Total calls remain uncapped.  These timers only detect elapsed time with no
-  # exact Replay/work-file byte change.
+  # Model/tool/check steps inside one logical Replay episode remain governed by
+  # wall time; the model section above separately limits physical transport
+  # attempts to one per model turn.
   material_progress_advisory_seconds: 120
   material_progress_stall_seconds: 600
 
@@ -80,9 +82,13 @@ model:
   # facts stay in the immutable workspace and enter context only through bounded
   # read-only query results selected by the Replay owner.
   compact_workspace_mirrors: false
-  compact_response_history_keep_recent: 3
-  use_previous_response_id: true
-  # Initial J/MaskC interpretation keeps the requested effort. Only ordinary
+  # Keep only the latest response group in the provider packet; the full
+  # Replay trajectory remains local and older groups become deterministic receipts.
+  compact_response_history_keep_recent: 1
+  # The active CPA Responses relay rejects previous_response_id continuation;
+  # Replay therefore sends the exact locally compacted history directly.
+  use_previous_response_id: false
+  # Initial J/optional-C interpretation keeps the requested effort. Only ordinary
   # own-source inspection, construction-check and exact repair turns use low.
   routine_reasoning_effort: low
   routine_timeout_seconds: 180
@@ -107,8 +113,10 @@ model:
     max_retries: 0
     parallel_tool_calls: true
   # Same source-blind episode and exact message packet; no new semantic input.
-  retry_attempts: 3
-  retry_timeouts: true
+  # One physical provider attempt belongs to one Replay model turn. A timeout
+  # is fail-closed and is recorded as provider infrastructure failure.
+  retry_attempts: 1
+  retry_timeouts: false
   use_global_model_stats: false
   cost_tracking: ignore_errors
 

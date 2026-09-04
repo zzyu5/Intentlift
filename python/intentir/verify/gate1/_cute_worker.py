@@ -1,4 +1,4 @@
-"""Private compile-only worker for the CuTe DSL Gate1 frontend.
+"""Private compile-only worker for the CuTe Gate1 frontend.
 
 The parent process performs the replay policy check and passes only a JSON
 request.  This worker is the first process that imports ``cutlass`` or executes

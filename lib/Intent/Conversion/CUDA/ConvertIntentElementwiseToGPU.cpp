@@ -891,9 +891,10 @@ struct ElementwiseLowering {
     auto targetInteger = dyn_cast<IntegerType>(targetType);
     if (targetType.isInteger(1)) {
       if (sourceInteger) {
+        Value integer = toSignlessInteger(b, loc, value);
         Value zero = b.create<arith::ConstantOp>(
-            loc, b.getIntegerAttr(sourceInteger, 0));
-        return b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, value,
+            loc, b.getIntegerAttr(integer.getType(), 0));
+        return b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, integer,
                                       zero);
       }
       if (sourceFloat) {
@@ -907,18 +908,36 @@ struct ElementwiseLowering {
       return sourceFloat.getWidth() < targetFloat.getWidth()
                  ? b.create<arith::ExtFOp>(loc, targetType, value).getResult()
                  : b.create<arith::TruncFOp>(loc, targetType, value).getResult();
-    if (sourceFloat && targetInteger)
+    if (sourceFloat && targetInteger) {
+      if (targetInteger.isUnsigned()) {
+        Type signlessTarget = IntegerType::get(
+            targetType.getContext(), targetInteger.getWidth());
+        Value converted = b.create<arith::FPToUIOp>(loc, signlessTarget, value);
+        return fromSignlessInteger(b, loc, converted, targetType);
+      }
       return b.create<arith::FPToSIOp>(loc, targetType, value);
+    }
     if (sourceInteger && targetFloat)
-      return sourceInteger.getWidth() == 1
-                 ? b.create<arith::UIToFPOp>(loc, targetType, value).getResult()
+      return (sourceInteger.getWidth() == 1 || sourceInteger.isUnsigned())
+                 ? b.create<arith::UIToFPOp>(
+                       loc, targetType, toSignlessInteger(b, loc, value))
+                       .getResult()
                  : b.create<arith::SIToFPOp>(loc, targetType, value).getResult();
     if (sourceInteger && targetInteger) {
-      if (sourceInteger.getWidth() < targetInteger.getWidth())
-        return sourceInteger.getWidth() == 1
-                   ? b.create<arith::ExtUIOp>(loc, targetType, value).getResult()
-                   : b.create<arith::ExtSIOp>(loc, targetType, value).getResult();
-      return b.create<arith::TruncIOp>(loc, targetType, value);
+      Value integer = toSignlessInteger(b, loc, value);
+      Type signlessTarget = IntegerType::get(
+          targetType.getContext(), targetInteger.getWidth());
+      if (sourceInteger.getWidth() < targetInteger.getWidth()) {
+        Value widened =
+            (sourceInteger.getWidth() == 1 || sourceInteger.isUnsigned())
+                ? b.create<arith::ExtUIOp>(loc, signlessTarget, integer)
+                      .getResult()
+                : b.create<arith::ExtSIOp>(loc, signlessTarget, integer)
+                      .getResult();
+        return fromSignlessInteger(b, loc, widened, targetType);
+      }
+      Value narrowed = b.create<arith::TruncIOp>(loc, signlessTarget, integer);
+      return fromSignlessInteger(b, loc, narrowed, targetType);
     }
     return nullptr;
   }
@@ -1084,8 +1103,8 @@ struct ElementwiseLowering {
           }
         } else if (auto mb = dyn_cast<MapBinaryOp>(&op)) {
           // Comparison fns are never hoisted here: their condition depends on a
-          // Row input (p > q), and emitScalarBinary returns null for a cmp fn.
-          // A fully-uniform cmp/select (rare) is simply recomputed per column in
+          // Row input (p > q), and comparison emission is handled separately.
+          // A fully-uniform comparison/select (rare) is simply recomputed per column in
           // emitAt — still correct, just not hoisted.
           if (isCmpFn(mb.getFn()))
             continue;

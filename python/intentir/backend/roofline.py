@@ -44,8 +44,37 @@ def evaluate_logical_roofline(
 ) -> dict[str, Any]:
     if latency_us <= 0:
         raise ValueError("Roofline latency must be positive")
-    boundary_bytes = int(workload_cost["boundary_io_bytes"])
     floating_ops = int(workload_cost["floating_point_ops"])
+    raw_boundary_bytes = workload_cost.get("boundary_io_bytes")
+    if raw_boundary_bytes is None:
+        compute_time_us = floating_ops / ceilings.fp32_gflops / 1_000.0
+        rejection_reasons = [
+            "dynamic_boundary_bytes",
+            "incomplete_j_workload_cost",
+        ]
+        return {
+            "protocol": ROOFLINE_PROTOCOL,
+            "ceilings": ceilings.to_record(),
+            "arithmetic_intensity_flop_per_byte": None,
+            "memory_roof_gflops": None,
+            "attainable_gflops": None,
+            "achieved_gflops": floating_ops / latency_us / 1_000.0,
+            "predicted_bottleneck": "unknown_dynamic_boundary",
+            "asymptotic_roof_bottleneck": "unknown_dynamic_boundary",
+            "observed_operational_regime": "dynamic_boundary_unresolved",
+            "supports_memory_wall_claim": False,
+            "memory_wall_claim_rejection_reasons": rejection_reasons,
+            "memory_time_lower_bound_us": None,
+            "compute_time_lower_bound_us": compute_time_us,
+            "roof_time_lower_bound_us": None,
+            "latency_over_logical_roof_lower_bound": None,
+            "roof_utilization": None,
+            "caveats": [
+                "J boundary bytes are dynamic for this invocation and cannot be used for a certified logical Roofline",
+                "no runtime output length is guessed from a symbolic shape marker",
+            ],
+        }
+    boundary_bytes = int(raw_boundary_bytes)
     intensity = floating_ops / boundary_bytes if boundary_bytes else float("inf")
     memory_roof_gflops = intensity * ceilings.memory_gbps
     attainable_gflops = min(memory_roof_gflops, ceilings.fp32_gflops)

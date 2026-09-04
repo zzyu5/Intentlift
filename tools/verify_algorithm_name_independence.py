@@ -131,7 +131,9 @@ def _load_case(
 ) -> tuple[MaterializedJ, ImplementationConfig]:
     snapshot, _path = load_production_snapshot(catalog, case_name)
     if snapshot.j is None or snapshot.c is None:
-        raise ValueError(f"{case_name}: production snapshot lacks J or C")
+        raise ValueError(
+            f"{case_name}: compatibility snapshot lacks J or Source/search prior"
+        )
     prepared = prepare_production_workload(
         case_name,
         profile=PRODUCTION_WORKLOAD_PROFILE_NATURAL_HEADLINE,

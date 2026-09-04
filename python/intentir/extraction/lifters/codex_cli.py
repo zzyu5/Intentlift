@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -28,11 +29,12 @@ from intentir.extraction.providers.provider import ProviderConfig, get_provider
 from intentir.verify.scrc_runner import CandidateLiftError
 from minisweagent.config.intentir_schema_query import schema_sections
 
-from .miniswe import MiniSWELiftAdapter, _input_files, _trajectory_bytes
-from .compiler_observation import (
-    SOURCE_TTIR_RECONCILE_PROTOCOL,
-    observe_anonymous_source_ttir,
-    reconcile_candidate_source_ttir,
+from .miniswe import (
+    MiniSWELiftAdapter,
+    _input_files,
+    _lift_invocation_limits,
+    _lift_turn_timeout,
+    _trajectory_bytes,
 )
 from .scrc import (
     CANDIDATE_CHECK_PROTOCOL,
@@ -40,6 +42,10 @@ from .scrc import (
     SCRCProvenance,
     SCRCReliftRecord,
     SourceIdentifierPrivacyError,
+    _decode_value_free_lift_candidate,
+    _unbound_lift_artifact_payload,
+    _value_free_lift_candidate_payload,
+    _validate_source_identifier_privacy,
     check_scrc_lift_candidate,
     decode_scrc_lift_artifact,
     prepare_scrc_lift,
@@ -47,7 +53,7 @@ from .scrc import (
 )
 CODEX_CLI_LIFT_BACKEND = "openai.codex-cli.intentir-lift.v41"
 CODEX_CLI_LIFT_KNOWLEDGE = "intentir.lift-knowledge.v101"
-CODEX_CLI_TURN_TIMEOUT_SECONDS = 900.0
+_INACTIVE_SOURCE_RECONCILE_PROTOCOL = "intentir.lift-source-reconcile.v1"
 
 _FEEDBACK_CATEGORY_NAMES = (
     "interface",
@@ -63,39 +69,37 @@ and tmp/ are writable. There is no repository or network.
 
 Act like a coding agent, not a staged JSON generator. Start with the one compact
 `source-brief` command in input/README.md, then read input/source.py. The brief includes
-the complete compact Harness ABI ledger and exact Source/compiler navigation; you
-decide all meaning. Query an exact compiler-observer section or TTIR slice only when
-the current draft needs it. When Source or the brief exposes a fused operation or
-explicit numeric extension/truncation, its focused TTIR query is mandatory before
-authoring that typed numeric subgraph; never guess fused operand width from surface
-operand declarations. Query schema leaves, operation contracts and ownership
+the complete value-free Harness ABI/C-declaration ledger; you decide all meaning.
+Trusted Source compilation and TTIR remain host-private and are never model input.
+When Source exposes a fused operation or ambiguous implicit numeric conversion,
+preserve only what Source establishes and never guess a hardware-specialized width
+or structure. Compiler realization is not a J authorship or Lift-acceptance
+authority. Query schema leaves, operation contracts and ownership
 terms through `python .agents/intentir_agent_tool.py lift_reference ...`; complete
-references are deliberately not mounted as readable workspace files. Do not dump
-input/source_ttir.json or broad reference material into the thread.
+references are deliberately not mounted as readable workspace files.
 
 You alone author the complete output/candidate.json. J owns all logical semantics;
 C owns only implementation choices; pi is only the typed Gate1 normalization
 witness in the supplied schema. It has no realization graph. Author only closed direct
 program/iteration/control/materialization/access-representation relations bound to
-existing J axes, values, accesses and C slots. Query `realization-ledger` and the exact
-pi schema leaves when needed; never copy a physical Source SSA id or target recipe into
+existing J axes, values, accesses and C slots. Query the exact pi schema leaves when
+needed; never invent a physical Source SSA id or target recipe in
 pi. A relation whose fixed unary recognizer cannot prove remains hard.
 Fixed code must not choose or fill any field, handle, relation, operation, or shape.
 Preserve anonymous ABI order, parametric shape identities, logical control/time and
-effects in J. Use dense declaration-ordered opaque handles and never copy Source
-identifiers into the artifact.
+effects in J. Derive logical program coordinates only from Source semantics; never
+copy launch axes or a backend execution topology into J. Use dense
+declaration-ordered opaque handles and never copy Source identifiers into the artifact.
 
 Every inout tensor requires explicit pre-state access/effect, post-state access/effect,
 and output_mapping. A static affine inout store is owned by that boundary access/effect
 and an identity output mapping; do not invent semantic scatter/update nodes merely to
 rebuild the full tensor. Use scatter only for a data-dependent J index whose closed
-index/source shapes agree at the data rank. Treat the Harness grid as fixed U_f: do not
-move a logical program coordinate to an absent launch axis. Preserve J access multiplicity; address recompute
-relations may change pointer construction but never tensor, logical index, mask, value,
-or effect. After J accesses exist, compare the ordered raw memory ledger with
-`candidate-attachments`: when tensor root, transfer kind, ordinal, logical index,
-predicate, and effect give a unique one-to-one correspondence, author the closed
-`address_recomputed` row for that access instead of forcing one pointer spelling.
+index/source shapes agree at the data rank. Preserve J access multiplicity. An access
+representation authorization may change pointer construction only at Lower time and
+never changes tensor, logical index, mask, value, or effect. `candidate-attachments`
+projects anchors already authored in your draft; it provides no Source or hardware
+realization evidence.
 
 If output/candidate.json already exists, it is the exact preceding model-authored
 candidate: read input/feedback_frontier.json and input/feedback_detail.json first, then
@@ -103,12 +107,11 @@ inspect and patch that candidate rather than recreating it. Otherwise write one 
 complete candidate early. Do not postpone authoring until after exhaustive reading. As
 soon as the first complete JSON exists, run
 `python .agents/intentir_agent_tool.py submit_candidate` before manual rereading or
-broad TTIR/schema inspection. Let its closed diagnostics drive focused patches.
+broad schema inspection. Let its closed diagnostics drive focused patches.
 Organize scratch under work/ however useful. The final J/C/pi and every semantic
-field remain entirely your work. This transaction first runs the source-free CandidateCheck and then the
-reject-only necessary-condition SourceReconcile on the same exact bytes. Repair the returned diagnostics
-and invoke it again. The host then runs the public Source-vs-J semantic probe on
-those exact passing bytes and returns a same-thread diagnostic if they diverge.
+field remain entirely your work. This transaction runs the source-free CandidateCheck
+on the exact bytes. The host then runs the public Source-vs-J semantic probe on those
+exact passing bytes and returns a same-thread diagnostic if they diverge.
 That probe never certifies or edits the candidate: repair only when the evidence
 shows your J is wrong, rerun submit_candidate, and leave small floating deltas or
 unsupported execution as diagnostics. The host independently reruns Decode and
@@ -168,7 +171,7 @@ def _codex_feedback_files(feedback_text: str) -> dict[str, str]:
         detail = {
             str(key): value
             for key, value in feedback.items()
-            if key not in {"previous_artifact", "diagnostics"}
+            if key not in {"previous_artifact", "previous_candidate", "diagnostics"}
         }
         diagnostics = feedback.get("diagnostics")
         if isinstance(diagnostics, Mapping):
@@ -224,15 +227,10 @@ def _codex_feedback_files(feedback_text: str) -> dict[str, str]:
 
 def _codex_input_files(
     request: Any,
-    *,
-    source_ttir_observation: Mapping[str, Any] | None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Build a small ordinary coding workspace for the source-aware owner."""
 
-    complete = _input_files(
-        request,
-        source_ttir_observation=source_ttir_observation,
-    )
+    complete = _input_files(request)
     files = {
         "source.py": complete["source.py"],
         "harness_view.json": complete["harness_view.json"],
@@ -245,19 +243,14 @@ def _codex_input_files(
             "semantic field; fixed code only projects evidence, checks, and rejects.\n\n"
             "Start once with:\n"
             "`python input/tools/context_query.py --input-root input --output-root output source-brief`\n\n"
-            "If that brief reports any compiler.sensitive_numeric_index operation, "
-            "query each exact operation in Source TTIR before authoring the typed "
-            "arithmetic graph; fused-operation operand promotion and cast placement "
-            "must not be guessed from Source surface operand dtypes.\n\n"
-            "Then read `input/source.py`. For an exact compiler fact, use the same tool "
-            "with `source-observer --path fingerprint.NAME`, `source-ttir-outline`, "
-            "`source-ttir-find`, or `source-ttir-def-use`. For wire syntax, use:\n"
+            "Then read `input/source.py`. Trusted Source TTIR, compiler schedule, "
+            "launch/grid, target metadata and actual C values are deliberately "
+            "host-private. Never infer them from Source surface syntax. For wire syntax, use:\n"
             "`python .agents/intentir_agent_tool.py lift_reference authoring-brief`\n"
             "Then request only `section NAME`, `op NAME`, or `contract TERM` needed by "
             "the current draft. Complete references are not readable files.\n\n"
-            "After J/C exists, run `python input/tools/context_query.py --input-root input "
-            "--output-root output realization-ledger` and `candidate-attachments` before "
-            "authoring pi. These are read-only raw facts and never choose a relation.\n\n"
+            "After J/C exists, run the read-only `candidate-attachments` view before "
+            "authoring pi; it projects only your own draft.\n\n"
             "Use `lift_reference contract TERM` only when ownership is unclear. Write "
             "`output/candidate.json` early and patch it in "
             "place. Run `python .agents/intentir_agent_tool.py submit_candidate`; the "
@@ -265,12 +258,9 @@ def _codex_input_files(
         ),
         "tools/context_query.py": complete["tools/context_query.py"],
         "candidate_check.json": "null\n",
-        "source_reconcile.json": "null\n",
         "semantic_probe.json": "null\n",
     }
     files.update(_codex_feedback_files(complete["feedback.json"]))
-    if "source_ttir.json" in complete:
-        files["source_ttir.json"] = complete["source_ttir.json"]
     references = {
         "schema": complete["schema/artifact.schema.json"],
         "contract": complete["knowledge/lift_contract.md"],
@@ -364,19 +354,12 @@ def _lift_reference_query(
             "ordinary_operations": sorted(operations),
             "structured_operations": ["loop", "effect_if", "value_if"],
             "mandatory_numeric_authoring": [
-                "Treat Source-TTIR math.fma as one typed fused event. Query its exact "
-                "def-use and operand/result types before decomposing it into available J ops.",
-                "When J has no scalar fma op, explicit cast nodes must reproduce the "
-                "observed fused operand width before the primary mul; do not infer that "
-                "mul width from the unfused source operand dtypes.",
-                "Keep a separately computed addend producer at its observed dtype and "
-                "placement before its conversion into the fused event.",
-                "If the fused addend is one direct negation or zero-minus value, author "
-                "the final J arithmetic as sub(primary_product, positive_value), not "
-                "const-zero + neg + add. This is the canonical direct fma expansion.",
-                "Keep iota/index arithmetic at the exact Source-TTIR integer width. "
-                "Never widen logical indices merely because an unrelated ABI stride "
-                "carrier or pointer representation uses i64.",
+                "Preserve a fused numeric event only when anonymous Source syntax or "
+                "its public language contract establishes that semantic operation.",
+                "Preserve Source-explicit cast order and logical operand/result dtypes; "
+                "never import a compiler-selected arithmetic width into J.",
+                "Keep logical index arithmetic independent of ABI pointer widths, "
+                "address representation, vectorization, and backend layout choices.",
             ],
         }
     elif command == "section" and len(arguments) == 2:
@@ -448,16 +431,14 @@ source-blind Replay.
 Your own prior formal candidates are immutable under work/candidate_history/;
 consult or restore them when a repair regresses, but decide every edit yourself.
 Treat the first exact missing/extra operation only as an entry point: inspect its
-typed Source-TTIR neighborhood and the bounded anonymous local frontier against the
-current J node and boundary. The frontier describes a mismatch but does not expose
+anonymous Source neighborhood and the bounded local frontier against the current J
+node and boundary. The frontier describes a mismatch but does not expose or authorize
 the Replay implementation that produced it. Preserve cast order and operation spelling when they are semantic. If J
 already states the complete logical fact but Replay failed to realize it, do not add a
 pi escape hatch; resubmit the unchanged artifact for a fresh source-blind Replay.
-If independent fresh Replays vary only in addptr/address topology while the Source raw
-memory ledger and current J access attachments have a unique tensor/kind/ordinal/index/
-predicate/effect correspondence, that is precisely the closed
-`access_representation_bindings.address_recomputed` case. Bind the existing accesses;
-do not edit J semantics or encode a Source pointer recipe in pi.
+Never copy block/thread/warp mapping, launch geometry, address topology, layout,
+pipeline, vector width, physical loop structure, or another Replay/compiler
+realization into J or pi. Such choices belong to a target Layer-C plugin.
 Before editing local operations, check whether one omitted Source-visible loop,
 effect_if, early terminal branch, continuation, or effect region explains the
 downstream op/dataflow/predicate differences; if so, repair that complete J scope
@@ -467,11 +448,12 @@ diff. Conversely, when
 the current J/B/C already authors the exact logical fact and Source-local boundary fact
 but the preceding Replay alone failed to consume it, do not mutate the artifact to
 imitate that Replay: resubmit the unchanged artifact for a fresh source-blind Replay.
-Use the compact source query only where the named feedback needs exact Source or
-compiler evidence, then revise the complete model-authored J/C/pi in place. If a
+Use the compact source query only where the named feedback needs exact Source syntax,
+then revise the complete model-authored J/C/pi in place. If a
 named relation's ownership is unclear, query only that term through
-`python .agents/intentir_agent_tool.py lift_reference contract TERM`. Treat feedback as a compiler counterexample, not
-as a semantic patch. Run `python .agents/intentir_agent_tool.py submit_candidate`;
+`python .agents/intentir_agent_tool.py lift_reference contract TERM`. Treat feedback as
+a semantic diagnostic, not as a patch or a lowering recipe. Run
+`python .agents/intentir_agent_tool.py submit_candidate`;
 the host automatically probes the exact passing J and returns any public divergence
 to this same thread. The host alone runs formal gates.
 """
@@ -484,21 +466,7 @@ after the complete candidate passes. Query a rejected relation's exact field nam
 `lift_reference contract TERM` when its ownership is unclear. The transaction is diagnostic-only.
 """
 
-_SOURCE_RECONCILE_CONTINUATION_PROMPT = """The source-aware necessary-condition preflight rejected the current exact candidate bytes.
-Read input/source_reconcile.json and revise only the model-authored J/C/pi facts whose
-closed obligations disagree with the immutable anonymous Source syntax or Source TTIR
-observation. A recurrence/control/mask presence diagnostic states only that the whole
-J-owned construct is absent: recover its complete trip/carries/body/control/predicate
-from Source yourself; the host has not supplied a formula or patch. Pi has no
-occurrence/route graph: correct only a closed direct relation bound to existing J/C
-handles, or revise J when your authorship was wrong. Never invent a source recipe or
-allowed diff.
-This diagnostic supplies no artifact field or repair. Rerun
-`python .agents/intentir_agent_tool.py submit_candidate` and finish immediately
-after it passes. Formal TypeCheck, Replay, and Gate1 remain external.
-"""
-
-_SEMANTIC_PROBE_CONTINUATION_PROMPT = """The current exact candidate passed CandidateCheck and SourceReconcile, and the host ran the public Source-vs-J semantic probe.
+_SEMANTIC_PROBE_CONTINUATION_PROMPT = """The current exact candidate passed CandidateCheck, and the host ran the public Source-vs-J semantic probe.
 Read input/semantic_probe.json in this same thread. It is diagnostic-only and does
 not accept, reject, certify, or edit J. If the observed divergence exposes an error
 in your authored J, patch output/candidate.json and rerun submit_candidate. An unavailable
@@ -518,7 +486,6 @@ def _source_aware_startup_context(workspace: Any, *, fresh_owner: bool) -> dict[
         "paths": {
             "source": "input/source.py",
             "harness": "input/harness_view.json",
-            "source_observer": "input/source_ttir.json",
             "source_query": "input/tools/context_query.py",
             "bounded_reference_query": (
                 "python .agents/intentir_agent_tool.py lift_reference"
@@ -530,7 +497,6 @@ def _source_aware_startup_context(workspace: Any, *, fresh_owner: bool) -> dict[
                 for name in _FEEDBACK_CATEGORY_NAMES
             ],
             "candidate_check": "input/candidate_check.json",
-            "source_reconcile": "input/source_reconcile.json",
             "semantic_probe": "input/semantic_probe.json",
             "candidate": "output/candidate.json",
             "candidate_history": "work/candidate_history/",
@@ -597,21 +563,27 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
         repr=False,
     )
     _codex_session: Any = field(default=None, init=False, repr=False)
-    _source_ttir_observation: dict[str, Any] | None = field(
-        default=None, init=False, repr=False
-    )
 
     def close(self) -> None:
         session = self._codex_session
         self._codex_session = None
         if session is not None:
             session.close()
-        self._source_ttir_observation = None
         super().close()
 
-    def _remaining_seconds(self) -> float:
-        if self.session_wall_time_limit_seconds <= 0:
-            raise ValueError("Lift owner session wall-time limit must be positive")
+    def _remaining_seconds(self) -> float | None:
+        if self.session_wall_time_limit_seconds in (None, 0):
+            return None
+        if (
+            isinstance(self.session_wall_time_limit_seconds, bool)
+            or not isinstance(self.session_wall_time_limit_seconds, (int, float))
+            or not math.isfinite(float(self.session_wall_time_limit_seconds))
+            or self.session_wall_time_limit_seconds < 0
+        ):
+            raise ValueError(
+                "Lift owner session wall-time limit must be null, zero, or a "
+                "finite non-negative number"
+            )
         return self.session_wall_time_limit_seconds - (
             self._session_active_elapsed_ms / 1000.0
         )
@@ -645,6 +617,85 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             diagnostic,
             physical_calls=0,
             terminal=True,
+        )
+
+    def _invocation_limit_error(
+        self,
+        round_index: int,
+        *,
+        reason: str,
+        invocation_turns: int,
+        invocation_elapsed_ms: float,
+        physical_calls: int,
+        semantic_probe: Mapping[str, Any] | None = None,
+    ) -> CandidateLiftError:
+        """Stop one Codex invocation while retaining its exact current draft."""
+
+        workspace = self._session_workspace
+        candidate = (
+            self._read_continuation_candidate(workspace)
+            if workspace is not None
+            else None
+        )
+        if candidate is not None:
+            try:
+                candidate = _value_free_lift_candidate_payload(candidate)
+            except (TypeError, ValueError, RecursionError, json.JSONDecodeError):
+                candidate = None
+        diagnostic = (
+            "Codex Lift invocation reached its bounded "
+            f"{reason} limit before a complete candidate was returned"
+        )
+        diagnostics: dict[str, Any] = {
+            "diagnostic": diagnostic,
+            "failure_class": "lift_worker_no_candidate",
+            "termination_status": "LiftInvocationLimit",
+            "resource_limited": True,
+            "retryable": True,
+            "limit_kind": reason,
+            "invocation_model_turns": invocation_turns,
+            "invocation_elapsed_ms": invocation_elapsed_ms,
+            "continuation": (
+                "the persistent Lift owner workspace and Codex thread remain "
+                "available to the next logical Lift invocation"
+            ),
+        }
+        if semantic_probe is not None:
+            diagnostics["semantic_probe"] = dict(semantic_probe)
+        if candidate is not None:
+            encoded = json.dumps(
+                candidate,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode()
+            diagnostics["continuation_draft"] = {
+                "sha256": hashlib.sha256(encoded).hexdigest(),
+                "bytes": len(encoded),
+            }
+        self._records.append(
+            SCRCReliftRecord(
+                round_index,
+                diagnostic=diagnostic,
+                backend_evidence={
+                    "backend": CODEX_CLI_LIFT_BACKEND,
+                    "runtime": CODEX_CLI_AGENT_RUNTIME,
+                    "owner_session_id": self._session_id,
+                    "thread_id": getattr(self._codex_session, "thread_id", None),
+                    "resource_limited": True,
+                    "limit_kind": reason,
+                    "invocation_model_turns": invocation_turns,
+                    "invocation_elapsed_ms": invocation_elapsed_ms,
+                },
+                continuation_candidate=candidate,
+            )
+        )
+        return CandidateLiftError(
+            diagnostics,
+            physical_calls=max(0, physical_calls),
+            terminal=False,
+            candidate_draft=candidate,
         )
 
     @staticmethod
@@ -681,7 +732,7 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             return
         encoded = (
             json.dumps(
-                payload(),
+                _unbound_lift_artifact_payload(payload()),
                 indent=2,
                 sort_keys=True,
                 ensure_ascii=False,
@@ -719,22 +770,25 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             source,
             compiler_view=self.compiler_view,
             relift_context=self._relift_context(feedback),
-            source_symbol=self.source_symbol,
+            source_symbol=(
+                getattr(source_program, "lift_source_symbol", None)
+                or self.source_symbol
+            ),
+            source_kind=getattr(source_program, "lift_source_kind", "python"),
+            source_parameter_order=tuple(
+                getattr(source_program, "lift_parameter_order", ())
+            ),
+            source_to_opaque=(
+                dict(getattr(source_program, "lift_source_to_opaque", ()))
+                or None
+            ),
         )
         candidate_check_context = scrc_candidate_check_context(prepared)
         round_index = len(self._records) + 1
-        if self._source_ttir_observation is None:
-            prepared_packet = json.loads(prepared.user_input)
-            anonymous_source = prepared_packet.get("anonymous_source")
-            anonymous_view = prepared_packet.get("harness_compiler_view")
-            self._source_ttir_observation = observe_anonymous_source_ttir(
-                anonymous_source,
-                anonymous_view,
-            )
-        files, references = _codex_input_files(
-            prepared,
-            source_ttir_observation=self._source_ttir_observation,
+        invocation_turn_limit, invocation_wall_time_limit = _lift_invocation_limits(
+            self.worker_config
         )
+        files, references = _codex_input_files(prepared)
         try:
             fresh_workspace = self._create_or_refresh_session_workspace(
                 files,
@@ -747,7 +801,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                             for name in _FEEDBACK_CATEGORY_NAMES
                         },
                         "candidate_check.json",
-                        "source_reconcile.json",
                         "semantic_probe.json",
                     }
                 ),
@@ -765,16 +818,24 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
         self._archive_formal_candidate(workspace, feedback)
         fresh_owner = self._codex_session is None
         previous_artifact = getattr(feedback, "previous_artifact", None)
+        previous_candidate = getattr(feedback, "previous_candidate", None)
         candidate_path = workspace.output_dir / "candidate.json"
-        if fresh_owner and previous_artifact is not None and not candidate_path.exists():
+        if fresh_owner and not candidate_path.exists() and (
+            previous_artifact is not None or previous_candidate is not None
+        ):
             # Cross-process continuation still starts a fresh isolated coding
             # session, but it must not force the model to reserialize the last
             # complete artifact from prose.  This is an exact copy of the prior
             # model-authored candidate; fixed code neither edits nor completes it.
+            payload = (
+                _value_free_lift_candidate_payload(previous_candidate)
+                if isinstance(previous_candidate, Mapping)
+                else _unbound_lift_artifact_payload(previous_artifact.to_json())
+            )
             _atomic_write_text(
                 candidate_path,
                 json.dumps(
-                    previous_artifact.to_json(),
+                    payload,
                     indent=2,
                     sort_keys=True,
                     ensure_ascii=False,
@@ -807,6 +868,8 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
         live_checkpoint_attempted = (
             {initial_candidate} if initial_candidate is not None else set()
         )
+        invocation_started = time.monotonic()
+        invocation_turns = 0
 
         def check_current_candidate(*, trigger: str) -> dict[str, Any]:
             nonlocal candidate_text
@@ -824,10 +887,26 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 )
                 if check["status"] == "pass":
                     try:
-                        # CandidateCheck intentionally remains source-free.  The
-                        # adjacent submission boundary additionally enforces
-                        # anonymity before a passing draft may leave this owner.
-                        decode_scrc_lift_artifact(candidate_text, prepared)
+                        # CandidateCheck remains value-free. The adjacent
+                        # submission boundary enforces Source-name privacy using
+                        # only the already-authored candidate; BindSource and all
+                        # realization checks run after owner acceptance.
+                        provisional = _decode_value_free_lift_candidate(
+                            candidate_text,
+                            expected_parameters=(
+                                candidate_check_context.expected_parameters
+                            ),
+                            semantic_compiler_view=(
+                                candidate_check_context.semantic_compiler_view
+                            ),
+                            required_schema=(
+                                candidate_check_context.schema_version
+                            ),
+                        )
+                        _validate_source_identifier_privacy(
+                            provisional,
+                            prepared.harness_binding,
+                        )
                     except SourceIdentifierPrivacyError as exc:
                         check = {
                             "protocol": CANDIDATE_CHECK_PROTOCOL,
@@ -863,35 +942,25 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
         def reconcile_current_candidate(
             *, trigger: str, checkpoint_allowed: bool = True
         ) -> dict[str, Any]:
+            """Emit an inert legacy receipt without consulting realization state.
+
+            The field remains in telemetry and the submit response for consumers
+            of the earlier wire shape. It cannot accept, reject, diagnose, or
+            modify J/C/pi and deliberately reads no Source TTIR, compiler result,
+            backend metadata, candidate structure, or C value.
+            """
+
             nonlocal candidate_text, last_checked_good
-            if candidate_text is None:
-                try:
-                    candidate_text = workspace.read_candidate()
-                except Exception as exc:
-                    result = {
-                        "protocol": SOURCE_TTIR_RECONCILE_PROTOCOL,
-                        "status": "fail",
-                        "applicable": False,
-                        "diagnostics": [
-                            {
-                                "rule_code": "candidate_unavailable",
-                                "path": "<candidate>",
-                                "anonymous_handles": [],
-                                "observed_refs_or_types": [type(exc).__name__],
-                                "line": None,
-                            }
-                        ],
-                    }
-                else:
-                    result = reconcile_candidate_source_ttir(
-                        candidate_text,
-                        self._source_ttir_observation,
-                    )
-            else:
-                result = reconcile_candidate_source_ttir(
-                    candidate_text,
-                    self._source_ttir_observation,
-                )
+            result = {
+                "protocol": _INACTIVE_SOURCE_RECONCILE_PROTOCOL,
+                "status": "pass",
+                "applicable": False,
+                "diagnostics": [],
+                "authority": (
+                    "compatibility receipt only; compiler realization is not "
+                    "a J authorship or Lift-acceptance authority"
+                ),
+            }
             source_reconcile_results.append(
                 {
                     "trigger": trigger,
@@ -909,22 +978,15 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             )
             if (
                 checkpoint_allowed
-                and result["status"] == "pass"
                 and candidate_text is not None
             ):
-                # Exact LLM-authored bytes only.  This checkpoint has passed both
-                # source-free CandidateCheck (enforced by callers) and the
-                # source-aware reject-only occurrence preflight.
+                # Exact LLM-authored bytes only. CandidateCheck is enforced by
+                # callers; this compatibility receipt adds no acceptance rule.
                 last_checked_good = candidate_text
             return result
 
         def submit_candidate_tool() -> Mapping[str, Any]:
-            """Run both reject-only preflights as one exact-byte transaction.
-
-            CandidateCheck and SourceReconcile retain separate authority and
-            diagnostics.  This wrapper only removes the model-facing sequencing
-            overhead; the host still reruns both checks after the CLI turn.
-            """
+            """Run CandidateCheck over one exact model-authored byte sequence."""
 
             with evaluation_lock:
                 candidate_check = check_current_candidate(
@@ -934,10 +996,7 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     trigger="submit_candidate",
                     checkpoint_allowed=candidate_check["status"] == "pass",
                 )
-                passed = (
-                    candidate_check["status"] == "pass"
-                    and source_reconcile["status"] == "pass"
-                )
+                passed = candidate_check["status"] == "pass"
                 if passed:
                     accepted_submission_event.set()
             return {
@@ -946,17 +1005,14 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 "phase": (
                     "complete"
                     if passed
-                    else (
-                        "candidate_check"
-                        if candidate_check["status"] != "pass"
-                        else "source_reconcile"
-                    )
+                    else "candidate_check"
                 ),
                 "candidate_check": candidate_check,
                 "source_reconcile": source_reconcile,
                 "authority": (
-                    "diagnostic-only independent phase results over the same exact "
-                    "candidate bytes; no artifact field is generated or repaired"
+                    "CandidateCheck is the only Lift acceptance preflight; the "
+                    "source_reconcile field is an inert compatibility receipt and "
+                    "no artifact field is generated or repaired"
                 ),
             }
 
@@ -1009,8 +1065,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     checked_text = candidate_text
                     passed = (
                         candidate_check["status"] == "pass"
-                        and source_reconcile is not None
-                        and source_reconcile["status"] == "pass"
                         and checked_text is not None
                         and checked_text == observed_text
                     )
@@ -1043,11 +1097,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                             workspace.input_dir / "candidate_check.json",
                             candidate_check,
                         )
-                    elif source_reconcile is not None:
-                        _atomic_write_json(
-                            workspace.input_dir / "source_reconcile.json",
-                            source_reconcile,
-                        )
                     # A failing passive checkpoint must not split one coding-agent
                     # tool loop into a new provider turn.  The owner receives the
                     # same closed diagnostics synchronously through its explicit
@@ -1069,13 +1118,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     "phase": "candidate_check",
                     "diagnostic": "current candidate has not passed CandidateCheck",
                 }
-            elif source_reconcile is None or source_reconcile["status"] != "pass":
-                result = {
-                    "protocol": "intentir.lift.public-semantic-probe.v1",
-                    "status": "unavailable",
-                    "phase": "source_reconcile",
-                    "diagnostic": "current candidate has not passed SourceReconcile",
-                }
             elif probe_candidate_text is None or self.semantic_probe is None:
                 result = {
                     "protocol": "intentir.lift.public-semantic-probe.v1",
@@ -1084,10 +1126,26 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     "diagnostic": "this Lift invocation has no public probe runner",
                 }
             else:
-                artifact = decode_scrc_lift_artifact(
-                    probe_candidate_text, prepared
-                )
-                result = dict(self.semantic_probe(artifact))
+                try:
+                    artifact = decode_scrc_lift_artifact(
+                        probe_candidate_text, prepared
+                    )
+                except Exception:
+                    # CandidateCheck has already accepted the value-free draft.
+                    # Any remaining Decode failure belongs to private
+                    # BindSource/Source realization and must not become an
+                    # owner-visible repair hint through this diagnostic tool.
+                    result = {
+                        "protocol": "intentir.lift.public-semantic-probe.v1",
+                        "status": "unavailable",
+                        "phase": "host_private_bind_source",
+                        "diagnostic": (
+                            "host-private BindSource rejected the accepted "
+                            "Lift draft"
+                        ),
+                    }
+                else:
+                    result = dict(self.semantic_probe(artifact))
             result.setdefault(
                 "authority",
                 "public diagnostic only; not CandidateCheck or certification",
@@ -1177,13 +1235,70 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             )
             selected_effort = effective_effort
             while True:
-                remaining = self._remaining_seconds()
-                if remaining <= 0:
-                    raise self._terminal_time_error(round_index)
-                turn_timeout = min(
-                    remaining,
-                    self.model_timeout_seconds or CODEX_CLI_TURN_TIMEOUT_SECONDS,
+                remaining_session = self._remaining_seconds()
+                remaining_invocation = (
+                    invocation_wall_time_limit
+                    - (time.monotonic() - invocation_started)
+                    if invocation_wall_time_limit is not None
+                    else None
                 )
+                current_physical_calls = (
+                    sum(turn.model_segments for turn in call_turns)
+                    + timed_out_calls
+                    + len(accepted_submission_interrupts)
+                    + len(diagnostic_ready_interrupts)
+                )
+                if (
+                    remaining_invocation is not None
+                    and remaining_invocation <= 0
+                ):
+                    raise self._invocation_limit_error(
+                        round_index,
+                        reason="wall time",
+                        invocation_turns=invocation_turns,
+                        invocation_elapsed_ms=(
+                            time.monotonic() - invocation_started
+                        )
+                        * 1000.0,
+                        physical_calls=current_physical_calls,
+                        semantic_probe=(
+                            semantic_probe_results[-1]
+                            if semantic_probe_results
+                            else None
+                        ),
+                    )
+                if invocation_turns >= invocation_turn_limit:
+                    raise self._invocation_limit_error(
+                        round_index,
+                        reason="model-turn",
+                        invocation_turns=invocation_turns,
+                        invocation_elapsed_ms=(
+                            time.monotonic() - invocation_started
+                        )
+                        * 1000.0,
+                        physical_calls=current_physical_calls,
+                        semantic_probe=(
+                            semantic_probe_results[-1]
+                            if semantic_probe_results
+                            else None
+                        ),
+                    )
+                if remaining_session is not None and remaining_session <= 0:
+                    raise self._terminal_time_error(round_index)
+                turn_limits = [
+                    value
+                    for value in (
+                        remaining_session,
+                        remaining_invocation,
+                        _lift_turn_timeout(
+                            selected_effort,
+                            self.model_timeout_seconds,
+                        ),
+                    )
+                    if value is not None
+                ]
+                turn_timeout = min(turn_limits) if turn_limits else None
+                invocation_turns += 1
                 try:
                     turn = self._codex_session.run(
                         prompt,
@@ -1258,8 +1373,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     )
                     if (
                         check["status"] != "pass"
-                        or source_reconcile is None
-                        or source_reconcile["status"] != "pass"
                         or candidate_text is None
                     ):
                         raise CodexCLIError(
@@ -1291,8 +1404,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     )
                     if (
                         check["status"] == "pass"
-                        and source_reconcile is not None
-                        and source_reconcile["status"] == "pass"
                         and candidate_text is not None
                     ):
                         if semantic_probe_needs_owner_turn():
@@ -1307,12 +1418,9 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                         )
                         prompt = _CANDIDATE_CHECK_CONTINUATION_PROMPT
                     else:
-                        assert source_reconcile is not None
-                        _atomic_write_json(
-                            workspace.input_dir / "source_reconcile.json",
-                            source_reconcile,
+                        raise CodexCLIError(
+                            "passing CandidateCheck produced no candidate bytes"
                         )
-                        prompt = _SOURCE_RECONCILE_CONTINUATION_PROMPT
                     selected_effort = self.repair_effort or effective_effort
                     continue
                 except CodexCLIError as exc:
@@ -1337,8 +1445,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                         )
                         if (
                             check["status"] == "pass"
-                            and source_reconcile is not None
-                            and source_reconcile["status"] == "pass"
                             and candidate_text is not None
                         ):
                             if semantic_probe_needs_owner_turn():
@@ -1359,8 +1465,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                             )
                             if (
                                 check["status"] == "pass"
-                                and source_reconcile is not None
-                                and source_reconcile["status"] == "pass"
                                 and candidate_text is not None
                             ):
                                 if semantic_probe_needs_owner_turn():
@@ -1376,7 +1480,41 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                                 break
 
                         remaining_after_timeout = self._remaining_seconds()
-                        if remaining_after_timeout <= 0:
+                        remaining_invocation_after_timeout = (
+                            invocation_wall_time_limit
+                            - (time.monotonic() - invocation_started)
+                            if invocation_wall_time_limit is not None
+                            else None
+                        )
+                        if (
+                            remaining_invocation_after_timeout is not None
+                            and remaining_invocation_after_timeout <= 0
+                        ):
+                            timeout_event["recovery"] = "invocation_time_exhausted"
+                            raise self._invocation_limit_error(
+                                round_index,
+                                reason="wall time",
+                                invocation_turns=invocation_turns,
+                                invocation_elapsed_ms=(
+                                    time.monotonic() - invocation_started
+                                )
+                                * 1000.0,
+                                physical_calls=(
+                                    sum(turn.model_segments for turn in call_turns)
+                                    + timed_out_calls
+                                    + len(accepted_submission_interrupts)
+                                    + len(diagnostic_ready_interrupts)
+                                ),
+                                semantic_probe=(
+                                    semantic_probe_results[-1]
+                                    if semantic_probe_results
+                                    else None
+                                ),
+                            ) from exc
+                        if (
+                            remaining_after_timeout is not None
+                            and remaining_after_timeout <= 0
+                        ):
                             timeout_event["recovery"] = "owner_time_exhausted"
                             raise self._terminal_time_error(round_index) from exc
                         if getattr(self._codex_session, "thread_id", None) is None:
@@ -1392,12 +1530,9 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                             )
                             prompt = _CANDIDATE_CHECK_CONTINUATION_PROMPT
                         else:
-                            assert source_reconcile is not None
-                            _atomic_write_json(
-                                workspace.input_dir / "source_reconcile.json",
-                                source_reconcile,
+                            raise CodexCLIError(
+                                "passing CandidateCheck produced no candidate bytes"
                             )
-                            prompt = _SOURCE_RECONCILE_CONTINUATION_PROMPT
                         timeout_event["recovery"] = "same_thread_continuation"
                         selected_effort = self.repair_effort or effective_effort
                         continue
@@ -1410,8 +1545,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 check, source_reconcile = host_preflight(trigger="host_post_turn")
                 if (
                     check["status"] == "pass"
-                    and source_reconcile is not None
-                    and source_reconcile["status"] == "pass"
                     and candidate_text is not None
                 ):
                     if semantic_probe_needs_owner_turn():
@@ -1426,12 +1559,9 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     )
                     prompt = _CANDIDATE_CHECK_CONTINUATION_PROMPT
                 else:
-                    assert source_reconcile is not None
-                    _atomic_write_json(
-                        workspace.input_dir / "source_reconcile.json",
-                        source_reconcile,
+                    raise CodexCLIError(
+                        "passing CandidateCheck produced no candidate bytes"
                     )
-                    prompt = _SOURCE_RECONCILE_CONTINUATION_PROMPT
                 selected_effort = self.repair_effort or effective_effort
         except Exception as exc:
             if isinstance(exc, CandidateLiftError):
@@ -1483,7 +1613,25 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             bridge.close()
 
         assert candidate_text is not None
-        artifact = decode_scrc_lift_artifact(candidate_text, prepared)
+        try:
+            artifact = decode_scrc_lift_artifact(candidate_text, prepared)
+        except Exception as exc:
+            from intentir.verify.scrc_runner import CandidateLiftError
+
+            raise CandidateLiftError(
+                {
+                    "diagnostic": (
+                        "host-private BindSource rejected the accepted Lift draft"
+                    ),
+                    "failure_class": "bind_source_rejected",
+                    "authority": (
+                        "host-private BindSource/Gate boundary; no Source "
+                        "realization diagnostic is returned to the Lift owner"
+                    ),
+                },
+                physical_calls=max(1, sum(turn.model_segments for turn in call_turns)),
+                terminal=True,
+            ) from exc
         usage = _aggregate_usage(call_turns)
         trajectory = {
             "protocol": CODEX_CLI_AGENT_RUNTIME,
@@ -1502,11 +1650,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 diagnostic_ready_interrupts
             ),
             "tool_bridge": bridge.evidence,
-            "source_ttir_observation": {
-                key: value
-                for key, value in self._source_ttir_observation.items()
-                if key not in {"ttir", "fingerprint"}
-            },
             "isolation": {
                 "outer": "bubblewrap-host-fs-v1",
                 "input": "read-only",
@@ -1552,7 +1695,7 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             ),
             elapsed_ms=elapsed_ms,
             backend=CODEX_CLI_LIFT_BACKEND,
-            termination_status="CandidateCheckAndSourceReconcilePass",
+            termination_status="CandidateCheckPass",
             trajectory=trajectory,
         )
         extraction = SCRCExtraction(
@@ -1580,6 +1723,15 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             "model_segments_lower_bound": physical_calls,
             "tool_actions": sum(turn.tool_actions for turn in call_turns),
             "elapsed_ms": elapsed_ms,
+            "invocation_model_turn_limit": invocation_turn_limit,
+            "invocation_wall_time_limit_seconds": invocation_wall_time_limit,
+            "invocation_model_turns": (
+                len(call_turns)
+                + timed_out_calls
+                + len(accepted_submission_interrupts)
+                + len(diagnostic_ready_interrupts)
+            ),
+            "invocation_elapsed_ms": elapsed_ms,
             "usage": usage,
             "candidate_check": list(check_results),
             "source_reconcile": list(source_reconcile_results),
@@ -1616,6 +1768,10 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             | {
                 "model": provider.model,
                 "artifact_schema": artifact.wire_schema,
+                "layer_c_interface": extraction.layer_c_interface_payload,
+                "layer_c_interface_digest": (
+                    extraction.layer_c_interface_digest
+                ),
                 "decode_protocol": candidate_check_context.decode_protocol,
                 "typecheck_protocol": candidate_check_context.typecheck_protocol,
                 "session_active_elapsed_ms": self._session_active_elapsed_ms,

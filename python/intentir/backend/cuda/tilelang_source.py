@@ -82,6 +82,13 @@ class PreparedTileLangInvocation:
             "i1": torch.bool,
             "i32": torch.int32,
             "i64": torch.int64,
+            "index": torch.int64,
+            "u8": torch.uint8,
+            "u16": torch.uint16,
+            "u32": torch.uint32,
+            "ui8": torch.uint8,
+            "ui16": torch.uint16,
+            "ui32": torch.uint32,
         }
         for output_key, output_spec in zip(
             output_keys, output_specs, strict=True

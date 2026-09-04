@@ -29,15 +29,17 @@ Top-level JSON:
     "returns": [ {"output":<declared output>,"value":<SSA/input value>}, ... ],
     "body": [ <op>, ... ]
 }}
-- dtype in {f16,bf16,f32,f64,i1,i8,i16,i32,i64}. Scalars have shape [].
+- dtype in {f16,bf16,f32,f64,i1,i8,i16,i32,i64,u8,u16,u32,index}. Scalars have shape [].
 - shape entries are ints or symbolic dim names (e.g. "M","N","D"); reuse the
-  same name for the same extent. An output is produced by an op result with the
-  output name, or by an explicit function-level `returns` binding.
+  same name for the same extent. `returns` is the only function-output ABI: it
+  must contain exactly one binding for every declared output, in output order;
+  never infer an output binding from the output name or from `output_mappings`.
 
 Atomic ops (each is one JSON object in a "body" list):
   map_binary : elementwise, numpy-broadcasting. fn in
-               {add,sub,mul,div,max,min,pow,cmp,atan2,gt,ge,lt,le,eq,ne,
-                logical_and,logical_or,logical_xor,isclose}.
+               {add,sub,mul,div,max,min,pow,atan2,gt,ge,lt,le,eq,ne,
+                logical_and,logical_or,logical_xor,and,or,xor,isclose,
+                floordiv,remainder,left_shift,right_shift,copysign}.
                Operand dtype promotion follows the closed IntentIR numeric
                lattice and the result type must be declared consistently;
                this op-internal promotion is distinct from an explicit source
@@ -58,10 +60,46 @@ Atomic ops (each is one JSON object in a "body" list):
      {"op":"map_binary","result":R,"operands":[A,B],"attrs":{"fn":F}}
   map_unary  : elementwise. fn in
                {identity,exp,log,log2,sqrt,rsqrt,neg,recip,abs,tanh,sigmoid,
-                cos,sin,tan,exp2,atan,erf,isnan,isinf,isfinite,logical_not}.
+                cos,sin,tan,exp2,atan,erf,acos,asin,cbrt,ceil,floor,round,
+                roundeven,trunc,sign,log10,log1p,expm1,erfc,isnan,isinf,
+                isfinite,logical_not}.
                (isnan/isinf/isfinite produce i1 tensors -> feed select;
                 logical_not is i1->i1. identity returns its operand unchanged.)
      {"op":"map_unary","result":R,"operands":[A],"attrs":{"fn":F}}
+  reshape    : preserve row-major element order while changing the tensor shape;
+               attrs.shape is a list of non-negative integer or symbolic extents,
+               and the declared result type must preserve dtype and element count.
+     {"op":"reshape","result":R,"operands":[A],"attrs":{"shape":[M,N]}}
+  ragged      : package a rank-1 Ragged-carrier offsets vector and a rank-1
+                Ragged-carrier member-index vector into one closed descriptor.
+                A Ragged carrier dtype is exactly one of
+                {i8,i16,i32,i64,u8,u16,u32,index}; bool/i1, u64, explicit
+                signed integer types, and every other integer width are
+                forbidden.  The result
+                type is {"kind":"ragged","fields":[
+                  {"name":"offsets","type":{"dtype":DT,"shape":[N+1]}},
+                  {"name":"indices","type":{"dtype":DT,"shape":[K]}}
+                ]}; it is not an ordinary tensor and has no attrs.
+     {"op":"ragged","result":R,"operands":[OFFSETS,INDICES]}
+  ragged_outer: return the rank-0 Ragged-carrier number of outer groups in a
+                ragged descriptor.  It may be used as a dynamic loop upper bound.
+     {"op":"ragged_outer","result":N,"operands":[R]}
+  ragged_member: return the rank-1 Ragged-carrier member-index vector for one
+                 outer group.  Its selector is a rank-0 Ragged carrier, and
+                 its declared shape is ["?"] because its length is
+                 data-dependent; it can feed gather or scatter.
+     {"op":"ragged_member","result":MEMBERS,"operands":[R,I]}
+  record     : construct one named-field tensor record.  attrs.fields gives the
+               field order and must match the names and tensor types in the
+               declared {"kind":"record","fields":[...]} result type.  Use
+               record_get to project one named field; do not encode a record as
+               an anonymous positional result list.
+     {"op":"record","result":R,"operands":[A,B],"attrs":{"fields":["max","sum"]},
+      "type":{"kind":"record","fields":[
+        {"name":"max","type":{"dtype":"f32","shape":[M]}},
+        {"name":"sum","type":{"dtype":"f32","shape":[M]}}
+      ]}}
+     {"op":"record_get","result":R,"operands":[REC],"attrs":{"field":"max"}}
   reduce     : along axes. The declared result shape chooses either KEEPDIMS
                (reduced dims become size 1, for broadcast consumers) or
                COLLAPSED (reduced dims are removed, for an external ABI such as
@@ -77,10 +115,15 @@ Atomic ops (each is one JSON object in a "body" list):
                Preserve the exact Source/compiler integer width; an unrelated
                i64 stride/address carrier never widens an i32 logical index.
      {"op":"iota","result":R,"attrs":{"n":<int-or-symbol>,"dtype":"i32"|"i64"}}
-  const      : a typed literal value, splat over an optional shape (default scalar []).
+  const      : a literal value, splat over an optional shape (default scalar []).
                Finite values are JSON numbers. IEEE floating specials use only the
                closed strings "-inf", "inf", or "nan" with a floating dtype.
-     {"op":"const","result":R,"attrs":{"value":<number-or-special>,"dtype":"f32","shape":[]}}
+               dtype is optional only when J can infer it from the value's
+               consumer; outside such a context it defaults to f32. Inside a
+               loop, an omitted dtype inherits the dtype required by the carry
+               dataflow. Never use this rule to override an authored dtype or
+               result type.
+     {"op":"const","result":R,"attrs":{"value":<number-or-special>,"shape":[]}}
   contraction: binary einsum. attrs.subscripts is the canonical explicit
                "lhs,rhs->out" label string (no ellipsis); exactly two operands.
                Repeated input labels are allowed when their typed extents agree;
@@ -93,6 +136,9 @@ Atomic ops (each is one JSON object in a "body" list):
                [rows,cols], author boundary.broadcasts for that exact select
                node/operand (here axes:[1]); an explicit result type never
                authorizes silently erasing the mismatch.
+               The two value arms have one common dtype. In a loop, an omitted
+               dtype on a const/rand value arm inherits the dtype required by
+               the selected carry path; the condition remains i1.
   cast       : dtype cast.  {"op":"cast","result":R,"operands":[A],"attrs":{"to_dtype":DT}}
   transpose  : {"op":"transpose","result":R,"operands":[A],"attrs":{"perm":[...]}}
   gather     : data-dependent addressing. `index` is an INTEGER tensor; `axis`
@@ -108,7 +154,31 @@ Atomic ops (each is one JSON object in a "body" list):
                canonical scatter must also have one matching top-level
                boundary.index_bounds and boundary.updates record, plus an
                explicit result relation for every observable output.
+               An explicit atomic update adds atomic="add" or "cas", ordering
+               in {"relaxed","acquire","release","acq_rel","seq_cst"}, and
+               memory_scope in {"work_item","subgroup","workgroup","device","system"}.
+               Every atomic scatter must also have one matching
+               boundary.realization_authorizations entry with kind
+               "native_atomic" and subject_ref equal to its stable node id.
+               atomic="add" requires reduce="add"; atomic="cas" requires
+               reduce="none".
+               Do not add ordering or memory_scope without atomic.
      {"op":"scatter","result":R,"operands":[DATA,INDEX,SRC],"attrs":{"axis":i,"mode":"along_axis","reduce":"none"|"add"}}
+     {"op":"scatter","result":R,"operands":[DATA,INDEX,SRC],"attrs":{"axis":i,"mode":"along_axis","reduce":"add","atomic":"add","ordering":"relaxed","memory_scope":"device"}}
+  atomic_scatter: explicit compare-exchange scatter with an observable old
+                  value. It is the J-level form of a scatter with
+                  atomic="cas", not an ordinary scatter with extra metadata.
+                  Operands are [DATA, INDEX, COMPARE, REPLACEMENT] and results
+                  are [UPDATED, OBSERVED], all with the data rank/element type;
+                  mode="along_axis", atomic="cas", ordering, and
+                  memory_scope are mandatory. cas_retry is optional and is
+                  one of "single_attempt" or "until_success". It also needs
+                  the matching native_atomic realization authorization bound
+                  to this node.
+     {"op":"atomic_scatter","result":[UPDATED,OBSERVED],
+      "operands":[DATA,INDEX,COMPARE,REPLACEMENT],"attrs":{"axis":i,
+      "mode":"along_axis","atomic":"cas","ordering":"relaxed",
+      "memory_scope":"device","cas_retry":"single_attempt"}}
   concat     : variadic structural placement along `axis` (numpy concatenate /
                torch.cat; hstack/vstack = axis 1/0; stack = concat after an
                unsqueeze of each input at `axis`).
@@ -124,12 +194,15 @@ Atomic ops (each is one JSON object in a "body" list):
   triu       : upper triangle above the k-th diagonal, rest zeroed (numpy/torch
                triu). Rank-2, shape-preserving.
      {"op":"triu","result":R,"operands":[A],"attrs":{"k":0}}
-  rand       : counter-based uniform[0,1) f32 RNG. NO operands; the output shape
-               is `attrs.shape`, `attrs.seed` is the philox seed. value[i] is a
+  rand       : counter-based uniform[0,1) RNG. NO operands; the output shape
+               is `attrs.shape`, `attrs.seed` is the philox seed. dtype defaults
+               to f32 when no consumer supplies a stronger type. In a loop,
+               an omitted dtype inherits the dtype required by its carry dataflow;
+               an authored dtype remains authoritative. value[i] is a
                stateless philox4x32-10 hash of (seed, element-index), so it is
                order-independent and reproducible. randn / normal / uniform(a,b)
                / dropout are COMPOSITIONS of rand (see below), NOT new ops.
-     {"op":"rand","result":R,"attrs":{"seed":<int>,"shape":[..]}}
+     {"op":"rand","result":R,"attrs":{"seed":<int>,"shape":[..],"dtype":"f32"}}
   scan       : inclusive cumulative scan along ONE `axis`, shape-preserving. fn in
                {sum,max,min} (cumsum / cummax / cummin). torch.cummax/cummin also
                return argmax/argmin indices — emit the VALUE scan here (pair the
@@ -154,8 +227,9 @@ Atomic ops (each is one JSON object in a "body" list):
                argmax FLAT index ih*W+iw (i64).
      {"op":"pool","result":O,"operands":[A],"attrs":{"fn":"avg","kH":k,"kW":k,"sH":s,"sW":s,"padH":p,"padW":p}}
      {"op":"pool","result":[O,IDX],"operands":[A],"attrs":{"fn":"max","kH":k,"kW":k,"sH":s,"sW":s,"padH":p,"padW":p}}
-  upsample   : nearest-neighbor resize over NCHW. out[.,oh,ow]=in[.,floor(oh*IH/OH),
-               floor(ow*IW/OW)]. `scale`=[sh,sw] integer upscale factors.
+  upsample   : resize over NCHW. `mode` is `nearest` (floor index-remap) or
+               `bicubic` (align_corners=False, closed 4x4 cubic neighborhood).
+               `scale`=[sh,sw] integer upscale factors.
      {"op":"upsample","result":O,"operands":[A],"attrs":{"mode":"nearest","scale":[sh,sw]}}
   polar      : complex build from magnitude+angle (torch.polar). The complex result
                is the trailing real/imag PAIR — name BOTH results (list):
@@ -185,11 +259,23 @@ Atomic ops (each is one JSON object in a "body" list):
      {"op":"masked_scatter","result":R,"operands":[DATA,MASK,SRC],"attrs":{}}
 
 Structured loop (loop-carried recurrence, e.g. online softmax / scans):
+  Handle namespaces are strict and must be followed exactly: logical tensor
+  boundaries are t0,t1,...; operation/region SSA values are v0,v1,...;
+  loop state_id values are s0,s1,...; structural scopes are q0,q1,...;
+  symbolic loop dimensions are x0,x1,...; physical signature parameters p*
+  never occur in any J value, shape, type, or operand position.  A loop's
+  body_argument, next_value, result_value, scan.name, and dynamic trip.index
+  are v* handles; static trip.axis is an x* handle; dynamic trip.upper_bound
+  is an already-visible rank-0 integer t*/v* value (a derived v* producer is
+  valid, for example a ragged_outer count).  Every ordinary body operation keeps the ordinary
+  {op,result,operands,attrs,type} shape.  Only op == loop may contain
+  scope_id/carry/trip/scan/body/yield; effect_if and value_if have their own
+  closed shapes below.
   {"op":"loop",
    "scope_id":<opaque semantic scope id>,
    "result":[<post-loop result values>],
    "carry":[{
-      "state_id":<opaque state id>,
+      "state_id":<s0, s1, ... state id>,
       "init_value":<outer value or typed literal>,
       "body_argument":<loop-local current value>,
       "next_value":<value defined by the body>,
@@ -200,6 +286,9 @@ Structured loop (loop-carried recurrence, e.g. online softmax / scans):
    "scan":[{"name":<slice name>,"from":<input>,"axis":<int>}, ...],
    "body":[ <ops over complete logical scan values + carries> ],
    "yield":[<next-iteration carry values, one per carry>] }
+  A descriptor-driven loop has no scan inputs and binds one scalar induction
+  value in its body:
+  {"trip":{"upper_bound":<rank-0 integer value>,"index":<loop-local value>}}
   result must exactly equal carry.result_value order; yield must exactly equal
   carry.next_value order. Body sees scan names and body_argument names only;
   body_argument must not escape the loop. The body op that defines each
@@ -304,6 +393,7 @@ FEWSHOT_JSON = """\
   "name": "l1_normalize",
   "inputs":  [{"name": "X", "dtype": "f32", "shape": ["M", "N"]}],
   "outputs": [{"name": "Y", "dtype": "f32", "shape": ["M", "N"]}],
+  "returns": [{"output": "Y", "value": "Y"}],
   "body": [
     {"op": "reduce", "result": "s", "operands": ["X"],
      "attrs": {"fn": "sum", "axes": [1], "assoc": "float_nondeterministic"}},

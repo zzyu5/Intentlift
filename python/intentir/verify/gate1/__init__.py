@@ -55,7 +55,11 @@ from .model import (
     UpdateOrder,
     opaque_replay_abi,
 )
-from .pi import RealizationWitness, RealizationWitnessError
+from .pi import (
+    RealizationWitness,
+    RealizationWitnessError,
+    validate_normalization_bindings_against_j,
+)
 from .profile import ObserverProfile, observer_profile_for
 
 __all__ = [
@@ -69,7 +73,8 @@ __all__ = [
     "ObserverProfile", "observer_profile_for",
     "ParameterMode", "PortableScope", "ProvenanceRecord", "ProvenanceRole",
     "RealizationAuthorization", "RealizationWitness",
-    "RealizationWitnessError", "ReductionBoundary", "RefinementKind",
+    "RealizationWitnessError", "validate_normalization_bindings_against_j",
+    "ReductionBoundary", "RefinementKind",
     "ResultRelationKind", "ResultRelationSpec",
     "RuntimeArgument", "ScheduleSlot", "ScheduleSlotKind", "SchemaError",
     "SignatureParameter", "ScopeKind", "SemanticArchive", "SemanticEventKind",

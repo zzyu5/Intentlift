@@ -20,6 +20,8 @@ from collections.abc import Iterable, Mapping
 import re
 from typing import Any
 
+from intentir.ir.intent_op_contract import RAGGED_OPS
+
 from .model import Gate1Artifact, ParameterKind
 from .ptx import PTXComparison, PTXDifference, PTXFingerprint, compare_ptx_fingerprints
 from .tilelang import TileLangComparison, TileLangDifference, TileLangFingerprint, compare_tilelang_fingerprints
@@ -142,10 +144,12 @@ def _j_contract(artifact: Gate1Artifact) -> tuple[set[str], set[str], bool]:
                 # A boolean-to-numeric blend may remain arithmetic or become a
                 # target select; both are representations of the same J cast.
                 allowed.add("select")
-        elif name in {"const", "gather", "iota", "transpose"}:
+        elif name in {"const", "gather", "iota", "transpose"} | RAGGED_OPS:
             # Pure data-movement nodes carry no floating opcode family of their
-            # own.  Their exact tensor types/ABI/program axes remain J-owned,
-            # while Gate2 evaluates the authored indexing/permutation semantics.
+            # own.  Ragged descriptor construction and its outer/member queries
+            # are the same bounded data-movement family: exact carrier types and
+            # ABI remain J-owned, while Gate2 evaluates offsets/indices/selector
+            # semantics at the runtime boundary.
             continue
         elif name is not None:
             unsupported = True

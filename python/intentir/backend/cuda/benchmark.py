@@ -246,7 +246,7 @@ def extract_single_launch(
     scalar_inputs: dict[str, tuple[int, str]] = {}
     for match in re.finditer(
         r"(%\w+)\s*=\s*llvm\.load\s+(%\w+)\s*:\s*!llvm\.ptr\s*->\s*"
-        r"(i32|i64|f16|bf16|f32|f64)",
+        r"(i1|i8|i16|i32|i64|ui8|ui16|ui32|f16|bf16|f32|f64)",
         host,
     ):
         result_ssa, pointer_ssa, scalar_type = match.groups()
@@ -306,6 +306,12 @@ def extract_single_launch(
             plan.append(("i64", int(raw)))
         elif operand.ty == "i32":
             plan.append(("i32", int(raw)))
+        elif operand.ty == "ui8":
+            plan.append(("u8", int(raw)))
+        elif operand.ty == "ui16":
+            plan.append(("u16", int(raw)))
+        elif operand.ty == "ui32":
+            plan.append(("u32", int(raw)))
         elif operand.ty == "f32":
             plan.append(("f32", orchestrate._parse_f32(raw)))
         elif operand.ty == "f64":

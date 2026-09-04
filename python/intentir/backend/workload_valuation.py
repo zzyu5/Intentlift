@@ -148,10 +148,11 @@ _NATURAL_HEADLINE_EXTENTS: dict[str, dict[str, int]] = {
     "kl_div": {_ROW: 4096, _FEATURE: 4096},
     "poly_norm": {_ROW: 2048, _FEATURE: 4096},
     "flash_attention_forward": {
-        # B*H*S=262144 makes the certified J-only 128 MiB scan bound select
-        # exactly the 128-key semantic slice used by the Source valuation.  This
-        # is also a model-scale 32-head attention workload rather than the old
-        # tiny B2/H8 smoke shape.
+        # This is a model-scale 32-head attention workload rather than the old
+        # tiny B2/H8 smoke shape.  Production J materialization has no implicit
+        # scan-memory budget: a physical scan tile must come from a validated
+        # target Layer-C binding, while the C-free path consumes the complete
+        # semantic axis.
         _BATCH: 8,
         _HEADS: 32,
         _SEQUENCE: 1024,

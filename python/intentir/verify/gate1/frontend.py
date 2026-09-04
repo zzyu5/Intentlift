@@ -36,6 +36,7 @@ class FrontendGate1Capability:
     case_type: type[Any]
     runner_type: type[Any]
     profile: ObserverProfile
+    dataset_workflow: bool = False
 
     def build_runner(
         self,
@@ -49,20 +50,30 @@ class FrontendGate1Capability:
             raise TypeError(
                 f"{self.frontend.value} requires {self.compiler_type.__name__}"
             )
+        runner_kwargs: dict[str, Any] = {
+            "compiler": compiler,
+            "writer": writer,
+            "config": config,
+        }
+        if self.frontend in {
+            Frontend.CUTE,
+            Frontend.CUDA,
+            Frontend.TILELANG,
+        }:
+            runner_kwargs["masked_writer"] = masked_writer
+        elif masked_writer is not None:
+            raise ValueError("Triton Gate1 owns masked Replay on its normal writer")
         return self.runner_type(
-            compiler=compiler,
-            writer=writer,
-            masked_writer=masked_writer,
-            config=config,
+            **runner_kwargs,
         )
 
 
 def _capabilities() -> dict[Frontend, FrontendGate1Capability]:
     rows = (
-        (Frontend.TRITON, "python", (".py",), TritonCompiler, KernelSource, CompileCase, Gate1Runner),
-        (Frontend.CUTE, "python", (".py",), CuteCompiler, CuteKernelSource, CuteCompileCase, CuteGate1Runner),
-        (Frontend.TILELANG, "python", (".py",), TileLangCompiler, TileLangKernelSource, TileLangCompileCase, TileLangGate1Runner),
-        (Frontend.CUDA, "cuda-c++", (".cu",), CudaCompiler, CudaKernelSource, CudaCompileCase, CudaGate1Runner),
+        (Frontend.TRITON, "python", (".py",), TritonCompiler, KernelSource, CompileCase, Gate1Runner, True),
+        (Frontend.CUTE, "python", (".py",), CuteCompiler, CuteKernelSource, CuteCompileCase, CuteGate1Runner, False),
+        (Frontend.TILELANG, "python", (".py",), TileLangCompiler, TileLangKernelSource, TileLangCompileCase, TileLangGate1Runner, True),
+        (Frontend.CUDA, "cuda-c++", (".cu",), CudaCompiler, CudaKernelSource, CudaCompileCase, CudaGate1Runner, True),
     )
     return {
         frontend: FrontendGate1Capability(
@@ -74,8 +85,9 @@ def _capabilities() -> dict[Frontend, FrontendGate1Capability]:
             case,
             runner,
             observer_profile_for(frontend),
+            dataset_workflow,
         )
-        for frontend, language, extensions, compiler, source, case, runner in rows
+        for frontend, language, extensions, compiler, source, case, runner, dataset_workflow in rows
     }
 
 
@@ -95,8 +107,25 @@ def active_gate1_frontends() -> tuple[Frontend, ...]:
     return tuple(_ACTIVE)
 
 
+def active_dataset_frontends() -> tuple[Frontend, ...]:
+    """Return frontends wired through the shared Dataset SCRC workflow.
+
+    A frontend may have a direct Gate1 capability without having a registered
+    Dataset Harness, source projection, or three-way Gate2 adapter.  Keeping
+    this distinction explicit prevents the capability registry from silently
+    promising a lifecycle path that the workload registry cannot construct.
+    """
+
+    return tuple(
+        frontend
+        for frontend, capability in _ACTIVE.items()
+        if capability.dataset_workflow
+    )
+
+
 __all__ = [
     "FrontendGate1Capability",
+    "active_dataset_frontends",
     "active_gate1_frontends",
     "frontend_gate1_capability",
 ]

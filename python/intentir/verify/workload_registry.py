@@ -13,6 +13,7 @@ from intentir.verify.frontend_workloads import (
     prepare_frontend_dataset_workload,
     project_frontend_dataset_harnesses,
 )
+from intentir.verify.gate1.frontend import active_dataset_frontends
 from intentir.verify.workload_adapters import (
     TRITON_WORKLOAD_ADAPTERS,
     PreparedTritonWorkload,
@@ -73,8 +74,14 @@ def registered_scrc_case_ids(
 ) -> tuple[str, ...]:
     rows = registered_scrc_workloads(dataset_root=dataset_root)
     if frontend is not None:
-        if frontend not in {"triton", "tilelang", "cuda"}:
-            raise ValueError(f"unsupported registered workload frontend {frontend!r}")
+        supported = {
+            item.value for item in active_dataset_frontends()
+        }
+        if frontend not in supported:
+            raise ValueError(
+                f"frontend {frontend!r} has no registered Dataset workflow; "
+                f"supported frontends are {sorted(supported)!r}"
+            )
         rows = {
             case_id: adapter
             for case_id, adapter in rows.items()

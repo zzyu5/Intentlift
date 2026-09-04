@@ -24,6 +24,7 @@ from intentir.verify.scrc_runner import (
     FeedbackKind,
     LiftFeedback,
     MainStatus,
+    MAX_LIFT_CALLS,
     _compact_gate1_observer_diff,
 )
 from intentir.verify.scrc_workload_run import (
@@ -63,7 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lift-backend",
         choices=("responses", "miniswe", "codex"),
-        default="miniswe",
+        default="responses",
     )
     parser.add_argument(
         "--replay-backend",
@@ -71,6 +72,15 @@ def _parser() -> argparse.ArgumentParser:
         default="miniswe",
     )
     parser.add_argument("--max-gate1-rounds", type=int, default=6)
+    parser.add_argument(
+        "--max-lift-calls",
+        type=int,
+        default=MAX_LIFT_CALLS,
+        help=(
+            "maximum new logical Lift invocations in this continuation "
+            f"(1-{MAX_LIFT_CALLS})"
+        ),
+    )
     parser.add_argument(
         "--max-pre-replay-rejections",
         type=int,
@@ -237,6 +247,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_gate1_rounds < 1:
         print("max-gate1-rounds must be positive", file=sys.stderr)
         return 2
+    if not 1 <= args.max_lift_calls <= MAX_LIFT_CALLS:
+        print(
+            f"max-lift-calls must be in [1, {MAX_LIFT_CALLS}]",
+            file=sys.stderr,
+        )
+        return 2
     if args.max_pre_replay_rejections < 0:
         print("max-pre-replay-rejections must be non-negative", file=sys.stderr)
         return 2
@@ -262,6 +278,7 @@ def main(argv: list[str] | None = None) -> int:
             run_masked_j=args.run_masked_j,
             lift_backend=args.lift_backend,
             replay_backend=args.replay_backend,
+            max_lift_calls=args.max_lift_calls,
             search_metadata={
                 "protocol": RANKED_CONTINUATION_PROTOCOL,
                 "parent_evidence": str(args.parent_evidence.expanduser().resolve()),
@@ -269,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                 "initial_selection_rank": rank,
                 "failed_parent_policy": "branch-owner-latest-candidate-v1",
                 "replay_width": args.replay_width,
+                "max_lift_calls": args.max_lift_calls,
                 "replay_selection": "exact-pass-then-gate1-rank-v1",
                 "retry_parent_gate1": args.retry_parent_gate1,
             },
@@ -305,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
             replay_width=args.replay_width,
             retry_initial_artifact=args.retry_parent_gate1,
             max_gate1_rounds=args.max_gate1_rounds,
+            max_lift_calls=args.max_lift_calls,
             max_pre_replay_rejections=args.max_pre_replay_rejections,
             progress_callback=progress,
         )
@@ -335,6 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         "parent_evidence": str(args.parent_evidence.expanduser().resolve()),
         "evidence_path": str(run_dir),
         "status": status,
+        "max_lift_calls": args.max_lift_calls,
     }
     _emit(payload, json_mode=args.json)
     return 0 if status == MainStatus.SCRC_CERTIFIED.value else 1

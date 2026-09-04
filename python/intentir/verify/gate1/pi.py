@@ -11,7 +11,9 @@ from __future__ import annotations
 import copy
 import re
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping
+
+from intentir.ir.intent_op_contract import is_scalar_literal_or_value_reference
 
 
 class RealizationWitnessError(ValueError):
@@ -103,6 +105,676 @@ def _record(
     return value
 
 
+def _wire_object(value: Any, path: str) -> dict[str, Any]:
+    """Read one JSON object without importing the Gate1 model layer.
+
+    The public normalization validator is intentionally owned by this module.
+    It therefore accepts either the persisted mapping or a typed object with a
+    ``to_json`` method, but it must not depend on ``model.py`` to discover the
+    declaration namespaces it is validating.
+    """
+
+    if not isinstance(value, Mapping):
+        to_json = getattr(value, "to_json", None)
+        if not callable(to_json):
+            raise RealizationWitnessError(f"{path} must be an object")
+        try:
+            value = to_json()
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            raise RealizationWitnessError(
+                f"{path} could not be converted to a JSON object: {exc}"
+            ) from exc
+    if not isinstance(value, Mapping) or any(
+        not isinstance(key, str) for key in value
+    ):
+        raise RealizationWitnessError(f"{path} must be an object")
+    return dict(value)
+
+
+def _wire_array(value: Any, path: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise RealizationWitnessError(f"{path} must be an array")
+    return value
+
+
+def _wire_handle(
+    value: Any,
+    path: str,
+    pattern: str,
+    description: str,
+) -> str:
+    if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+        raise RealizationWitnessError(f"{path} must be {description}")
+    return value
+
+
+def _wire_handle_set(
+    values: Any,
+    *,
+    path: str,
+    pattern: str,
+    fields: tuple[str, ...] = ("name", "id"),
+) -> set[str]:
+    result: set[str] = set()
+    for index, value in enumerate(_wire_array(values, path)):
+        item = _wire_object(value, f"{path}[{index}]")
+        handle = next(
+            (item.get(field) for field in fields if item.get(field) is not None),
+            None,
+        )
+        if not isinstance(handle, str) or re.fullmatch(pattern, handle) is None:
+            raise RealizationWitnessError(
+                f"{path}[{index}] must declare a handle matching {pattern}"
+            )
+        if handle in result:
+            raise RealizationWitnessError(f"{path} contains duplicate handle {handle!r}")
+        result.add(handle)
+    return result
+
+
+def _wire_operation_results(value: Any, path: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return (
+            _wire_handle(value, path, r"v[0-9]+", "an SSA v* result handle"),
+        )
+    if isinstance(value, list):
+        return tuple(
+            _wire_handle(
+                item,
+                f"{path}[{index}]",
+                r"v[0-9]+",
+                "an SSA v* result handle",
+            )
+            for index, item in enumerate(value)
+        )
+    raise RealizationWitnessError(f"{path} must be a string, string array, or null")
+
+
+def _wire_walk_operations(
+    operations: Any,
+    *,
+    prefix: str,
+) -> tuple[tuple[str, dict[str, Any]], ...]:
+    rows: list[tuple[str, dict[str, Any]]] = []
+    for index, raw in enumerate(_wire_array(operations, prefix)):
+        path = f"{prefix}[{index}]"
+        operation = _wire_object(raw, path)
+        rows.append((path, operation))
+        body = operation.get("body")
+        if body is not None:
+            rows.extend(_wire_walk_operations(body, prefix=f"{path}.body"))
+        if operation.get("op") in {"effect_if", "value_if"}:
+            for polarity in ("positive", "negative"):
+                arm = operation.get(polarity)
+                if arm is None:
+                    continue
+                arm_object = _wire_object(arm, f"{path}.{polarity}")
+                arm_body = arm_object.get("body")
+                if arm_body is not None:
+                    rows.extend(
+                        _wire_walk_operations(
+                            arm_body,
+                            prefix=f"{path}.{polarity}.body",
+                        )
+                    )
+    return tuple(rows)
+
+
+def _wire_declared_j_names(j: Any) -> dict[str, set[str] | dict[str, Any]]:
+    """Collect only J-owned namespaces needed by normalization bindings."""
+
+    data = _wire_object(j, "j")
+    boundary = _wire_object(data.get("boundary"), "j.boundary")
+    domains_object = _wire_object(boundary.get("domains"), "j.boundary.domains")
+    domains = set(domains_object)
+    if any(re.fullmatch(r"d[0-9]+", item) is None for item in domains):
+        raise RealizationWitnessError(
+            "j.boundary.domains must contain only declaration-order d* handles"
+        )
+
+    access_refs: set[str] = set()
+    for index, raw in enumerate(
+        _wire_array(boundary.get("accesses"), "j.boundary.accesses")
+    ):
+        item = _wire_object(raw, f"j.boundary.accesses[{index}]")
+        access_ref = item.get("access_id")
+        if not isinstance(access_ref, str) or re.fullmatch(r"a[0-9]+", access_ref) is None:
+            raise RealizationWitnessError(
+                f"j.boundary.accesses[{index}].access_id must be an a* handle"
+            )
+        if access_ref in access_refs:
+            raise RealizationWitnessError("J access handles must be unique")
+        access_refs.add(access_ref)
+
+    effect_refs: set[str] = set()
+    for index, raw in enumerate(
+        _wire_array(boundary.get("effects"), "j.boundary.effects")
+    ):
+        item = _wire_object(raw, f"j.boundary.effects[{index}]")
+        effect_ref = item.get("effect_id", f"e{index}")
+        if not isinstance(effect_ref, str) or re.fullmatch(r"e[0-9]+", effect_ref) is None:
+            raise RealizationWitnessError(
+                f"j.boundary.effects[{index}].effect_id must be an e* handle"
+            )
+        if effect_ref in effect_refs:
+            raise RealizationWitnessError("J effect handles must be unique")
+        effect_refs.add(effect_ref)
+
+    scopes = _wire_handle_set(
+        boundary.get("scopes", data.get("scopes", [])),
+        path="j.scopes",
+        pattern=r"q[0-9]+",
+        fields=("scope_id",),
+    )
+    storage = _wire_handle_set(
+        data.get("storage", []),
+        path="j.storage",
+        pattern=r"(?:b|s)[0-9]+",
+        fields=("storage_id",),
+    )
+    authorizations = _wire_handle_set(
+        boundary.get("realization_authorizations", []),
+        path="j.boundary.realization_authorizations",
+        pattern=r"u[0-9]+",
+        fields=("auth_id",),
+    )
+
+    node_ids = _wire_object(data.get("node_ids"), "j.node_ids")
+    nodes: set[str] = set()
+    for node_ref, node_path in node_ids.items():
+        if re.fullmatch(r"n[0-9]+", node_ref) is None or not isinstance(node_path, str):
+            raise RealizationWitnessError(
+                "j.node_ids must map n* handles to operation paths"
+            )
+        if node_ref in nodes:
+            raise RealizationWitnessError("J node handles must be unique")
+        nodes.add(node_ref)
+
+    intent = _wire_object(data.get("intent"), "j.intent")
+    intent_function = _wire_object(
+        intent.get("intent_function"), "j.intent.intent_function"
+    )
+    value_refs: set[str] = set()
+    tensor_refs: set[str] = set()
+    states: set[str] = set()
+    dimensions: set[str] = set()
+    for field_name in ("inputs", "outputs"):
+        for index, raw in enumerate(
+            _wire_array(intent_function.get(field_name), f"j.intent.intent_function.{field_name}")
+        ):
+            item = _wire_object(
+                raw, f"j.intent.intent_function.{field_name}[{index}]"
+            )
+            name = item.get("name")
+            shape = item.get("shape")
+            name = _wire_handle(
+                name,
+                f"j.intent.intent_function.{field_name}[{index}].name",
+                r"t[0-9]+",
+                "a logical tensor t* handle",
+            )
+            if not isinstance(shape, list):
+                raise RealizationWitnessError(
+                    f"j.intent.intent_function.{field_name}[{index}].shape must be an array"
+                )
+            tensor_refs.add(name)
+            value_refs.add(name)
+            for extent_index, extent in enumerate(shape):
+                if isinstance(extent, str) and re.fullmatch(r"x[0-9]+", extent):
+                    dimensions.add(extent)
+                elif isinstance(extent, str) and re.fullmatch(r"p[0-9]+", extent):
+                    raise RealizationWitnessError(
+                        f"j.intent.intent_function.{field_name}[{index}].shape"
+                        f"[{extent_index}] cannot use physical parameter {extent!r}"
+                    )
+
+    operation_rows = _wire_walk_operations(
+        intent_function.get("body"),
+        prefix="body",
+    )
+    operations_by_path = {path: operation for path, operation in operation_rows}
+    operations_by_node: dict[str, dict[str, Any]] = {}
+    for node_ref, node_path in node_ids.items():
+        operation = operations_by_path.get(node_path)
+        if operation is None:
+            raise RealizationWitnessError(
+                f"j.node_ids.{node_ref} does not resolve to a J operation"
+            )
+        operations_by_node[node_ref] = operation
+        value_refs.update(
+            _wire_operation_results(
+                operation.get("result"),
+                f"j.node_ids.{node_ref}.result",
+            )
+        )
+        carries = operation.get("carry")
+        if carries is None:
+            continue
+        for carry_index, raw_carry in enumerate(_wire_array(carries, f"j.node_ids.{node_ref}.carry")):
+            carry = _wire_object(
+                raw_carry,
+                f"j.node_ids.{node_ref}.carry[{carry_index}]",
+            )
+            carry_path = f"j.node_ids.{node_ref}.carry[{carry_index}]"
+            required_fields = {
+                "state_id",
+                "init_value",
+                "body_argument",
+                "next_value",
+                "result_value",
+                "type",
+            }
+            missing_fields = sorted(required_fields - set(carry))
+            if missing_fields:
+                raise RealizationWitnessError(
+                    f"{carry_path} is missing complete loop-carry fields: "
+                    + ", ".join(missing_fields)
+                )
+            state_id = _wire_handle(
+                carry["state_id"],
+                f"{carry_path}.state_id",
+                r"s[0-9]+",
+                "an s* loop-state handle",
+            )
+            if state_id in states:
+                raise RealizationWitnessError(
+                    f"{carry_path}.state_id duplicates loop state {state_id!r}"
+                )
+            states.add(state_id)
+            if not isinstance(carry["type"], dict):
+                raise RealizationWitnessError(f"{carry_path}.type must be an object")
+            init_value = carry["init_value"]
+            if not is_scalar_literal_or_value_reference(init_value):
+                raise RealizationWitnessError(
+                    f"{carry_path}.init_value must be a scalar literal or t*/v* "
+                    "value reference; physical p* parameters are not J values"
+                )
+            if isinstance(init_value, str) and re.fullmatch(
+                r"(?:t|v)[0-9]+", init_value
+            ):
+                value_refs.add(init_value)
+            for field_name in ("body_argument", "next_value", "result_value"):
+                ref = _wire_handle(
+                    carry[field_name],
+                    f"{carry_path}.{field_name}",
+                    r"v[0-9]+",
+                    "an SSA v* handle",
+                )
+                value_refs.add(ref)
+
+    return {
+        "domains": domains,
+        "nodes": nodes,
+        "operations_by_node": operations_by_node,
+        "accesses": access_refs,
+        "effects": effect_refs,
+        "tensors": tensor_refs,
+        "values": value_refs,
+        "states": states,
+        "dimensions": dimensions,
+        "scopes": scopes,
+        "storage": storage,
+        "authorizations": authorizations,
+    }
+
+
+def _wire_axis_ref(value: Any, path: str) -> int | str:
+    if isinstance(value, bool):
+        raise RealizationWitnessError(f"{path} must be a non-negative integer or x*")
+    if isinstance(value, int) and value >= 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"x[0-9]+", value):
+        return value
+    raise RealizationWitnessError(f"{path} must be a non-negative integer or x*")
+
+
+def _wire_unique_relation_rows(
+    rows: list[Any],
+    *,
+    path: str,
+    field: str,
+    relations: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    seen: set[tuple[str, str]] = set()
+    result: list[tuple[str, str]] = []
+    for index, raw in enumerate(rows):
+        item_path = f"{path}[{index}]"
+        item = _record(
+            raw,
+            path=item_path,
+            required=frozenset({"relation", field}),
+        )
+        relation = _name(item["relation"], f"{item_path}.relation")
+        if relation not in relations:
+            raise RealizationWitnessError(
+                f"{item_path}.relation is not a closed relation"
+            )
+        ref = _opaque_anchor_ref(item[field], f"{item_path}.{field}")
+        key = (relation, ref)
+        if key in seen:
+            raise RealizationWitnessError(f"{path} rows must be unique")
+        seen.add(key)
+        result.append(key)
+    return tuple(result)
+
+
+def validate_normalization_bindings_against_j(
+    j: Any,
+    c: Any,
+    pi: Any,
+) -> None:
+    """Validate the public J/C ownership boundary of active normalization π.
+
+    This API deliberately has no dependency on :mod:`gate1.model` or
+    :mod:`verify.typecheck`.  It accepts either JSON mappings or typed objects,
+    verifies that every authored relation names a real J/C declaration, and
+    raises :class:`RealizationWitnessError` when the relation cannot be proved
+    from those declarations.  The deeper canonical axis/predicate checks remain
+    in TypeCheck; this function prevents malformed or cross-owner references
+    from reaching that private checker.
+    """
+
+    j_data = _wire_object(j, "j")
+    c_data = _wire_object(c, "c")
+    pi_data = _wire_object(pi, "pi")
+    schema = pi_data.get("schema")
+    if schema is None:
+        return
+    if schema != NORMALIZATION_WITNESS_SCHEMA:
+        raise RealizationWitnessError(f"unsupported pi subwire schema {schema!r}")
+
+    declared = _wire_declared_j_names(j_data)
+    domains = declared["domains"]
+    nodes = declared["nodes"]
+    operations_by_node = declared["operations_by_node"]
+    accesses = declared["accesses"]
+    effects = declared["effects"]
+    tensors = declared["tensors"]
+    values = declared["values"]
+    scopes = declared["scopes"]
+    storage = declared["storage"]
+    authorizations = declared["authorizations"]
+
+    raw_slots = _wire_array(c_data.get("slots"), "c.slots")
+    slots: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(raw_slots):
+        path = f"c.slots[{index}]"
+        item = _record(
+            raw,
+            path=path,
+            required=frozenset({"name", "kind", "role"}),
+            allowed=frozenset(
+                {
+                    "name",
+                    "kind",
+                    "role",
+                    "value_type",
+                    "required",
+                    "subject_ref",
+                    "axis_ref",
+                }
+            ),
+        )
+        name = _name(item["name"], f"{path}.name")
+        if re.fullmatch(r"c[0-9]+", name) is None:
+            raise RealizationWitnessError(f"{path}.name must be a C slot c*")
+        if name in slots:
+            raise RealizationWitnessError("C slot names must be unique")
+        kind = _name(item["kind"], f"{path}.kind")
+        if kind not in {"constexpr", "compiler"}:
+            raise RealizationWitnessError(f"{path}.kind is not a closed C slot kind")
+        role = _name(item["role"], f"{path}.role")
+        subject_ref = item.get("subject_ref")
+        axis_ref = item.get("axis_ref")
+        if subject_ref is not None:
+            subject_ref = _name(subject_ref, f"{path}.subject_ref")
+            known_subjects = (
+                set(tensors)
+                | set(nodes)
+                | set(domains)
+                | set(accesses)
+                | set(effects)
+                | set(scopes)
+                | set(storage)
+                | set(authorizations)
+            )
+            if subject_ref not in known_subjects:
+                raise RealizationWitnessError(
+                    f"{path}.subject_ref is not a declared J scheduling subject"
+                )
+        if axis_ref is not None:
+            if subject_ref is None:
+                raise RealizationWitnessError(f"{path}.axis_ref requires subject_ref")
+            axis_ref = _wire_axis_ref(axis_ref, f"{path}.axis_ref")
+        if kind == "compiler" and (subject_ref is not None or axis_ref is not None):
+            raise RealizationWitnessError(
+                f"{path} compiler slots cannot attach to a J subject or axis"
+            )
+        slots[name] = {
+            "kind": kind,
+            "role": role,
+            "subject_ref": subject_ref,
+            "axis_ref": axis_ref,
+        }
+
+    def rows(name: str) -> list[Any]:
+        raw = pi_data.get(name, [])
+        return _wire_array(raw, f"pi.{name}")
+
+    program_axes = rows("program_axes")
+    bound_domains: set[str] = set()
+    for index, raw in enumerate(program_axes):
+        path = f"pi.program_axes[{index}]"
+        item = _record(raw, path=path, required=frozenset({"domain_ref", "axis"}))
+        domain_ref = _name(item["domain_ref"], f"{path}.domain_ref")
+        if domain_ref not in domains:
+            raise RealizationWitnessError(
+                f"{path}.domain_ref is not a declared J boundary domain"
+            )
+        axis = item["axis"]
+        if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis <= 2:
+            raise RealizationWitnessError(f"{path}.axis must be an integer in [0, 2]")
+        if domain_ref in bound_domains:
+            raise RealizationWitnessError("pi program-axis domain bindings must be unique")
+        bound_domains.add(domain_ref)
+
+    program_bindings = rows("program_bindings")
+    claimed_program_axes: set[tuple[str, int | str]] = set()
+    claimed_physical_axes: set[int] = set()
+    physical_axis_by_domain: dict[str, int] = {}
+    for index, raw in enumerate(program_bindings):
+        path = f"pi.program_bindings[{index}]"
+        item = _record(
+            raw,
+            path=path,
+            required=frozenset({"axis", "relation", "logical_axes"}),
+        )
+        physical_axis = item["axis"]
+        if (
+            isinstance(physical_axis, bool)
+            or not isinstance(physical_axis, int)
+            or not 0 <= physical_axis <= 2
+        ):
+            raise RealizationWitnessError(f"{path}.axis must be an integer in [0, 2]")
+        if physical_axis in claimed_physical_axes:
+            raise RealizationWitnessError(
+                "pi program bindings must bind each physical launch axis once"
+            )
+        claimed_physical_axes.add(physical_axis)
+        relation = _name(item["relation"], f"{path}.relation")
+        if relation not in PROGRAM_BINDING_RELATIONS:
+            raise RealizationWitnessError(f"{path}.relation is not a closed program relation")
+        axes = _wire_array(item["logical_axes"], f"{path}.logical_axes")
+        if not axes:
+            raise RealizationWitnessError(f"{path}.logical_axes must not be empty")
+        if relation == "direct" and len(axes) != 1:
+            raise RealizationWitnessError(f"{path}.direct requires one logical axis")
+        if relation != "direct" and len(axes) < 2:
+            raise RealizationWitnessError(
+                f"{path}.{relation} requires at least two logical axes"
+            )
+        local: set[tuple[str, int | str]] = set()
+        for axis_index, raw_axis in enumerate(axes):
+            axis_path = f"{path}.logical_axes[{axis_index}]"
+            axis = _record(
+                raw_axis,
+                path=axis_path,
+                required=frozenset({"domain_ref", "axis_ref"}),
+            )
+            domain_ref = _name(axis["domain_ref"], f"{axis_path}.domain_ref")
+            if domain_ref not in domains:
+                raise RealizationWitnessError(
+                    f"{axis_path}.domain_ref is not a declared J domain"
+                )
+            axis_ref = _wire_axis_ref(axis["axis_ref"], f"{axis_path}.axis_ref")
+            key = (domain_ref, axis_ref)
+            if key in local or key in claimed_program_axes:
+                raise RealizationWitnessError(
+                    "pi program bindings must not claim one logical J axis twice"
+                )
+            previous_physical_axis = physical_axis_by_domain.setdefault(
+                domain_ref, physical_axis
+            )
+            if previous_physical_axis != physical_axis:
+                raise RealizationWitnessError(
+                    "pi program bindings must map one J domain to one physical "
+                    "launch axis"
+                )
+            local.add(key)
+            claimed_program_axes.add(key)
+    if program_axes and program_bindings:
+        raise RealizationWitnessError(
+            "pi.program_axes and pi.program_bindings are alternative complete "
+            "program-coordinate mappings and are mutually exclusive"
+        )
+
+    iteration_bindings = rows("iteration_bindings")
+    claimed_iteration_axes: set[tuple[str, int | str]] = set()
+    for index, raw in enumerate(iteration_bindings):
+        path = f"pi.iteration_bindings[{index}]"
+        item = _record(
+            raw,
+            path=path,
+            required=frozenset({"relation", "logical_axes", "tile_slot", "mode_slot"}),
+        )
+        relation = _name(item["relation"], f"{path}.relation")
+        if relation not in ITERATION_BINDING_RELATIONS:
+            raise RealizationWitnessError(f"{path}.relation is not a closed iteration relation")
+        axes = _wire_array(item["logical_axes"], f"{path}.logical_axes")
+        if not axes:
+            raise RealizationWitnessError(f"{path}.logical_axes must not be empty")
+        valid_axis_keys: set[tuple[str, int | str]] = set()
+        for axis_index, raw_axis in enumerate(axes):
+            axis_path = f"{path}.logical_axes[{axis_index}]"
+            axis = _record(
+                raw_axis,
+                path=axis_path,
+                required=frozenset({"subject_ref", "axis_ref"}),
+            )
+            subject_ref = _name(axis["subject_ref"], f"{axis_path}.subject_ref")
+            if subject_ref not in domains and subject_ref not in nodes:
+                raise RealizationWitnessError(
+                    f"{axis_path}.subject_ref is not a declared J domain or node"
+                )
+            if relation == "tiled_domain" and subject_ref not in domains:
+                raise RealizationWitnessError(
+                    f"{axis_path}.subject_ref for tiled_domain must be a J domain"
+                )
+            if relation == "tiled_recurrence" and (
+                subject_ref not in nodes
+                or operations_by_node[subject_ref].get("op") != "loop"
+            ):
+                raise RealizationWitnessError(
+                    f"{axis_path}.subject_ref for tiled_recurrence must be a J loop"
+                )
+            axis_ref = _wire_axis_ref(axis["axis_ref"], f"{axis_path}.axis_ref")
+            key = (subject_ref, axis_ref)
+            if key in valid_axis_keys or key in claimed_iteration_axes:
+                raise RealizationWitnessError(
+                    "pi iteration bindings must not claim one logical J axis twice"
+                )
+            valid_axis_keys.add(key)
+            claimed_iteration_axes.add(key)
+
+        tile_slot_ref = _name(item["tile_slot"], f"{path}.tile_slot")
+        if tile_slot_ref not in slots:
+            raise RealizationWitnessError(
+                f"{path}.tile_slot is not declared by C"
+            )
+        tile_slot = slots[tile_slot_ref]
+        if tile_slot["role"] not in {"tile_extent", "reduction_tile_extent"}:
+            raise RealizationWitnessError(
+                f"{path}.tile_slot must have role tile_extent or reduction_tile_extent"
+            )
+        tile_attachment = (tile_slot["subject_ref"], tile_slot["axis_ref"])
+        if tile_attachment not in valid_axis_keys:
+            raise RealizationWitnessError(
+                f"{path}.tile_slot must attach to one of its authored logical axes"
+            )
+
+        mode_slot_ref = item["mode_slot"]
+        if mode_slot_ref is not None:
+            mode_slot_ref = _name(mode_slot_ref, f"{path}.mode_slot")
+            if mode_slot_ref not in slots:
+                raise RealizationWitnessError(
+                    f"{path}.mode_slot is not declared by C"
+                )
+            mode_slot = slots[mode_slot_ref]
+            mode_attachment = (mode_slot["subject_ref"], mode_slot["axis_ref"])
+            if mode_slot["subject_ref"] is not None and mode_attachment not in valid_axis_keys:
+                raise RealizationWitnessError(
+                    f"{path}.mode_slot must attach to one of its authored logical axes"
+                )
+
+    _wire_unique_relation_rows(
+        rows("control_bindings"),
+        path="pi.control_bindings",
+        field="subject_ref",
+        relations=CONTROL_BINDING_RELATIONS,
+    )
+    for index, raw in enumerate(rows("control_bindings")):
+        path = f"pi.control_bindings[{index}]"
+        item = _record(raw, path=path, required=frozenset({"relation", "subject_ref"}))
+        relation = item["relation"]
+        subject_ref = item["subject_ref"]
+        allowed = domains if relation == "terminal_domain_guard" else nodes | effects
+        if subject_ref not in allowed:
+            raise RealizationWitnessError(
+                f"{path}.subject_ref is not a declared J anchor for {relation}"
+            )
+
+    _wire_unique_relation_rows(
+        rows("materialization_bindings"),
+        path="pi.materialization_bindings",
+        field="value_ref",
+        relations=MATERIALIZATION_BINDING_RELATIONS,
+    )
+    for index, raw in enumerate(rows("materialization_bindings")):
+        path = f"pi.materialization_bindings[{index}]"
+        item = _record(raw, path=path, required=frozenset({"relation", "value_ref"}))
+        value_ref = item["value_ref"]
+        if value_ref not in tensors | values | nodes:
+            raise RealizationWitnessError(
+                f"{path}.value_ref is not a J value-producing anchor"
+            )
+
+    _wire_unique_relation_rows(
+        rows("access_representation_bindings"),
+        path="pi.access_representation_bindings",
+        field="access_ref",
+        relations=ACCESS_REPRESENTATION_BINDING_RELATIONS,
+    )
+    for index, raw in enumerate(rows("access_representation_bindings")):
+        path = f"pi.access_representation_bindings[{index}]"
+        item = _record(raw, path=path, required=frozenset({"relation", "access_ref"}))
+        if item["access_ref"] not in accesses:
+            raise RealizationWitnessError(
+                f"{path}.access_ref is not a declared J boundary access"
+            )
+
+
 def _name(value: Any, path: str) -> str:
     if not isinstance(value, str) or not value:
         raise RealizationWitnessError(f"{path} must be a non-empty string")
@@ -180,12 +852,14 @@ def render_realization_witness_wire_grammar() -> str:
         "stays lexically inside its loop even when its operands are loop invariant, "
         "and a parent-region instance stays outside. This is certification input to "
         "a fixed Gate1 normalizer, not an instruction to Replay. A relation remains "
-        "hard unless the active profile has a sound unary matcher. program_axes binds "
-        "each distinct J-domain program "
-        "coordinate to one physical launch axis 0, 1, or 2. It is authored by "
-        "Lift from the compiler-visible Source realization and is unique by "
-        "domain_ref. Distinct logical consumer domains may share one physical axis; "
-        "they and repeated instances of the same d* reuse one compiled coordinate. "
+        "hard unless the active profile has a sound unary matcher. program_axes is "
+        "the direct domain-to-launch-axis form. program_bindings is the complete "
+        "relation form: every row carries its one physical launch axis 0, 1, or 2 "
+        "together with direct, product_linearized, or guarded_union logical axes. "
+        "The two forms are mutually exclusive, and a relation row is unique by its "
+        "physical axis while every named J domain stays on one physical axis. "
+        "Distinct logical consumer domains may share one physical axis through one "
+        "relation row; repeated instances of the same d* reuse that coordinate. "
         "An empty-slot route from a program-region d* realization into a branch "
         "region makes that region an inside-domain physical realization. The "
         "condition remains the J domain; pi carries no predicate, grid extent, "
@@ -292,8 +966,9 @@ def render_realization_mechanism_grammar() -> str:
         "path enters address_base before transfer; a domain/C dependency path "
         "entering address_lane is lane-varying instead. This base-versus-lane "
         "distinction is a Source-realization witness only. "
-        "Program-axis identity follows the closed pi.program_axes binding of the "
-        "J domain semantic_ref, not instance multiplicity: repeated "
+        "Program-axis identity follows the closed pi.program_axes direct mapping "
+        "or pi.program_bindings relation row for the J domain semantic_ref, not "
+        "instance multiplicity: repeated "
         "program-coordinate instances on one d* remain distinct stages of the "
         "same bound axis. Lift must not infer an axis from declaration order, "
         "grid extent, instance multiplicity, or C. "
@@ -1147,13 +1822,29 @@ class RealizationWitness:
 
         checked_program_bindings: list[dict[str, JsonValue]] = []
         used_program_axes: set[tuple[str, int | str]] = set()
+        used_physical_axes: set[int] = set()
+        physical_axis_by_domain: dict[str, int] = {}
         for index, raw in enumerate(self.program_bindings):
             path = f"pi.program_bindings[{index}]"
             item = _record(
                 raw,
                 path=path,
-                required=frozenset({"relation", "logical_axes"}),
+                required=frozenset({"axis", "relation", "logical_axes"}),
             )
+            physical_axis = item["axis"]
+            if (
+                isinstance(physical_axis, bool)
+                or not isinstance(physical_axis, int)
+                or not 0 <= physical_axis <= 2
+            ):
+                raise RealizationWitnessError(
+                    f"{path}.axis must be an integer launch axis in [0, 2]"
+                )
+            if physical_axis in used_physical_axes:
+                raise RealizationWitnessError(
+                    "pi program bindings must bind each physical launch axis once"
+                )
+            used_physical_axes.add(physical_axis)
             relation = _name(item["relation"], f"{path}.relation")
             if relation not in PROGRAM_BINDING_RELATIONS:
                 raise RealizationWitnessError(
@@ -1181,13 +1872,27 @@ class RealizationWitness:
                 raise RealizationWitnessError(
                     "pi program bindings must not claim one logical J axis twice"
                 )
+            for domain_ref, _axis_ref in keys:
+                previous_physical_axis = physical_axis_by_domain.setdefault(
+                    domain_ref, physical_axis
+                )
+                if previous_physical_axis != physical_axis:
+                    raise RealizationWitnessError(
+                        "pi program bindings must map one J domain to one physical "
+                        "launch axis"
+                    )
             used_program_axes.update(keys)
             checked_program_bindings.append(
-                {"relation": relation, "logical_axes": axes}
+                {
+                    "axis": physical_axis,
+                    "relation": relation,
+                    "logical_axes": axes,
+                }
             )
         if checked_program_axes and checked_program_bindings:
             raise RealizationWitnessError(
-                "legacy-hard program_axes and active program_bindings are mutually exclusive"
+                "pi.program_axes and pi.program_bindings are alternative complete "
+                "program-coordinate mappings and are mutually exclusive"
             )
 
         checked_iteration_bindings: list[dict[str, JsonValue]] = []
@@ -1484,6 +2189,7 @@ __all__ = [
     "ACCESS_REPRESENTATION_BINDING_RELATIONS",
     "RealizationWitness",
     "RealizationWitnessError",
+    "validate_normalization_bindings_against_j",
     "REALIZATION_MECHANISMS",
     "ITERATION_BASES",
     "PHYSICAL_ITERATION_DIRECTIONS",

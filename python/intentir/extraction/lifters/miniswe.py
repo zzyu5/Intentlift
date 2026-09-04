@@ -11,10 +11,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from intentir.extraction.providers.client import (
-    DEFAULT_RESPONSES_TIMEOUT_SECONDS,
-    XHIGH_RESPONSES_TIMEOUT_SECONDS,
-)
 from intentir.extraction.providers.provider import (
     ProviderConfig,
     get_provider,
@@ -28,19 +24,34 @@ from .scrc import (
     SCRCProvenance,
     SCRCReliftContext,
     SCRCReliftRecord,
+    SOURCE_AWARE_LIFT_TURN_TIMEOUT_SECONDS,
+    SOURCE_AWARE_LIFT_XHIGH_TURN_TIMEOUT_SECONDS,
+    _unbound_lift_artifact_payload,
+    _value_free_lift_candidate_payload,
     decode_scrc_lift_artifact,
     check_scrc_lift_candidate,
     prepare_scrc_lift,
+    resolve_source_aware_lift_timeout,
     scrc_candidate_check_context,
 )
-from .scrc_schema import scrc_lift_core_json_schema
+from .scrc_schema import scrc_lift_core_model_json_schema
 from .prompt import SCHEMA as INTENTIR_OPERATION_REFERENCE
 
 
 MINISWE_LIFT_BACKEND = "minisweagent.intentir-lift.v4"
 MINISWE_LIFT_KNOWLEDGE = "intentir.lift-knowledge.v70"
-MINISWE_LIFT_TURN_TIMEOUT_SECONDS = 300.0
-MINISWE_LIFT_XHIGH_TURN_TIMEOUT_SECONDS = 900.0
+# Lift does not own a framework wall-clock deadline.  The persistent owner
+# history is retained so the next bounded logical Lift can resume without
+# duplicating a transport retry.
+MINISWE_LIFT_TURN_TIMEOUT_SECONDS = SOURCE_AWARE_LIFT_TURN_TIMEOUT_SECONDS
+MINISWE_LIFT_XHIGH_TURN_TIMEOUT_SECONDS = (
+    SOURCE_AWARE_LIFT_XHIGH_TURN_TIMEOUT_SECONDS
+)
+# One logical Lift invocation still has a model-step budget.  The branch-level
+# runner owns the separate maximum of three logical Lift invocations; neither
+# budget is a wall-clock deadline.
+LIFT_MODEL_STEP_LIMIT = 3
+LIFT_INVOCATION_WALL_TIME_SECONDS: float | None = None
 MAX_RELIFT_CHECK_FEEDBACK_ITEMS = 20
 MAX_RELIFT_CHECK_FEEDBACK_CHARS = 2048
 MAX_FEEDBACK_FRONTIER_EXAMPLES = 6
@@ -53,10 +64,90 @@ _FEEDBACK_CATEGORY_PRIORITY = {
 }
 
 
+def _lift_invocation_limits(
+    worker_config: Mapping[str, Any] | None = None,
+) -> tuple[int, float | None]:
+    """Resolve one logical Lift invocation's step/time policy.
+
+    The YAML remains the normal configuration surface.  A zero or null wall
+    time means unbounded; only the model-step budget remains capped at three.
+    An explicit positive finite wall time is retained as an opt-in caller
+    override and is never silently narrowed.
+    """
+
+    try:
+        from minisweagent.run.intentir_lift import load_intentir_lift_config
+
+        raw_agent = load_intentir_lift_config().get("agent", {})
+    except ImportError:
+        # Keep the later MiniSWE import as the authoritative dependency check.
+        # A missing or malformed installed config must not silently turn into a
+        # different hard-coded runtime contract.
+        raw_agent = {}
+    agent = dict(raw_agent) if isinstance(raw_agent, Mapping) else {}
+    if isinstance(worker_config, Mapping):
+        overrides = worker_config.get("agent")
+        if isinstance(overrides, Mapping):
+            agent.update(overrides)
+
+    raw_steps = agent.get("step_limit", LIFT_MODEL_STEP_LIMIT)
+    if raw_steps == 0:
+        raw_steps = LIFT_MODEL_STEP_LIMIT
+    if type(raw_steps) is not int or raw_steps < 1:
+        raise ValueError("Lift agent step_limit must be a positive integer")
+
+    raw_wall = agent.get("wall_time_limit_seconds", LIFT_INVOCATION_WALL_TIME_SECONDS)
+    if raw_wall is None or raw_wall == 0:
+        resolved_wall = None
+    elif (
+        isinstance(raw_wall, bool)
+        or not isinstance(raw_wall, (int, float))
+        or not math.isfinite(float(raw_wall))
+        or raw_wall <= 0
+    ):
+        raise ValueError(
+            "Lift agent wall_time_limit_seconds must be null, zero, or a "
+            "finite positive number"
+        )
+    else:
+        resolved_wall = float(raw_wall)
+    return min(raw_steps, LIFT_MODEL_STEP_LIMIT), resolved_wall
+
+
+def _lift_turn_timeout(
+    effort: str,
+    requested: float | None = None,
+) -> float | None:
+    """Resolve one provider turn under the source-aware timeout contract."""
+
+    return resolve_source_aware_lift_timeout(effort, requested)
+
+
+def _safe_relift_candidate(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Return a bounded value-free draft, or no continuation on malformed data."""
+
+    if value is None or not isinstance(value, Mapping):
+        return None
+    try:
+        return _value_free_lift_candidate_payload(value)
+    except (TypeError, ValueError, RecursionError, json.JSONDecodeError):
+        return None
+
+
 def _bounded_feedback_items(value: Any, limit: int) -> list[Any]:
     if not isinstance(value, list):
         return []
     return [copy.deepcopy(item) for item in value[:limit]]
+
+
+def _is_provider_timeout(error: BaseException | None) -> bool:
+    if error is None:
+        return False
+    try:
+        import litellm
+    except ImportError:
+        return False
+    return isinstance(error, litellm.exceptions.Timeout)
 
 
 def _feedback_frontier(
@@ -153,6 +244,25 @@ def _feedback_frontier(
     for key in ("repair_progress", "candidate_check_feedback"):
         if key in closed:
             frontier[key] = copy.deepcopy(closed[key])
+    semantic_probe = closed.get("semantic_probe")
+    if isinstance(semantic_probe, Mapping):
+        frontier["semantic_probe"] = {
+            key: copy.deepcopy(semantic_probe[key])
+            for key in (
+                "protocol",
+                "status",
+                "frontend",
+                "case_id",
+                "seed",
+                "failed_leg",
+                "unsupported",
+                "diagnostic",
+            )
+            if key in semantic_probe
+        }
+        frontier["semantic_probe"]["full_feedback_path"] = (
+            "/input/feedback.json"
+        )
     if "unresolved_gate1" in closed:
         frontier["unresolved_gate1_query"] = (
             "python /input/tools/context_query.py feedback "
@@ -210,7 +320,11 @@ def _continued_lift_history(result: Any) -> list[dict[str, Any]]:
     history = list(messages)
     while history and history[-1].get("role") == "exit":
         history.pop()
-    if result.exit_status in {"Submitted", "InvalidSubmission"} and history:
+    if result.exit_status in {
+        "Submitted",
+        "SubmittedCheckpoint",
+        "InvalidSubmission",
+    } and history:
         # Submission is represented by a final tool call whose environment-side
         # success interrupted the old worker before a tool result was appended.
         # It cannot be replayed as an unmatched call in the continued Responses
@@ -366,11 +480,7 @@ def _last_candidate_check_feedback(
     return None
 
 
-def _input_files(
-    request: SCRCLiftRequest,
-    *,
-    source_ttir_observation: Mapping[str, Any] | None = None,
-) -> dict[str, str]:
+def _input_files(request: SCRCLiftRequest) -> dict[str, str]:
     packet = json.loads(request.user_input)
     anonymous_source = packet.get("anonymous_source")
     if not isinstance(anonymous_source, str) or not anonymous_source:
@@ -442,14 +552,15 @@ owner. Its conversation and persistent workspace survive across formal Gate1
 continuations for the same Source; Replay remains a separate fresh process.
 
 - `source.py`: alpha-renamed Source available only to Lift.
-- `harness_view.json`: trusted anonymous compiler/Harness view.
-- `source_ttir.json`: optional exact compilation of this same anonymous Source
-  under the frozen anonymous Harness specialization, plus the existing Gate1
-  observer fingerprint. It is source-aware navigation evidence only and never
-  proposes or constructs J/C/pi.
+- `harness_view.json`: value-free anonymous ABI, shape relations and typed
+  Layer-C declarations. It contains no runtime scalar/tensor valuation, C value,
+  launch/grid, schedule, target or compiler metadata.
+- Trusted Source compilation/TTIR is host-private and is neither mounted in this
+  workspace nor used as a J authorship/Lift-acceptance authority.
 - `feedback.json`: null on the first round, otherwise only the explicitly
-  allowed previous parser/TypeCheck/Gate1/Gate2 feedback, previous candidate, or the
-  last worker's bounded source-free CandidateCheck diagnostic summary.
+  allowed previous parser/TypeCheck/public Source-vs-J/Gate1/Gate2 feedback,
+  previous candidate, or the last worker's bounded source-free CandidateCheck
+  diagnostic summary.
 - `feedback_frontier.json`: deterministic bounded projection of the same closed
   feedback. Read this first; it orders already-labelled hard categories and
   omits bulk recursive witnesses without inferring a cause or repair. Query the
@@ -461,7 +572,8 @@ continuations for the same Source; Replay remains a separate fresh process.
 - `inspect_lift_context(view="feedback_category", query="CATEGORY")` (or the
   matching `context_query.py feedback-category CATEGORY`) returns just that
   exact bounded category, including local/effect-order witnesses when present.
-- `schema/artifact.schema.json`: closed static JSON envelope for `(J,C,pi)`.
+- `schema/artifact.schema.json`: compact machine-only closed JSON envelope for
+  `(J,C,pi)`; field prose remains in the focused contract/preflight references.
 - `knowledge/lift_contract.md`: semantic ownership and construction rules.
 - `knowledge/intent_ops.md`: global source-neutral IntentIR operation reference.
 - `knowledge/preflight.md`: short source-neutral handle/ownership checklist.
@@ -485,7 +597,8 @@ continuations for the same Source; Replay remains a separate fresh process.
   `intentir_lift_submit --committed`: direct structured delivery without a
   stdout marker. Direct submit is the normal fast path: it runs CandidateCheck
   on exact current bytes when needed and exits immediately on PASS; external
-  Decode/TypeCheck still rerun independently.
+  Decode/TypeCheck and the public Source-vs-J diagnostic still run independently
+  before Replay/Gate1.
 - `submit_candidate(candidate_text)`: preferred first-candidate tool. It writes
   the complete exact LLM-authored text and invokes the same preflight in one
   action; it does not construct, normalize, or select a field.
@@ -514,10 +627,9 @@ continuations for the same Source; Replay remains a separate fresh process.
   load/store/atomic call sites, and names that were lexically bound before a loop
   and written inside it. These remain navigation checklists, not inferred
   effects, carriers, or frontend tuple order.
-  When `source_ttir.json` is available, use `source-ttir`,
-  `source-ttir-find`, `source-ttir-outline`, `source-ttir-def-use`, and
-  `source-observer --path ...` to inspect exact compiler facts without loading
-  the complete TTIR/fingerprint. These commands never infer a J/C/pi field.
+  No Source-TTIR, compiler-observer, launch/grid, schedule, target, or physical
+  realization query exists in the Lift workspace because those facts cannot
+  author or reject J=A+B.
   Its `feedback --path`, `candidate --path`, and `candidate-find` commands are
   bounded read-only inspection over already-mounted data and the current draft.
   `bootstrap` copies an explicitly supplied previous artifact only when no
@@ -642,23 +754,35 @@ summarizes or interprets J/C/pi semantics during compaction.
     files = {
         "README.md": readme,
         "source.py": anonymous_source,
+        # These files are read through JSON-aware lookup tools.  Keep the
+        # mounted transport compact; the semantic values are unchanged and
+        # the focused query commands provide readable bounded projections.
         "harness_view.json": json.dumps(
-            harness_view, indent=2, sort_keys=True, ensure_ascii=False
+            harness_view,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
         + "\n",
         "feedback.json": json.dumps(
-            feedback_for_mount, indent=2, sort_keys=True, ensure_ascii=False
+            feedback_for_mount,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
         + "\n",
         "feedback_frontier.json": json.dumps(
-            feedback_frontier, indent=2, sort_keys=True, ensure_ascii=False
+            feedback_frontier,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
         + "\n",
         "schema/artifact.schema.json": json.dumps(
-            scrc_lift_core_json_schema(),
-            indent=2,
+            scrc_lift_core_model_json_schema(),
             sort_keys=True,
             ensure_ascii=False,
+            separators=(",", ":"),
         )
         + "\n",
         "knowledge/lift_contract.md": request.instructions,
@@ -669,17 +793,6 @@ summarizes or interprets J/C/pi semantics during compaction.
         "tools/schema_query.py": schema_query,
         "tools/context_query.py": context_query,
     }
-    if source_ttir_observation is not None:
-        files["source_ttir.json"] = (
-            json.dumps(
-                dict(source_ttir_observation),
-                indent=2,
-                sort_keys=True,
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n"
-        )
     return files
 
 
@@ -694,7 +807,7 @@ class MiniSWELiftAdapter:
     workflow: str = "single"
     worker_config: Mapping[str, Any] = field(default_factory=dict)
     model_timeout_seconds: float | None = None
-    session_wall_time_limit_seconds: float = 3600.0
+    session_wall_time_limit_seconds: float | None = None
     stop_requested: Callable[[], int | None] | None = field(
         default=None, repr=False
     )
@@ -791,7 +904,8 @@ class MiniSWELiftAdapter:
         if (
             not self._records
             or not isinstance(diagnostics, Mapping)
-            or diagnostics.get("failure_class") != "lift_response"
+            or diagnostics.get("failure_class")
+            not in {"lift_response", "candidate_check_rejected"}
         ):
             return None
         record = self._records[-1]
@@ -886,52 +1000,114 @@ class MiniSWELiftAdapter:
         kind = getattr(getattr(feedback, "kind", None), "value", None)
         diagnostics = getattr(feedback, "diagnostics", None)
         previous_artifact = getattr(feedback, "previous_artifact", None)
-        previous_candidate = (
-            self._latest_rejected_candidate(diagnostics)
-            if kind == "lift"
-            else None
-        )
+        previous_candidate = getattr(feedback, "previous_candidate", None)
+        if previous_candidate is not None:
+            previous_candidate = _safe_relift_candidate(previous_candidate)
+        if previous_candidate is None and kind == "lift":
+            previous_candidate = self._latest_rejected_candidate(diagnostics)
         if previous_candidate is None and kind == "lift":
             previous_candidate = self._latest_continuation_candidate(
                 diagnostics
             )
-        if previous_candidate is None and hasattr(previous_artifact, "to_json"):
-            previous_candidate = previous_artifact.to_json()
+        previous_artifact_payload = (
+            _unbound_lift_artifact_payload(previous_artifact.to_json())
+            if hasattr(previous_artifact, "to_json")
+            else None
+        )
+        # A persistent owner already has the exact current draft in its output
+        # directory.  Do not duplicate it in the next model packet.  A fresh
+        # owner keeps one value-free copy in the context so bootstrap/seed can
+        # restore the same authored bytes without constructing an artifact.
+        if self._session_workspace is not None and (
+            self._read_continuation_candidate(self._session_workspace) is not None
+        ):
+            previous_candidate = None
+            previous_artifact_payload = None
         return SCRCReliftContext(
-            max(1, len(self._records)),
+            len(self._records) + 1,
             kind,
             diagnostics if isinstance(diagnostics, Mapping) else {},
-            previous_candidate,
+            previous_artifact=previous_artifact_payload,
+            previous_candidate=previous_candidate,
+        )
+
+    @staticmethod
+    def _seed_previous_candidate(
+        workspace: Any,
+        context: SCRCReliftContext | None,
+    ) -> None:
+        """Copy one prior authored draft into a fresh owner workspace exactly."""
+
+        if context is None:
+            return
+        target = workspace.candidate_path
+        if target.exists():
+            return
+        payload = context.previous_candidate
+        if payload is None:
+            payload = context.previous_artifact
+        if payload is None:
+            return
+        if not isinstance(payload, Mapping):
+            raise TypeError("relift seed must be a JSON object")
+        target.write_text(
+            json.dumps(
+                dict(payload),
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
         )
 
     def _continued_worker_config(self) -> dict[str, Any]:
         config = copy.deepcopy(dict(self.worker_config))
-        if self.session_wall_time_limit_seconds <= 0:
-            raise ValueError("Lift owner session wall-time limit must be positive")
-        remaining_seconds = self.session_wall_time_limit_seconds - (
-            self._session_active_elapsed_ms / 1000.0
-        )
-        if remaining_seconds <= 0:
-            from intentir.verify.scrc_runner import CandidateLiftError
-
-            raise CandidateLiftError(
-                {
-                    "diagnostic": "branch-local Lift owner wall-time exhausted",
-                    "failure_class": "lift_owner_time_exhausted",
-                    "session_id": self._session_id,
-                    "active_elapsed_ms": self._session_active_elapsed_ms,
-                },
-                physical_calls=0,
-                terminal=True,
+        if self.session_wall_time_limit_seconds in (None, 0):
+            remaining_seconds = None
+        elif (
+            isinstance(self.session_wall_time_limit_seconds, bool)
+            or not isinstance(self.session_wall_time_limit_seconds, (int, float))
+            or not math.isfinite(float(self.session_wall_time_limit_seconds))
+            or self.session_wall_time_limit_seconds < 0
+        ):
+            raise ValueError(
+                "Lift owner session wall-time limit must be null, zero, or a "
+                "finite non-negative number"
             )
+        else:
+            remaining_seconds = self.session_wall_time_limit_seconds - (
+                self._session_active_elapsed_ms / 1000.0
+            )
+            if remaining_seconds <= 0:
+                from intentir.verify.scrc_runner import CandidateLiftError
+
+                raise CandidateLiftError(
+                    {
+                        "diagnostic": "branch-local Lift owner wall-time exhausted",
+                        "failure_class": "lift_owner_time_exhausted",
+                        "session_id": self._session_id,
+                        "active_elapsed_ms": self._session_active_elapsed_ms,
+                    },
+                    physical_calls=0,
+                    terminal=True,
+                )
+        step_limit, invocation_wall_time = _lift_invocation_limits(
+            self.worker_config
+        )
         agent = config.get("agent")
         agent_config = dict(agent) if isinstance(agent, Mapping) else {}
-        # Tool/model/check counts remain telemetry. The branch owner is bounded by
-        # cumulative active wall time and the outer formal Gate1 budget instead.
-        agent_config["step_limit"] = 0
-        agent_config["wall_time_limit_seconds"] = max(
-            1,
-            math.ceil(remaining_seconds),
+        # Keep the three-step work bound.  Wall time is zero when both the
+        # invocation and owner policies are intentionally unbounded.
+        agent_config["step_limit"] = step_limit
+        wall_limits = [
+            value
+            for value in (remaining_seconds, invocation_wall_time)
+            if value is not None
+        ]
+        agent_config["wall_time_limit_seconds"] = (
+            max(1, math.ceil(min(wall_limits))) if wall_limits else 0
         )
         config["agent"] = agent_config
         return config
@@ -1073,24 +1249,27 @@ class MiniSWELiftAdapter:
             raise ValueError("one Lift owner session cannot cross Source programs")
         provider = self.provider or get_provider()
         effective_effort = self.effort or provider.reasoning_effort
-        timeout = self.model_timeout_seconds
-        if timeout is None:
-            provider_timeout = (
-                XHIGH_RESPONSES_TIMEOUT_SECONDS
-                if effective_effort.casefold() == "xhigh"
-                else DEFAULT_RESPONSES_TIMEOUT_SECONDS
-            )
-            turn_timeout = (
-                MINISWE_LIFT_XHIGH_TURN_TIMEOUT_SECONDS
-                if effective_effort.casefold() == "xhigh"
-                else MINISWE_LIFT_TURN_TIMEOUT_SECONDS
-            )
-            timeout = min(provider_timeout, turn_timeout)
+        timeout = _lift_turn_timeout(
+            effective_effort,
+            self.model_timeout_seconds,
+        )
+        relift_context = self._relift_context(feedback)
         prepared = prepare_scrc_lift(
             source,
             compiler_view=self.compiler_view,
-            relift_context=self._relift_context(feedback),
-            source_symbol=self.source_symbol,
+            relift_context=relift_context,
+            source_symbol=(
+                getattr(source_program, "lift_source_symbol", None)
+                or self.source_symbol
+            ),
+            source_kind=getattr(source_program, "lift_source_kind", "python"),
+            source_parameter_order=tuple(
+                getattr(source_program, "lift_parameter_order", ())
+            ),
+            source_to_opaque=(
+                dict(getattr(source_program, "lift_source_to_opaque", ()))
+                or None
+            ),
         )
         round_index = len(self._records) + 1
         fresh_owner_session = self._session_history is None
@@ -1099,7 +1278,8 @@ class MiniSWELiftAdapter:
             "wall_time_limit_seconds"
         )
         if (
-            isinstance(configured_owner_remaining, (int, float))
+            timeout is not None
+            and isinstance(configured_owner_remaining, (int, float))
             and not isinstance(configured_owner_remaining, bool)
             and configured_owner_remaining > 0
         ):
@@ -1149,6 +1329,10 @@ class MiniSWELiftAdapter:
                 evidence={"backend": MINISWE_LIFT_BACKEND},
             ) from exc
         workspace = self._session_workspace
+        if workspace is None:
+            raise RuntimeError("persistent MiniSWE Lift workspace was not created")
+        if fresh_workspace:
+            self._seed_previous_candidate(workspace, relift_context)
         result = None
         try:
             model_identity = (
@@ -1179,8 +1363,8 @@ class MiniSWELiftAdapter:
                 getattr(model, "config", None), "model_kwargs", None
             )
             if isinstance(model_kwargs, dict):
-                # The branch owner survives formal relifts, while the request
-                # deadline monotonically follows its remaining wall-time budget.
+                # Keep the model config JSON-safe; the Responses model converts
+                # an explicit None at the final LiteLLM call boundary.
                 model_kwargs["timeout"] = timeout
             run_kwargs: dict[str, Any] = {
                 "model": model,
@@ -1217,6 +1401,9 @@ class MiniSWELiftAdapter:
             )
             continuation_candidate = self._read_continuation_candidate(
                 workspace
+            )
+            continuation_candidate = _safe_relift_candidate(
+                continuation_candidate
             )
             continuation_receipt = None
             if continuation_candidate is not None:
@@ -1255,6 +1442,61 @@ class MiniSWELiftAdapter:
                         "winner_branch_id": exc.cause.winner_branch_id,
                     },
                     physical_calls=result.physical_provider_calls,
+                    candidate_draft=continuation_candidate,
+                ) from exc
+            if _is_provider_timeout(exc.cause):
+                from intentir.verify.scrc_runner import CandidateLiftError
+
+                raise CandidateLiftError(
+                    {
+                        "diagnostic": diagnostic,
+                        "failure_class": "lift_provider_timeout",
+                        "retryable": True,
+                        "continuation": (
+                            "the persistent Lift owner history is retained; the "
+                            "next logical Lift may resume it"
+                        ),
+                    },
+                    physical_calls=result.physical_provider_calls,
+                    terminal=False,
+                    candidate_draft=continuation_candidate,
+                ) from exc
+            if result.exit_status in {
+                "LimitsExceeded",
+                "TimeExceeded",
+                "OrchestrationStall",
+                "RepeatedFormatError",
+            }:
+                from intentir.verify.scrc_runner import CandidateLiftError
+
+                rejected_diagnostics: dict[str, Any] = {
+                    "diagnostic": (
+                        "Lift owner reached its bounded invocation limit before "
+                        "delivering a complete candidate"
+                    ),
+                    "failure_class": "lift_worker_no_candidate",
+                    "termination_status": result.exit_status,
+                    "resource_limited": True,
+                    "retryable": True,
+                    "continuation": (
+                        "the persistent Lift owner workspace and conversation "
+                        "remain available to the next logical Lift invocation"
+                    ),
+                }
+                candidate_check_feedback = _last_candidate_check_feedback(evidence)
+                if candidate_check_feedback is not None:
+                    rejected_diagnostics["candidate_check_feedback"] = (
+                        candidate_check_feedback
+                    )
+                if continuation_receipt is not None:
+                    rejected_diagnostics["continuation_draft"] = dict(
+                        continuation_receipt
+                    )
+                raise CandidateLiftError(
+                    rejected_diagnostics,
+                    physical_calls=result.physical_provider_calls,
+                    terminal=False,
+                    candidate_draft=continuation_candidate,
                 ) from exc
             if (
                 exc.cause is not None
@@ -1289,6 +1531,7 @@ class MiniSWELiftAdapter:
                 rejected_diagnostics,
                 physical_calls=result.physical_provider_calls,
                 terminal=result.exit_status == "TimeExceeded",
+                candidate_draft=continuation_candidate,
             ) from exc
         except Exception as exc:
             self._records.append(
@@ -1330,7 +1573,7 @@ class MiniSWELiftAdapter:
         except Exception as exc:
             attempt = SCRCLiftAttempt(
                 model=provider.model,
-                diagnostic=f"{type(exc).__name__}: {exc}",
+                diagnostic="host-private BindSource rejected the accepted Lift draft",
                 response_text=result.candidate_text,
                 response_id=response_id,
                 response_model=response_model,
@@ -1359,9 +1602,14 @@ class MiniSWELiftAdapter:
             raise CandidateLiftError(
                 {
                     "diagnostic": attempt.diagnostic,
-                    "failure_class": "lift_response",
+                    "failure_class": "bind_source_rejected",
+                    "authority": (
+                        "host-private BindSource/Gate boundary; no Source "
+                        "realization diagnostic is returned to the Lift owner"
+                    ),
                 },
                 physical_calls=result.physical_provider_calls,
+                terminal=True,
             ) from exc
 
         provenance = SCRCProvenance(
@@ -1424,6 +1672,10 @@ class MiniSWELiftAdapter:
                 ),
                 "workflow": self.workflow,
                 "artifact_schema": artifact.wire_schema,
+                "layer_c_interface": extraction.layer_c_interface_payload,
+                "layer_c_interface_digest": (
+                    extraction.layer_c_interface_digest
+                ),
                 "decode_protocol": candidate_check_context.decode_protocol,
                 "typecheck_protocol": candidate_check_context.typecheck_protocol,
                 "candidate_check": worker_evidence["candidate_check"],

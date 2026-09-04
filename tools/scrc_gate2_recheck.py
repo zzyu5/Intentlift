@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Re-run current Gate1 and Gate2 over one exact artifact/Replay without a model."""
+"""Diagnose current Gate1/Gate2 capability for exact historical bytes."""
 
 from __future__ import annotations
 
@@ -229,6 +229,13 @@ def main(argv: list[str] | None = None) -> int:
         gate2_passed = False
         status_counts: dict[str, int] = {}
         if gate1.passed:
+            accepted = gate1.normal.generation
+            if accepted is None:
+                raise ValueError("closed Gate1 lacks its accepted Replay")
+            replay = KernelSource.from_replay(
+                accepted.code,
+                accepted.function_name,
+            )
             suite = build_workload_gate2_suite(prepared, artifact)
             result = Gate2Runner().run_suite(
                 prepared.request.source.gate_source,
@@ -239,7 +246,11 @@ def main(argv: list[str] | None = None) -> int:
             _write_json(recheck_dir / "gate2.json", gate2_payload)
             gate2_passed = bool(result.passed)
             status_counts = dict(result.status_counts)
-            status = "scrc_certified" if result.passed else "gate2_failed"
+            status = (
+                "capability_execution_pass"
+                if result.passed
+                else "gate2_failed"
+            )
         else:
             status = "gate1_no_closure"
         summary = {
@@ -252,7 +263,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         _write_json(recheck_dir / "recheck.json", summary)
         (recheck_dir / "SUMMARY.md").write_text(
-            "# Exact current Gate1/Gate2 capability recheck\n\n"
+            "# Historical exact-byte current-contract capability diagnostic\n\n"
             f"- case: `{args.case}`\n"
             f"- status: `{status}`\n"
             "- model calls: `0`\n"
@@ -267,7 +278,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     _emit(summary, output=args.output, json_mode=args.json)
-    return 0 if summary["status"] == "scrc_certified" else 1
+    return 0 if summary["status"] == "capability_execution_pass" else 1
 
 
 if __name__ == "__main__":

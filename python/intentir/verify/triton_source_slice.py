@@ -40,7 +40,12 @@ def _decorator_name(node: ast.expr) -> str:
 
 
 def _is_jit_decorator(node: ast.expr) -> bool:
-    return _decorator_name(node) in {"triton.jit", "jit"}
+    # ``@triton.jit(...)`` is a decorator factory.  The source slice cannot
+    # prove which callable it returns without executing the frontend, so keep
+    # the accepted form to the direct decorator object only.
+    return not isinstance(node, ast.Call) and _decorator_name(node) in {
+        "triton.jit", "jit"
+    }
 
 
 def _is_schedule_decorator(node: ast.expr) -> bool:
@@ -136,6 +141,343 @@ def _statement_dependencies(statement: ast.stmt) -> set[str]:
     if isinstance(statement, ast.FunctionDef):
         return _function_dependencies(statement)
     return _load_names(statement) - _bound_names(statement) - set(dir(builtins))
+
+
+_DYNAMIC_REFLECTION_NAMES = frozenset(
+    {
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "__import__",
+        "locals",
+        "setattr",
+        "vars",
+    }
+)
+_DYNAMIC_REFLECTION_ATTRIBUTES = frozenset(
+    {
+        "__bases__",
+        "__class__",
+        "__dict__",
+        "__getattr__",
+        "__getattribute__",
+        "__mro__",
+        "__subclasses__",
+        "__setattr__",
+        "__delattr__",
+    }
+)
+_STATIC_TRITON_LIBDEVICE_NAMES = frozenset({"pow", "rsqrt"})
+
+
+def _static_attribute_path(node: ast.AST) -> tuple[str, ...] | None:
+    if isinstance(node, ast.Name):
+        return (node.id,)
+    if isinstance(node, ast.Attribute):
+        prefix = _static_attribute_path(node.value)
+        return (*prefix, node.attr) if prefix is not None else None
+    return None
+
+
+def _direct_callable_names(statements: Iterable[ast.stmt]) -> set[str]:
+    """Return names whose call target is statically declared by the slice."""
+
+    names = set(dir(builtins)) - _DYNAMIC_REFLECTION_NAMES
+    for statement in statements:
+        # Imports in real Triton modules are often guarded by a version or
+        # device check and may therefore live inside ``if``/``try`` nodes.
+        # Walk the selected statements, but collect only declarations that
+        # introduce call targets.  In particular, do not treat arbitrary
+        # assignment targets as callable merely because they are closed names.
+        for node in ast.walk(statement):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(node.name)
+            elif isinstance(node, ast.Import):
+                names.update(
+                    alias.asname or alias.name.split(".")[0]
+                    for alias in node.names
+                )
+            elif isinstance(node, ast.ImportFrom):
+                names.update(alias.asname or alias.name for alias in node.names)
+    return names
+
+
+def _normalize_triton_compatibility_aliases(
+    statements: Iterable[ast.stmt],
+) -> tuple[tuple[ast.stmt, ...], tuple[str, ...]]:
+    """Resolve the known xFormers libdevice compatibility shim statically.
+
+    xFormers uses ``libdevice_find("rsqrt")`` (and, in older kernels,
+    ``libdevice_find("pow")``) so one source tree can run against several
+    Triton releases.  The resolver itself performs reflective module lookup;
+    retaining it in a fixed Source projection would make the projection depend
+    on the ambient Python installation.  Its first supported candidate is the
+    direct Triton libdevice module, so this exact literal form can be replaced
+    without changing the selected kernel operation.
+
+    Arbitrary resolver calls, non-literal names, and unknown libdevice names
+    remain for the normal fail-closed validator to reject.
+    """
+
+    original = tuple(statements)
+    resolver_names: set[str] = set()
+    resolver_imports: set[int] = set()
+    for index, statement in enumerate(original):
+        if not isinstance(statement, ast.ImportFrom):
+            continue
+        if statement.module != "xformers.triton.importing":
+            continue
+        for alias in statement.names:
+            if alias.name == "libdevice_find":
+                resolver_names.add(alias.asname or alias.name)
+                resolver_imports.add(index)
+    if not resolver_names:
+        return original, ()
+
+    normalized: list[ast.stmt] = []
+    labels: list[str] = []
+    for statement in original:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            target = statement.targets[0]
+            value = statement.value
+            if (
+                isinstance(target, ast.Name)
+                and isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in resolver_names
+                and len(value.args) == 1
+                and not value.keywords
+                and isinstance(value.args[0], ast.Constant)
+                and isinstance(value.args[0].value, str)
+                and value.args[0].value in _STATIC_TRITON_LIBDEVICE_NAMES
+            ):
+                libdevice_name = value.args[0].value
+                replacement = ast.ImportFrom(
+                    module="triton.language.extra.libdevice",
+                    names=[
+                        ast.alias(
+                            name=libdevice_name,
+                            asname=(
+                                target.id
+                                if target.id != libdevice_name
+                                else None
+                            ),
+                        )
+                    ],
+                    level=0,
+                )
+                ast.copy_location(replacement, statement)
+                normalized.append(replacement)
+                labels.append(
+                    "compat:xformers.triton.importing:"
+                    f"{target.id}->{libdevice_name}"
+                )
+                continue
+        normalized.append(statement)
+
+    remaining_resolver_loads = {
+        node.id
+        for statement in normalized
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Load)
+        and node.id in resolver_names
+    }
+    if not remaining_resolver_loads:
+        normalized = [
+            statement
+            for index, statement in enumerate(normalized)
+            if index not in resolver_imports
+        ]
+    return tuple(normalized), tuple(labels)
+
+
+class _StaticDependencySurfaceValidator(ast.NodeVisitor):
+    """Reject dependency edges that cannot be closed from the selected AST.
+
+    The validator deliberately accepts ordinary Triton attribute calls such as
+    ``tl.load`` and ``x.to``.  It rejects reflection, dynamic imports, callable
+    values obtained through a subscript/factory, and direct calls whose name is
+    not a top-level function/import or a builtin.  This keeps registry lookup,
+    function factories, and local callable aliases from silently pulling an
+    unselected sibling into the source projection.
+    """
+
+    def __init__(self, direct_callable_names: set[str]) -> None:
+        self.direct_callable_names = direct_callable_names
+
+    def _error(self, node: ast.AST, detail: str) -> None:
+        line = getattr(node, "lineno", "?")
+        raise TritonSourceSliceError(
+            f"selected-kernel dependency is not statically closed at line "
+            f"{line}: {detail}"
+        )
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._validate_decorators(node)
+        for field, value in ast.iter_fields(node):
+            if field == "decorator_list":
+                continue
+            if isinstance(value, ast.AST):
+                self.visit(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        self.visit(item)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._validate_decorators(node)
+        for field, value in ast.iter_fields(node):
+            if field == "decorator_list":
+                continue
+            if isinstance(value, ast.AST):
+                self.visit(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, ast.AST):
+                        self.visit(item)
+
+    def _validate_decorators(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            if _is_schedule_decorator(decorator) or _is_jit_decorator(decorator):
+                continue
+            self._error(
+                decorator,
+                "decorator must be a direct Triton JIT or known schedule decorator",
+            )
+
+    def _is_closed_call_target(self, node: ast.Call) -> bool:
+        """Return whether a call used as an attribute receiver is closed.
+
+        Triton commonly chains a value-producing intrinsic with a method, for
+        example ``tl.load(ptr).to(tl.float32)`` or
+        ``tl.zeros(shape).to(tl.float32)``.  The outer method call has an
+        ``ast.Call`` receiver, but that is not the same shape as an indirect
+        callable such as ``factory()(x)`` or ``registry()[name](x)``.  Keep
+        the distinction structural: the inner call must still target a
+        directly declared name or a static attribute path.
+        """
+
+        if isinstance(node.func, ast.Name):
+            return node.func.id in self.direct_callable_names
+        if not isinstance(node.func, ast.Attribute):
+            return False
+        if node.func.attr in _DYNAMIC_REFLECTION_ATTRIBUTES:
+            return False
+        return self._is_closed_value_expression(node.func.value)
+
+    def _is_closed_value_expression(self, node: ast.AST) -> bool:
+        """Prove that an expression can produce a value without an indirect call.
+
+        Triton values are routinely transformed before a method call, for
+        example ``(p * q).to(dtype)``, ``(offs + 1).to(tl.float32)``, and
+        ``x[mask, None].to(dtype)``.  Checking only Name/Attribute/Call
+        receivers rejects those real kernels.  This grammar follows value
+        expressions recursively while keeping callable targets stricter: a
+        Subscript or a factory can produce a value, but neither can become an
+        outer callable target.
+        """
+
+        if isinstance(node, (ast.Name, ast.Constant)):
+            return True
+        if isinstance(node, ast.Attribute):
+            if node.attr in _DYNAMIC_REFLECTION_ATTRIBUTES:
+                return False
+            return self._is_closed_value_expression(node.value)
+        if isinstance(node, ast.Call):
+            return self._is_closed_call_target(node)
+        if isinstance(node, ast.Subscript):
+            return self._is_closed_value_expression(node.value) and self._is_closed_value_expression(
+                node.slice
+            )
+        if isinstance(node, ast.Slice):
+            return all(
+                item is None or self._is_closed_value_expression(item)
+                for item in (node.lower, node.upper, node.step)
+            )
+        if isinstance(node, ast.Starred):
+            return self._is_closed_value_expression(node.value)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return all(self._is_closed_value_expression(item) for item in node.elts)
+        if isinstance(node, ast.Dict):
+            return all(
+                (key is None or self._is_closed_value_expression(key))
+                and self._is_closed_value_expression(value)
+                for key, value in zip(node.keys, node.values, strict=True)
+            )
+        if isinstance(node, ast.BinOp):
+            return self._is_closed_value_expression(node.left) and self._is_closed_value_expression(
+                node.right
+            )
+        if isinstance(node, ast.UnaryOp):
+            return self._is_closed_value_expression(node.operand)
+        if isinstance(node, ast.BoolOp):
+            return all(self._is_closed_value_expression(item) for item in node.values)
+        if isinstance(node, ast.Compare):
+            return self._is_closed_value_expression(node.left) and all(
+                self._is_closed_value_expression(item) for item in node.comparators
+            )
+        if isinstance(node, ast.IfExp):
+            return (
+                self._is_closed_value_expression(node.test)
+                and self._is_closed_value_expression(node.body)
+                and self._is_closed_value_expression(node.orelse)
+            )
+        return False
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            if alias.name == "importlib" or alias.name.startswith("importlib."):
+                self._error(node, "dynamic importlib dependency is forbidden")
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module == "importlib" or (node.module or "").startswith("importlib."):
+            self._error(node, "dynamic importlib dependency is forbidden")
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if node.attr in _DYNAMIC_REFLECTION_ATTRIBUTES:
+            self._error(node, f"reflective attribute {node.attr!r} is forbidden")
+        self.generic_visit(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        path = _static_attribute_path(node.func)
+        if path is not None and (
+            path[-1] in _DYNAMIC_REFLECTION_NAMES
+            or path[:1] == ("importlib",)
+        ):
+            self._error(node, f"dynamic callable {'.'.join(path)!r} is forbidden")
+        if isinstance(node.func, ast.Name):
+            if node.func.id not in self.direct_callable_names:
+                self._error(
+                    node,
+                    f"callable name {node.func.id!r} is not a selected function, "
+                    "import, or builtin",
+                )
+        elif isinstance(node.func, ast.Attribute):
+            if node.func.attr in _DYNAMIC_REFLECTION_ATTRIBUTES:
+                self._error(node, f"reflective callable attribute {node.func.attr!r} is forbidden")
+            receiver = node.func.value
+            if not self._is_closed_value_expression(receiver):
+                self._error(
+                    node,
+                    "attribute call has a dynamic receiver; callable factories and "
+                    "registry lookups are forbidden",
+                )
+        else:
+            self._error(
+                node,
+                "call target is not a statically named function or attribute; "
+                "indirect callable/registry dependency is forbidden",
+            )
+        self.generic_visit(node)
+
+
+def _validate_static_dependency_surface(statements: Iterable[ast.stmt]) -> None:
+    selected = tuple(statements)
+    validator = _StaticDependencySurfaceValidator(_direct_callable_names(selected))
+    for statement in selected:
+        validator.visit(statement)
 
 
 @dataclass(frozen=True)
@@ -258,13 +600,17 @@ def build_triton_source_slice(
             + ", ".join(unresolved_calls)
         )
 
+    selected_statements = tuple(tree.body[index] for index in sorted(selected))
+    selected_statements, normalized_aliases = _normalize_triton_compatibility_aliases(
+        selected_statements
+    )
+    _validate_static_dependency_surface(selected_statements)
+
     projected_body: list[ast.stmt] = []
     removed: list[str] = []
     included_declarations: list[str] = []
     included_functions: list[str] = []
-    for index, statement in enumerate(tree.body):
-        if index not in selected:
-            continue
+    for statement in selected_statements:
         item = copy.deepcopy(statement)
         names = sorted(_bound_names(item))
         included_declarations.extend(names)
@@ -307,6 +653,7 @@ def build_triton_source_slice(
         tuple(dict.fromkeys(included_declarations)),
         tuple(included_functions),
         tuple(removed),
+        tuple(normalized_aliases),
     )
 
 
@@ -720,11 +1067,38 @@ def _module_source_path(
     module: str,
     search_roots: Iterable[str | Path],
 ) -> Path | None:
+    """Resolve one imported helper using the declared external layout.
+
+    The workload manifest names the upstream logical module.  The checked-in
+    external source archive is intentionally a source-only mirror and keeps a
+    few helpers in their repository-oriented directories, so a literal
+    ``module.replace('.', '/')`` lookup is insufficient.  Keep those layout
+    aliases explicit and small: this is source provenance, not a recursive
+    basename search.  A direct logical path wins; multiple aliases in one
+    root are rejected so an ambiguous helper can never be silently selected.
+    """
+
     relative = Path(*module.split(".")).with_suffix(".py")
+    aliases: tuple[Path, ...] = ()
+    if module.startswith("xformers.triton."):
+        # The external xFormers source mirror stores the import-support
+        # modules under ``support/triton`` while preserving their upstream
+        # logical import names.
+        tail = Path(*module.split(".")[2:]).with_suffix(".py")
+        aliases = (Path("xformers") / "support" / "triton" / tail,)
     for root in search_roots:
-        candidate = Path(root).expanduser().resolve() / relative
-        if candidate.is_file():
-            return candidate
+        root_path = Path(root).expanduser().resolve()
+        direct = root_path / relative
+        if direct.is_file():
+            return direct
+        candidates = [root_path / item for item in aliases if (root_path / item).is_file()]
+        if len(candidates) > 1:
+            raise TritonSourceSliceError(
+                f"external helper module {module!r} has ambiguous source layout: "
+                + ", ".join(str(item) for item in candidates)
+            )
+        if candidates:
+            return candidates[0]
     return None
 
 
@@ -865,6 +1239,9 @@ def _build_plain_helper_closure(
         pending.extend(
             _plain_helper_statement_dependencies(tree.body[owner])
         )
+    _validate_static_dependency_surface(
+        tree.body[target_index] for target_index in sorted(selected)
+    )
     return [
         copy.deepcopy(statement)
         for index, statement in enumerate(tree.body)
@@ -984,6 +1361,7 @@ def inline_imported_triton_helpers(
             continue
         seen_structures.add(structure)
         deduplicated.append(statement)
+    _validate_static_dependency_surface(deduplicated)
     projected = ast.Module(body=deduplicated, type_ignores=[])
     ast.fix_missing_locations(projected)
     code = ast.unparse(projected) + "\n"

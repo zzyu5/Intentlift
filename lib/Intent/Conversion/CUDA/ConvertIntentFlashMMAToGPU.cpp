@@ -377,8 +377,10 @@ struct FlashMMALowering {
              dense.getSplatValue<APInt>().isZero();
     };
     auto isOverwrite = [](ScatterOp op) {
-      return op && op.getAxis() == 2 && op.getMode() == "along_axis" &&
-             op.getReduce() == "none";
+      return op && !op->hasAttr("atomic") && !op->hasAttr("ordering") &&
+             !op->hasAttr("memory_scope") && !op->hasAttr("cas_retry") &&
+             op.getAxis() == 2 &&
+             op.getMode() == "along_axis" && op.getReduce() == "none";
     };
 
     LoopOp theLoop;
@@ -542,6 +544,10 @@ struct FlashMMALowering {
     ScatterOp scratchScatter;
     for (Operation &operation : lbody.without_terminator()) {
       if (auto candidate = dyn_cast<ScatterOp>(&operation)) {
+        if (candidate->hasAttr("atomic") || candidate->hasAttr("ordering") ||
+            candidate->hasAttr("memory_scope") ||
+            candidate->hasAttr("cas_retry"))
+          return failure();
         if (scratchScatter)
           return failure();
         scratchScatter = candidate;

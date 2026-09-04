@@ -1,13 +1,16 @@
 """Contract-preserving CUDA lowering-state/schedule search over immutable M0.
 
-Candidate legality is decided only by registered C++ whole-graph probes.  The
-optional C object influences enumeration order and nothing else.  Runtime
+Candidate legality is decided only by registered C++ whole-graph probes.
+Legacy Source-C priors influence enumeration order and nothing else.  A target
+Layer-C plugin is a separate object: it resolves one exact regenerated and
+re-admitted candidate by opaque key plus implementation digest.  Runtime
 measurements select among candidates that already passed structural admission
 and compiled to cubins; measurements are never used as a correctness oracle.
 """
 
 from __future__ import annotations
 
+import hashlib
 import math
 import statistics
 import time
@@ -33,7 +36,12 @@ from intentir.backend.contract_capabilities import (
     B_CAP_READONLY_INPUTS,
     derive_search_capabilities,
 )
-from intentir.backend.materialize import BackendSearchState, CPrior
+from intentir.backend.materialize import (
+    BackendSearchState,
+    CPrior,
+    MaterializedJ,
+    materialize_target_lowering,
+)
 from intentir.backend.ablation import ExperimentArm, SearchAxes
 from intentir.backend.search_and_close import (
     BackendClosureError,
@@ -43,9 +51,47 @@ from intentir.backend.search_and_close import (
     ObservationClass,
     SearchAndCloseController,
 )
+from intentir.frontend.canonical_j import (
+    LOGICAL_FULL_AXIS_STEP_MATERIALIZATION,
+    STRUCTURED_SCAN_LOOP_MATERIALIZATION,
+)
+from intentir.ir.layer_c import (
+    ImplementationChoice,
+    LayerCBinding,
+    LayerCExtensionPoint,
+    LayerCInterface,
+    TargetIdentity,
+    TargetLayerCPlugin,
+    TargetLowering,
+    TargetPipeline,
+    TargetRealizationContract,
+    TargetSplit,
+    binding_interface_digest,
+    canonical_layer_c_json,
+    layer_c_content_digest,
+    validate_layer_c_attachments,
+)
+from intentir.backend.protocol import (
+    TargetBindingContext,
+    TargetExtensionMapping,
+    TargetPluginArtifact,
+    bind_target,
+    deserialize_target_plugin,
+    project_source_c_to_target,
+    serialize_target_plugin,
+    validate_target_plugin,
+)
+from intentir.ir.model import walk_intent_op_paths
+from intentir.verify.gate1.model import RefinementKind, SemanticArchive
 
 from .program import analyze_j_for_cuda
-from .selection import DEFAULT_PASSES, LoweringTarget, select_variant
+from .selection import (
+    DEFAULT_PASSES,
+    RAGGED_FAST_PATH_ID,
+    LoweringTarget,
+    read_intent_module,
+    select_variant,
+)
 
 
 SEARCH_PROTOCOL = "intentir.backend.cuda.measured-search.v5"
@@ -70,6 +116,7 @@ ROWMASK_ZERO_FILL_FAST_PATH_ID = "cuda.elementwise.rowmask.zero-fill.v1"
 SEARCH_PARTITION_UNPARTITIONED = "unpartitioned"
 SEARCH_PARTITION_SCHEDULE_SPINE = "schedule_spine"
 SEARCH_PARTITION_EXPANDED = "expanded"
+CUDA_LAYER_C_BACKEND_KIND = "cuda"
 
 
 Benchmark = Callable[[LoweredProgram, "CudaSearchCandidate"], float]
@@ -100,12 +147,16 @@ def _lowering_path_kind_for_fast_path(fast_path_id: str) -> str:
     return mapping.get(fast_path_id, fast_path_id)
 
 
-def derive_default_fast_path_id(state: BackendSearchState) -> str | None:
+def derive_default_fast_path_id(
+    state: BackendSearchState,
+    *,
+    intent_module: str | None = None,
+) -> str | None:
     """Resolve E1's first C++-admitted pass identity from J and target only."""
 
     derive_cuda_contract_view(state)
     selection = select_variant(
-        state.base_ir,
+        intent_module or state.base_ir,
         target=LoweringTarget(
             backend="cuda",
             chip=state.target.architecture,
@@ -115,10 +166,17 @@ def derive_default_fast_path_id(state: BackendSearchState) -> str | None:
     return selection.fast_path_id
 
 
-def derive_default_lowering_path_kind(state: BackendSearchState) -> str:
+def derive_default_lowering_path_kind(
+    state: BackendSearchState,
+    *,
+    intent_module: str | None = None,
+) -> str:
     """Resolve E1's admitted path label without compiling a target binary."""
 
-    fast_path_id = derive_default_fast_path_id(state)
+    fast_path_id = derive_default_fast_path_id(
+        state,
+        intent_module=intent_module,
+    )
     return (
         "generic"
         if fast_path_id is None
@@ -128,6 +186,8 @@ def derive_default_lowering_path_kind(state: BackendSearchState) -> str:
 
 def schedule_only_cuda_path_identity(
     state: BackendSearchState,
+    *,
+    intent_module: str | None = None,
 ) -> tuple[str, str | None]:
     """Choose the production canonical structure held fixed by CF/E2.
 
@@ -144,7 +204,10 @@ def schedule_only_cuda_path_identity(
     avoiding the generic materialized fallback is not a Full contribution.
     """
 
-    fast_path_id = derive_default_fast_path_id(state)
+    fast_path_id = derive_default_fast_path_id(
+        state,
+        intent_module=intent_module,
+    )
     if fast_path_id is None:
         return "generic", None
     # Tensor-core substitution changes the contraction implementation.  The
@@ -152,7 +215,7 @@ def schedule_only_cuda_path_identity(
     # tune that structure, while Full additionally opens MMA/Split-K states.
     if fast_path_id.startswith("cuda.linear.") or ".mma" in fast_path_id:
         selection = select_variant(
-            state.base_ir,
+            intent_module or state.base_ir,
             target=LoweringTarget(
                 backend="cuda",
                 chip=state.target.architecture,
@@ -209,6 +272,8 @@ def derive_cuda_contract_view(state: BackendSearchState) -> CudaContractView:
 
     if not isinstance(state, BackendSearchState):
         raise TypeError("CUDA ContractView requires BackendSearchState")
+    if state.target.family != "cuda":
+        raise CudaContractError("CUDA search requires a cuda BackendTarget")
     analysis = analyze_j_for_cuda(
         state.base.j,
         materialization=state.base,
@@ -247,7 +312,10 @@ class CudaSearchCandidate:
 
     @property
     def generic(self) -> bool:
-        return self.compiler_pipeline == "generic_materialized"
+        return self.compiler_pipeline in {
+            "generic_materialized",
+            RAGGED_FAST_PATH_ID,
+        }
 
     @property
     def upstream_fused(self) -> bool:
@@ -335,6 +403,30 @@ class CudaSearchCandidate:
             observation_class=observation_class,
             compiler_record=program.to_record(),
         )
+
+
+def _generic_cuda_candidate(*, ragged: bool = False) -> CudaSearchCandidate:
+    if ragged:
+        return CudaSearchCandidate(
+            _candidate_id("generic", None, RAGGED_FAST_PATH_ID),
+            "generic",
+            None,
+            None,
+            {},
+            0.0,
+            requested_trace=(RAGGED_FAST_PATH_ID,),
+            compiler_pipeline=RAGGED_FAST_PATH_ID,
+        )
+    return CudaSearchCandidate(
+        _candidate_id("generic", None, None),
+        "generic",
+        None,
+        None,
+        {},
+        0.0,
+        requested_trace=("cuda.generic.intent_to_linalg.v1",),
+        compiler_pipeline="generic_materialized",
+    )
 
 
 @dataclass(frozen=True)
@@ -865,7 +957,781 @@ def _candidate_id(
     return f"{lowering_path_kind}:{compiler_path}:{options}"
 
 
-def canonical_cuda_candidate(state: BackendSearchState) -> CudaSearchCandidate:
+def _cuda_candidate_registry_coordinates(
+    candidate: CudaSearchCandidate,
+) -> dict[str, Any]:
+    """Return closed registry coordinates without compiler command text."""
+
+    if not isinstance(candidate, CudaSearchCandidate):
+        raise TypeError("CUDA candidate coordinates require CudaSearchCandidate")
+    return {
+        "backend_kind": CUDA_LAYER_C_BACKEND_KIND,
+        "lowering_path_kind": candidate.lowering_path_kind,
+        "fast_path_id": candidate.fast_path_id,
+        "schedule": dict(candidate.schedule),
+        "b_transformations": list(candidate.b_transformations),
+        "required_b_capabilities": list(candidate.required_b_capabilities),
+        "requested_trace": list(candidate.requested_trace),
+        "requested_observation_class": (
+            candidate.requested_observation_class.value
+        ),
+        "compiler_pipeline": candidate.compiler_pipeline,
+    }
+
+
+def cuda_candidate_key(candidate: CudaSearchCandidate) -> str:
+    """Return an opaque key over safe, regenerated registry coordinates.
+
+    Candidate ids and pass arguments may contain compiler command text, so
+    neither is transported in target Layer C.  Search scores and partition
+    labels are likewise excluded because they do not identify an executable
+    implementation.
+    """
+
+    payload = canonical_layer_c_json(
+        _cuda_candidate_registry_coordinates(candidate)
+    )
+    return "cuda.candidate." + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def cuda_candidate_digest(candidate: CudaSearchCandidate) -> str:
+    """Digest complete trusted compile content for stale-plugin detection.
+
+    The internal pass argument is covered by this one-way digest, but is never
+    placed in the plugin or accepted back as caller-authored compiler input.
+    """
+
+    payload = _cuda_candidate_registry_coordinates(candidate)
+    payload["internal_pass_argument"] = candidate.pass_argument
+    return layer_c_content_digest(payload)
+
+
+def _cuda_loop_attachment(
+    j: SemanticArchive,
+) -> tuple[str, int | str | None] | None:
+    if not isinstance(j, SemanticArchive):
+        raise TypeError("CUDA Layer-C interface requires SemanticArchive")
+    node_by_path = {path: node_id for node_id, path in j.node_ids.items()}
+    loops: list[tuple[str, Any]] = []
+    for index, operation in enumerate(j.intent.body):
+        if operation.op != "loop":
+            continue
+        node_id = operation.node_id or node_by_path.get(f"body[{index}]")
+        if node_id is None:
+            raise CudaContractError(
+                "CUDA structured loop lacks a stable J node attachment"
+            )
+        loops.append((node_id, operation))
+    if not loops:
+        return None
+    if len(loops) != 1:
+        raise CudaContractError(
+            "CUDA Layer-C currently requires at most one top-level loop"
+        )
+    node_id, loop = loops[0]
+    if loop.trip is None:
+        raise CudaContractError("CUDA structured loop lacks a trip axis")
+    # A dynamic value trip is controlled by a runtime tensor, not by a
+    # semantic J dimension.  It is therefore a subject-only attachment: no
+    # target tile may be invented for it and the optional tile extension point
+    # must remain absent.
+    return node_id, loop.trip.axis
+
+
+def cuda_layer_c_interface(j: SemanticArchive) -> LayerCInterface:
+    """Declare the complete pre-materialization CUDA extension surface."""
+
+    attachment = _cuda_loop_attachment(j)
+    if attachment is None:
+        return LayerCInterface()
+    subject_ref, axis_ref = attachment
+    if axis_ref is None:
+        return LayerCInterface()
+    interface = LayerCInterface(
+        (
+            LayerCExtensionPoint(
+                slot="loop_schedule_tile",
+                role="loop_schedule_tile",
+                value_type="i64",
+                required=False,
+                subject_ref=subject_ref,
+                axis_ref=axis_ref,
+            ),
+        )
+    )
+    validate_layer_c_attachments(j, interface)
+    return interface
+
+
+def _cuda_plugin_bindings(
+    state: BackendSearchState,
+    candidate: CudaSearchCandidate,
+    *,
+    loop_schedule_tile: int | None = None,
+) -> tuple[LayerCBinding, ...]:
+    del candidate
+    if loop_schedule_tile is None:
+        return ()
+    interface = cuda_layer_c_interface(state.base.j)
+    if not interface.points:
+        raise CudaContractError(
+            "CUDA dynamic value loop has no semantic axis and cannot bind "
+            "loop_schedule_tile"
+        )
+    return (LayerCBinding("loop_schedule_tile", loop_schedule_tile),)
+
+
+def _cuda_target_realization_contract(
+    state: BackendSearchState,
+    candidate: CudaSearchCandidate,
+    choice: ImplementationChoice,
+    *,
+    loop_schedule_tile: int | None,
+) -> TargetRealizationContract:
+    """Project the admitted CUDA candidate into the shared typed grammar."""
+
+    attachment = _cuda_loop_attachment(state.base.j)
+    subject_ref, axis_ref = attachment if attachment is not None else (None, None)
+    requested_depth = next(
+        (
+            candidate.schedule[name]
+            for name in ("pipeline_depth", "pipeline_stages", "stage_count")
+            if name in candidate.schedule
+        ),
+        1,
+    )
+    depth = (
+        requested_depth
+        if isinstance(requested_depth, int) and not isinstance(requested_depth, bool)
+        and requested_depth > 0
+        else 1
+    )
+    pipeline = TargetPipeline(
+        stage=candidate.compiler_pipeline,
+        depth=depth,
+        # ``loop_schedule_tile`` is a split/tile factor.  It must never be
+        # reused as a pipeline-depth binding: the two values have different
+        # meanings and can legitimately differ for one candidate.
+        slot=None,
+        subject_ref=subject_ref,
+        axis_ref=axis_ref,
+    )
+    splits: tuple[TargetSplit, ...] = ()
+    if loop_schedule_tile is not None:
+        if subject_ref is None or axis_ref is None:
+            raise CudaContractError(
+                "CUDA target tile requires a J loop attachment"
+            )
+        splits = (
+            TargetSplit(
+                slot="loop_schedule_tile",
+                subject_ref=subject_ref,
+                axis_ref=axis_ref,
+                factor=loop_schedule_tile,
+            ),
+        )
+    return TargetRealizationContract(
+        pipeline=(pipeline,),
+        split=splits,
+        lowering=TargetLowering(
+            backend_kind=choice.backend_kind,
+            candidate_key=choice.candidate_key,
+            candidate_digest=choice.candidate_digest,
+        ),
+    )
+
+
+def _cuda_target_binding_context(
+    state: BackendSearchState,
+    contract_view: CudaContractView,
+    *,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+) -> TargetBindingContext:
+    target_interface = cuda_layer_c_interface(state.base.j)
+    return TargetBindingContext(
+        j=state.base.j,
+        target=state.target,
+        interface=target_interface,
+        capabilities=contract_view.capabilities,
+        allowed_authorizations=cuda_allowed_authorizations(state),
+        # C_target is not Source-C.  Only an explicit producer projection may
+        # populate shared E_C; an omitted value means that this context is
+        # binding a target-only plugin.
+        e_c=e_c,
+    )
+
+
+def cuda_allowed_authorizations(
+    state: BackendSearchState,
+) -> tuple[str, ...]:
+    """Return only J authorizations that a CUDA candidate can address.
+
+    This is intentionally narrower than ``J.boundary``.  Source-side index
+    widening, unrelated casts, and permissions for a backend operation that
+    CUDA does not currently register are not generic CUDA capabilities.  The
+    candidate-specific resolver below repeats the kind/subject/dtype checks
+    after it has resolved the opaque candidate key.
+    """
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("CUDA authorization derivation requires BackendSearchState")
+    nodes = _cuda_node_operations(state.base.j)
+    reduction_subjects = {
+        item.node_ref
+        for item in state.base.j.boundary.reductions
+        if item.node_ref in nodes and nodes[item.node_ref].op in {"reduce", "scan"}
+    }
+    contraction_subjects = {
+        node_ref
+        for node_ref, operation in nodes.items()
+        if operation.op == "contraction"
+    }
+    supported = {
+        item.auth_id
+        for item in state.base.j.boundary.realization_authorizations
+        if (
+            item.kind is RefinementKind.REASSOCIATION
+            and item.subject_ref in reduction_subjects
+        )
+        or (
+            item.kind is RefinementKind.ACCUMULATION_DTYPE
+            and item.subject_ref in contraction_subjects
+            and item.target_dtype is not None
+            and item.target_dtype.casefold() == "f32"
+        )
+    }
+    return tuple(sorted(supported))
+
+
+def _cuda_node_operations(
+    j: SemanticArchive,
+) -> dict[str, Any]:
+    """Resolve stable J node ids to their canonical Intent operations."""
+
+    by_path = dict(walk_intent_op_paths(j.intent.body))
+    return {
+        node_ref: by_path[path]
+        for node_ref, path in j.node_ids.items()
+        if path in by_path
+    }
+
+
+def _cuda_is_floating_dtype(dtype: Any) -> bool:
+    if not isinstance(dtype, str):
+        return False
+    normalized = dtype.removeprefix("torch.").casefold()
+    return normalized.startswith(("f", "bf", "float", "half"))
+
+
+def _cuda_reduction_candidate(candidate: CudaSearchCandidate) -> bool:
+    fast_path_id = candidate.fast_path_id or ""
+    return (
+        candidate.lowering_path_kind in {
+            "row_reduction",
+            "padded_row_reduction",
+            "row_scan",
+            "splitk_weighted_merge",
+        }
+        or fast_path_id.startswith("cuda.row_reduction.")
+        or fast_path_id.startswith("cuda.row_scan.")
+        or fast_path_id.startswith("cuda.splitk.")
+        or fast_path_id.startswith("cuda.loop_contraction.")
+    )
+
+
+def _cuda_contraction_candidate(candidate: CudaSearchCandidate) -> bool:
+    fast_path_id = candidate.fast_path_id or ""
+    return fast_path_id in {
+        DIRECT_CONTRACTION_FAST_PATH_ID,
+        MMA_CONTRACTION_FAST_PATH_ID,
+        TUNED_LINEAR_FAST_PATH_ID,
+        "cuda.contraction.mma-warp-specialized.v1",
+        "cuda.conv.implicit-gemm-mma.v1",
+    }
+
+
+def _cuda_matching_authorizations(
+    state: BackendSearchState,
+    *,
+    kind: RefinementKind,
+    subject_ref: str,
+    source_dtype: str | None = None,
+    target_dtype: str | None = None,
+) -> tuple[Any, ...]:
+    """Find exact J/B authorization matches for one target subject."""
+
+    matches = tuple(
+        item
+        for item in state.base.j.boundary.realization_authorizations
+        if item.kind is kind
+        and item.subject_ref == subject_ref
+        and (source_dtype is None or item.source_dtype == source_dtype)
+        and (target_dtype is None or item.target_dtype == target_dtype)
+        and (
+            kind is not RefinementKind.REASSOCIATION
+            or (item.source_dtype is None and item.target_dtype is None)
+        )
+    )
+    return matches
+
+
+def _cuda_required_authorizations(
+    state: BackendSearchState,
+    candidate: CudaSearchCandidate,
+) -> tuple[str, ...]:
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("CUDA authorization derivation requires BackendSearchState")
+    if not isinstance(candidate, CudaSearchCandidate):
+        raise TypeError("CUDA authorization derivation requires CudaSearchCandidate")
+
+    nodes = _cuda_node_operations(state.base.j)
+    refs: list[str] = []
+
+    # A target reduction topology may change floating accumulation order only
+    # when J already describes either a reassociable reduction or an explicit
+    # reassociation authorization for that exact reduction subject.  The
+    # ordinary ``assoc=float_nondeterministic`` contract is sufficient by
+    # itself; an explicit matching authorization is carried as an attachment,
+    # while an unrelated u* is never reused as a permission token.
+    if _cuda_reduction_candidate(candidate):
+        reductions = tuple(
+            item
+            for item in state.base.j.boundary.reductions
+            if item.node_ref in nodes and nodes[item.node_ref].op in {"reduce", "scan"}
+        )
+        if not reductions:
+            raise CudaContractError(
+                "CUDA reduction candidate has no J reduction/scan subject"
+            )
+        for reduction in reductions:
+            operation = nodes[reduction.node_ref]
+            dtype = (
+                operation.type.get("dtype")
+                if isinstance(operation.type, Mapping)
+                else None
+            )
+            assoc = operation.attrs.get("assoc")
+            if assoc in {"associative", "float_nondeterministic"}:
+                matches = _cuda_matching_authorizations(
+                    state,
+                    kind=RefinementKind.REASSOCIATION,
+                    subject_ref=reduction.node_ref,
+                )
+                if len(matches) > 1:
+                    raise CudaContractError(
+                        "CUDA reduction subject has duplicate reassociation "
+                        f"authorizations: {reduction.node_ref}"
+                    )
+                if matches:
+                    refs.append(matches[0].auth_id)
+                continue
+            matches = _cuda_matching_authorizations(
+                state,
+                kind=RefinementKind.REASSOCIATION,
+                subject_ref=reduction.node_ref,
+            )
+            if not matches:
+                raise CudaContractError(
+                    "CUDA reduction candidate lacks an exact reassociation "
+                    f"authorization for {reduction.node_ref}"
+                )
+            if len(matches) != 1:
+                raise CudaContractError(
+                    "CUDA reduction subject has duplicate reassociation "
+                    f"authorizations: {reduction.node_ref}"
+                )
+            if _cuda_is_floating_dtype(dtype) or assoc is None:
+                refs.append(matches[0].auth_id)
+
+    # Current CUDA contraction passes accumulate in f32.  That is already the
+    # canonical J result type for the admitted f16/bf16 contraction graph, so
+    # no authorization is needed in the normal case.  If a future admitted J
+    # exposes a different result dtype, only an exact typed accumulation
+    # authorization for the concrete contraction node may bridge it.
+    if _cuda_contraction_candidate(candidate):
+        contractions = tuple(
+            (node_ref, operation)
+            for node_ref, operation in nodes.items()
+            if operation.op == "contraction"
+        )
+        if not contractions:
+            raise CudaContractError(
+                "CUDA contraction candidate has no J contraction subject"
+            )
+        for node_ref, operation in contractions:
+            dtype = (
+                operation.type.get("dtype")
+                if isinstance(operation.type, Mapping)
+                else None
+            )
+            if dtype == "f32":
+                continue
+            matches = _cuda_matching_authorizations(
+                state,
+                kind=RefinementKind.ACCUMULATION_DTYPE,
+                subject_ref=node_ref,
+                source_dtype=dtype if isinstance(dtype, str) else None,
+                target_dtype="f32",
+            )
+            if len(matches) != 1:
+                raise CudaContractError(
+                    "CUDA contraction candidate requires exactly one typed "
+                    f"f32 accumulation authorization for {node_ref}"
+                )
+            refs.append(matches[0].auth_id)
+
+    # Observation-changing numeric states such as native PTX exp/tanh, FMA,
+    # reciprocal approximation, row-mask load skipping, and split-K topology
+    # are qualified by SearchAndClose Q/D.  They are not silently converted
+    # into arbitrary J permissions because the current closed authorization
+    # grammar has no matching subject/kind for those target-only changes.
+    return tuple(sorted(set(refs)))
+
+
+def cuda_plugin_loop_schedule_tile(
+    j: SemanticArchive,
+    target: Any,
+    plugin: TargetLayerCPlugin,
+) -> int | None:
+    """Validate pre-M0 plugin facts and resolve its optional scan tile only."""
+
+    if not isinstance(plugin, TargetLayerCPlugin):
+        raise TypeError("CUDA materialization requires TargetLayerCPlugin")
+    if plugin.target != TargetIdentity.from_target(target):
+        raise CudaContractError("CUDA plugin target does not match lowering target")
+    if plugin.j_digest != layer_c_content_digest(j.to_json()):
+        raise CudaContractError("CUDA plugin J digest is stale or mismatched")
+    expected_interface = cuda_layer_c_interface(j)
+    if plugin.interface != expected_interface:
+        raise CudaContractError(
+            "CUDA plugin interface differs from J extension points"
+        )
+    if plugin.interface_digest != binding_interface_digest(expected_interface):
+        raise CudaContractError("CUDA plugin interface digest is stale")
+    if plugin.choice.backend_kind != CUDA_LAYER_C_BACKEND_KIND:
+        raise CudaContractError("CUDA plugin has the wrong backend kind")
+    validate_layer_c_attachments(j, plugin.interface)
+    values = {item.slot: item.value for item in plugin.bindings}
+    tile = values.get("loop_schedule_tile")
+    if tile is None:
+        return None
+    if isinstance(tile, bool) or not isinstance(tile, int) or tile <= 0:
+        raise CudaContractError(
+            "CUDA loop_schedule_tile binding must be a positive integer"
+        )
+    return tile
+
+
+def _admitted_cuda_universe(
+    state: BackendSearchState,
+    *,
+    intent_module: str | None = None,
+) -> tuple[CudaSearchCandidate, ...]:
+    candidates = enumerate_cuda_candidates(
+        state,
+        enable_b_transformations=True,
+        intent_module=intent_module,
+    )
+    admitted, _records = admit_cuda_candidate_paths(
+        state,
+        candidates,
+        intent_module=intent_module,
+    )
+    return admitted
+
+
+def resolve_cuda_candidate_key(
+    state: BackendSearchState,
+    candidate_key: str,
+    candidate_digest: str,
+    *,
+    intent_module: str | None = None,
+) -> CudaSearchCandidate:
+    """Resolve one exact key+digest in the regenerated admitted universe."""
+
+    if not isinstance(candidate_key, str) or not candidate_key:
+        raise CudaContractError("CUDA Layer-C candidate key must be non-empty")
+    if not isinstance(candidate_digest, str) or not candidate_digest:
+        raise CudaContractError("CUDA Layer-C candidate digest must be non-empty")
+    matches = [
+        item
+        for item in _admitted_cuda_universe(
+            state,
+            intent_module=intent_module,
+        )
+        if cuda_candidate_key(item) == candidate_key
+        and cuda_candidate_digest(item) == candidate_digest
+    ]
+    if len(matches) != 1:
+        raise CudaContractError(
+            "CUDA Layer-C candidate key+digest is absent or ambiguous for this J/target"
+        )
+    return matches[0]
+
+
+def _target_materialization_for_tile(
+    base: MaterializedJ,
+    loop_schedule_tile: int | None,
+) -> MaterializedJ | None:
+    """Materialize a validated target tile without changing the search base."""
+
+    if loop_schedule_tile is None:
+        return None
+    try:
+        return materialize_target_lowering(
+            base,
+            loop_schedule_tile=loop_schedule_tile,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CudaContractError(
+            "CUDA target Layer-C tile cannot be materialized from neutral M0: "
+            f"{exc}"
+        ) from exc
+
+
+def build_cuda_target_plugin(
+    state: BackendSearchState,
+    candidate: CudaSearchCandidate,
+    *,
+    loop_schedule_tile: int | None = None,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+) -> TargetLayerCPlugin:
+    """Freeze one currently admitted CUDA candidate as target Layer C."""
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("CUDA plugin construction requires BackendSearchState")
+    if not isinstance(candidate, CudaSearchCandidate):
+        raise TypeError("CUDA plugin construction requires CudaSearchCandidate")
+    contract_view = derive_cuda_contract_view(state)
+    target_materialization = _target_materialization_for_tile(
+        state.base,
+        loop_schedule_tile,
+    )
+    intent_module = (
+        target_materialization.intent_mlir
+        if target_materialization is not None
+        else state.base_ir
+    )
+    matches = [
+        item
+        for item in _admitted_cuda_universe(
+            state,
+            intent_module=intent_module,
+        )
+        if cuda_candidate_key(item) == cuda_candidate_key(candidate)
+        and cuda_candidate_digest(item) == cuda_candidate_digest(candidate)
+    ]
+    if len(matches) != 1:
+        raise CudaContractError(
+            "CUDA candidate is absent or ambiguous in the rebuilt admitted universe"
+        )
+    candidate = matches[0]
+    required_capabilities = tuple(sorted(candidate.required_b_capabilities))
+    missing = sorted(set(required_capabilities) - set(contract_view.capabilities))
+    if missing:
+        raise CudaContractError(
+            "CUDA candidate lacks internally derived capabilities: "
+            + ", ".join(missing)
+        )
+    authorizations = _cuda_required_authorizations(state, candidate)
+    choice = ImplementationChoice(
+        backend_kind=CUDA_LAYER_C_BACKEND_KIND,
+        candidate_key=cuda_candidate_key(candidate),
+        candidate_digest=cuda_candidate_digest(candidate),
+        authorization_refs=authorizations,
+    )
+    target_contract = _cuda_target_realization_contract(
+        state,
+        candidate,
+        choice,
+        loop_schedule_tile=loop_schedule_tile,
+    )
+    return bind_target(
+        _cuda_target_binding_context(state, contract_view, e_c=e_c),
+        bindings=_cuda_plugin_bindings(
+            state,
+            candidate,
+            loop_schedule_tile=loop_schedule_tile,
+        ),
+        choice=choice,
+        required_capabilities=required_capabilities,
+        contract=target_contract,
+    )
+
+
+def build_cuda_target_artifact(
+    state: BackendSearchState,
+    candidate: CudaSearchCandidate,
+    *,
+    loop_schedule_tile: int | None = None,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+    e_c_mapping: Sequence[TargetExtensionMapping | Mapping[str, Any]] | None = None,
+    source_c: Any | None = None,
+) -> TargetPluginArtifact:
+    """Build the complete shared-E_C/CUDA target handoff.
+
+    The target plugin remains target-specific, while the artifact retains the
+    exact value-free shared interface used by the producer.  Identity mapping
+    is inferred only when both interfaces are byte-for-byte equivalent; a
+    differing non-empty shared interface must provide its explicit relation.
+    """
+
+    target_interface = cuda_layer_c_interface(state.base.j)
+    if source_c is not None:
+        projected_e_c, projected_mapping = project_source_c_to_target(
+            j=state.base.j,
+            source_c=source_c,
+            target_interface=target_interface,
+            e_c_mapping=e_c_mapping,
+        )
+        shared_e_c = (
+            projected_e_c
+            if e_c is None
+            else (
+                e_c
+                if isinstance(e_c, LayerCInterface)
+                else LayerCInterface.from_dict(e_c)
+            )
+        )
+        if shared_e_c != projected_e_c:
+            raise CudaContractError(
+                "explicit CUDA E_C is not the Source-C projection selected by "
+                "e_c_mapping"
+            )
+        if e_c_mapping is None:
+            e_c_mapping = projected_mapping
+    else:
+        # A target-only point belongs to ``C_target`` until a producer proves
+        # that it is shared with Source-C.  Defaulting this envelope to the
+        # target interface would silently promote every target declaration to
+        # shared ``E_C`` and would make the artifact lineage depend on which
+        # producer happened to omit ``source_c``.  An explicit ``e_c`` remains
+        # supported for callers that already crossed the Source-C projection.
+        shared_e_c = (
+            LayerCInterface()
+            if e_c is None
+            else (
+                e_c
+                if isinstance(e_c, LayerCInterface)
+                else LayerCInterface.from_dict(e_c)
+            )
+        )
+    validate_layer_c_attachments(state.base.j, shared_e_c)
+    plugin = build_cuda_target_plugin(
+        state,
+        candidate,
+        loop_schedule_tile=loop_schedule_tile,
+        e_c=shared_e_c,
+    )
+    if e_c_mapping is None:
+        if shared_e_c == plugin.interface:
+            e_c_mapping = tuple(
+                TargetExtensionMapping(item.slot, item.slot)
+                for item in shared_e_c.points
+            )
+        elif not shared_e_c.points:
+            e_c_mapping = ()
+        else:
+            raise CudaContractError(
+                "CUDA shared E_C and target interface differ; an explicit "
+                "e_c_mapping is required"
+            )
+    return TargetPluginArtifact(
+        e_c=shared_e_c,
+        plugin=plugin,
+        e_c_mapping=tuple(e_c_mapping),
+    )
+
+
+def resolve_cuda_target_plugin(
+    state: BackendSearchState,
+    plugin: TargetLayerCPlugin,
+) -> CudaSearchCandidate:
+    """Rebuild and re-admit J+target candidates, then resolve one exact plugin."""
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("CUDA plugin resolution requires BackendSearchState")
+    if not isinstance(plugin, TargetLayerCPlugin):
+        raise TypeError("CUDA lowering requires TargetLayerCPlugin")
+    contract_view = derive_cuda_contract_view(state)
+    context = _cuda_target_binding_context(state, contract_view)
+    plugin = deserialize_target_plugin(
+        context,
+        serialize_target_plugin(plugin),
+    )
+    if plugin.choice.backend_kind != CUDA_LAYER_C_BACKEND_KIND:
+        raise CudaContractError("CUDA plugin has the wrong backend kind")
+    loop_schedule_tile = cuda_plugin_loop_schedule_tile(
+        state.base.j,
+        state.target,
+        plugin,
+    )
+    target_materialization = _target_materialization_for_tile(
+        state.base,
+        loop_schedule_tile,
+    )
+    intent_module = (
+        target_materialization.intent_mlir
+        if target_materialization is not None
+        else state.base_ir
+    )
+    candidate = resolve_cuda_candidate_key(
+        state,
+        plugin.choice.candidate_key,
+        plugin.choice.candidate_digest,
+        intent_module=intent_module,
+    )
+    if plugin.bindings != _cuda_plugin_bindings(
+        state,
+        candidate,
+        loop_schedule_tile=loop_schedule_tile,
+    ):
+        raise CudaContractError(
+            "CUDA plugin bindings differ from the rebuilt candidate requirements"
+        )
+    required_capabilities = tuple(sorted(candidate.required_b_capabilities))
+    if plugin.required_capabilities != required_capabilities:
+        raise CudaContractError(
+            "CUDA plugin capabilities differ from the rebuilt candidate requirements"
+        )
+    expected_authorizations = _cuda_required_authorizations(state, candidate)
+    if plugin.choice.authorization_refs != expected_authorizations:
+        raise CudaContractError(
+            "CUDA plugin authorizations differ from the rebuilt candidate requirements"
+        )
+    expected_contract = _cuda_target_realization_contract(
+        state,
+        candidate,
+        plugin.choice,
+        loop_schedule_tile=loop_schedule_tile,
+    )
+    try:
+        validate_target_plugin(
+            context,
+            plugin,
+            expected_choice=ImplementationChoice(
+                backend_kind=CUDA_LAYER_C_BACKEND_KIND,
+                candidate_key=cuda_candidate_key(candidate),
+                candidate_digest=cuda_candidate_digest(candidate),
+                authorization_refs=expected_authorizations,
+            ),
+            expected_bindings=_cuda_plugin_bindings(
+                state,
+                candidate,
+                loop_schedule_tile=loop_schedule_tile,
+            ),
+            expected_contract=expected_contract,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CudaContractError(str(exc)) from exc
+    return candidate
+
+
+def canonical_cuda_candidate(
+    state: BackendSearchState,
+    *,
+    intent_module: str | None = None,
+) -> CudaSearchCandidate:
     """Return E1's deterministic J/target-selected compiler state.
 
     This performs the same registered C++ structural probes as production
@@ -874,17 +1740,15 @@ def canonical_cuda_candidate(state: BackendSearchState) -> CudaSearchCandidate:
     """
 
     derive_cuda_contract_view(state)
-    path_kind, fast_path_id = schedule_only_cuda_path_identity(state)
+    path_kind, fast_path_id = schedule_only_cuda_path_identity(
+        state,
+        intent_module=intent_module,
+    )
     if fast_path_id is None:
-        return CudaSearchCandidate(
-            _candidate_id("generic", None, None),
-            "generic",
-            None,
-            None,
-            {},
-            0.0,
-            requested_trace=("cuda.generic.intent_to_linalg.v1",),
-            compiler_pipeline="generic_materialized",
+        return _generic_cuda_candidate(
+            ragged=backend_compile._has_ragged_ops(
+                read_intent_module(intent_module or state.base_ir)
+            )
         )
     descriptor = next(
         (
@@ -1699,8 +2563,15 @@ def enumerate_cuda_candidates(
     axes: SearchAxes | None = None,
     fixed_lowering_path_kind: str | None = None,
     fixed_fast_path_id: str | None = None,
+    intent_module: str | None = None,
 ) -> tuple[CudaSearchCandidate, ...]:
-    """Enumerate concrete pass states only after complete B admission."""
+    """Enumerate concrete pass states only after complete B admission.
+
+    ``state.base`` is always neutral M0.  ``intent_module`` is an optional,
+    separately materialized target view used only for registered whole-graph
+    probes (for example a validated structured-scan tile); it never replaces
+    the J-derived facts used to construct the candidate universe.
+    """
 
     if not isinstance(state, BackendSearchState):
         raise TypeError("CUDA candidate enumeration requires BackendSearchState")
@@ -1719,6 +2590,19 @@ def enumerate_cuda_candidates(
     # return logic below excludes the generic materialized pipeline, which
     # would silently turn it back into a multi-path experiment.
     contract_view = derive_cuda_contract_view(state)
+    source = read_intent_module(intent_module or state.base_ir)
+    if backend_compile._has_ragged_ops(source):
+        if fixed_fast_path_id is not None:
+            raise CudaContractError(
+                "CUDA Ragged lowering is represented by the generic candidate; "
+                "the descriptor-aware pass is not a tunable fast-path choice"
+            )
+        if fixed_lowering_path_kind not in {None, "generic"}:
+            raise CudaContractError(
+                "CUDA Ragged lowering has no specialized lowering path kind; "
+                "use the generic descriptor-aware candidate"
+            )
+        return (_generic_cuda_candidate(ragged=True),)
     capabilities = set(contract_view.capabilities)
     runtime_names = set(state.base.runtime_input_names)
     referenced_inputs = _referenced_intent_inputs(state)
@@ -3305,16 +4189,7 @@ def enumerate_cuda_candidates(
             if rank < len(candidates):
                 specialized.append(candidates[rank])
         rank += 1
-    generic = CudaSearchCandidate(
-        _candidate_id("generic", None, None),
-        "generic",
-        None,
-        None,
-        {},
-        0.0,
-        requested_trace=("cuda.generic.intent_to_linalg.v1",),
-        compiler_pipeline="generic_materialized",
-    )
+    generic = _generic_cuda_candidate()
     if fixed_fast_path_id is not None:
         return tuple(specialized)
     if fixed_lowering_path_kind is not None:
@@ -3328,7 +4203,10 @@ def enumerate_cuda_candidates(
     # IntentIR expands the concrete state space, but its fixed budget must retain
     # the complete Schedule-Only prefix.  Build that prefix through this exact
     # enumerator with structural/numeric/local expansion disabled.
-    canonical_kind, canonical_fast_path_id = schedule_only_cuda_path_identity(state)
+    canonical_kind, canonical_fast_path_id = schedule_only_cuda_path_identity(
+        state,
+        intent_module=intent_module,
+    )
     schedule_axes = replace(
         axes,
         search_structural_states=False,
@@ -3346,6 +4224,7 @@ def enumerate_cuda_candidates(
             canonical_kind
         ),
         fixed_fast_path_id=canonical_fast_path_id,
+        intent_module=intent_module,
     )
     spine_ids = {item.candidate_id for item in schedule_spine}
     expanded_remainder = [
@@ -3511,8 +4390,15 @@ def enumerate_cuda_candidates(
 def admit_cuda_candidate_paths(
     state: BackendSearchState,
     candidates: tuple[CudaSearchCandidate, ...],
+    *,
+    intent_module: str | None = None,
 ) -> tuple[tuple[CudaSearchCandidate, ...], tuple[Mapping[str, Any], ...]]:
-    """Run source-blind structural probes before spending tuning budget."""
+    """Run source-blind structural probes before spending tuning budget.
+
+    The optional module is a target-lowering view derived from the same neutral
+    M0.  It is used only for the C++ probe; contract and candidate facts still
+    come from ``state``.
+    """
 
     grouped: dict[str, list[CudaSearchCandidate]] = {}
     generic_candidates: list[CudaSearchCandidate] = []
@@ -3528,18 +4414,67 @@ def admit_cuda_candidate_paths(
         chip=state.target.architecture,
         features=frozenset(state.target.features),
     )
+    source = read_intent_module(intent_module or state.base_ir)
+    has_ragged = backend_compile._has_ragged_ops(source)
     admitted_ids: set[str] = set()
     records: list[Mapping[str, Any]] = []
+    generic_admitted = False
     if generic_candidates:
-        records.append(
-            {
-                "path_id": "cuda.pipeline.linalg-materialized.v1",
-                "candidate_count": len(generic_candidates),
-                "status": "admitted_by_registered_generic_pipeline",
-                "admitted": True,
-                "probe": None,
-            }
-        )
+        if has_ragged:
+            try:
+                selection = select_variant(
+                    source,
+                    target=target,
+                    only_fast_path=RAGGED_FAST_PATH_ID,
+                )
+            except Exception as error:
+                records.append(
+                    {
+                        "path_id": RAGGED_FAST_PATH_ID,
+                        "candidate_count": len(generic_candidates),
+                        "status": "probe_failed",
+                        "admitted": False,
+                        "reason": f"{type(error).__name__}: {error}",
+                        "probe": {
+                            "fast_path_id": RAGGED_FAST_PATH_ID,
+                            "error": f"{type(error).__name__}: {error}",
+                        },
+                    }
+                )
+            else:
+                ragged_attempts = tuple(
+                    attempt
+                    for attempt in selection.attempts
+                    if attempt.fast_path_id == RAGGED_FAST_PATH_ID
+                )
+                if len(ragged_attempts) != 1:
+                    raise CudaContractError(
+                        "Ragged selection did not return exactly one "
+                        "descriptor-aware probe attempt"
+                    )
+                probe = ragged_attempts[0]
+                generic_admitted = probe.direct_hit
+                records.append(
+                    {
+                        "path_id": RAGGED_FAST_PATH_ID,
+                        "candidate_count": len(generic_candidates),
+                        "status": "admitted" if probe.direct_hit else probe.status,
+                        "admitted": probe.direct_hit,
+                        "reason": probe.reason,
+                        "probe": selection.to_dict(),
+                    }
+                )
+        else:
+            generic_admitted = True
+            records.append(
+                {
+                    "path_id": "cuda.pipeline.linalg-materialized.v1",
+                    "candidate_count": len(generic_candidates),
+                    "status": "admitted_by_registered_generic_pipeline",
+                    "admitted": True,
+                    "probe": None,
+                }
+            )
     for fast_path_id, path_candidates in grouped.items():
         if fast_path_id == LINALG_FUSED_FAST_PATH_ID:
             admitted_ids.add(fast_path_id)
@@ -3555,7 +4490,7 @@ def admit_cuda_candidate_paths(
             continue
         try:
             selection = select_variant(
-                state.base_ir,
+                source,
                 target=target,
                 only_fast_path=fast_path_id,
             )
@@ -3590,7 +4525,8 @@ def admit_cuda_candidate_paths(
     admitted_candidates = tuple(
         candidate
         for candidate in candidates
-        if candidate.generic or candidate.fast_path_id in admitted_ids
+        if (candidate.generic and generic_admitted)
+        or candidate.fast_path_id in admitted_ids
     )
     return admitted_candidates, tuple(records)
 
@@ -3598,6 +4534,8 @@ def admit_cuda_candidate_paths(
 def compile_cuda_candidate(
     state: BackendSearchState,
     candidate: CudaSearchCandidate,
+    *,
+    intent_module: str | None = None,
 ) -> LoweredProgram:
     """Compile one path-admitted request through its registered MLIR pipeline.
 
@@ -3611,9 +4549,18 @@ def compile_cuda_candidate(
         raise TypeError("CUDA candidate compilation requires BackendSearchState")
     if not isinstance(candidate, CudaSearchCandidate):
         raise TypeError("CUDA candidate compilation requires CudaSearchCandidate")
+    if state.target.family != "cuda":
+        raise CudaContractError("CUDA compiler requires a cuda BackendTarget")
+    source = intent_module or state.base_ir
+    target = LoweringTarget(
+        backend="cuda",
+        chip=state.target.architecture,
+        features=frozenset(state.target.features),
+    )
     if candidate.generic:
         return lower_to_cuda(
-            state.base_ir,
+            source,
+            target=target,
             allow_specialized=False,
         )
     if candidate.upstream_fused:
@@ -3622,8 +4569,9 @@ def compile_cuda_candidate(
             for item in str(candidate.schedule["tile_shape"]).split("x")
         )
         return lower_to_cuda_fused(
-            state.base_ir,
+            source,
             tile=tile,
+            target=target,
             # A reduction barrier can legitimately leave two or more fused
             # stages.  That compiler-emitted graph is the production canonical
             # CF/E2 structure; requiring one launch would silently exclude the
@@ -3633,11 +4581,51 @@ def compile_cuda_candidate(
     assert candidate.fast_path_id is not None
     assert candidate.pass_argument is not None
     return lower_to_cuda(
-        state.base_ir,
+        source,
+        target=target,
         only_fast_path=candidate.fast_path_id,
         pass_overrides={candidate.fast_path_id: candidate.pass_argument},
         require_specialized=True,
     )
+
+
+def compile_cuda_target_plugin(
+    state: BackendSearchState,
+    candidate: CudaSearchCandidate,
+) -> LoweredProgram:
+    """Compile one candidate through the target Layer-C production boundary.
+
+    Search may carry a legacy Source-C prior solely for ordering.  The actual
+    target compilation always rebuilds a neutral M0 state, constructs a closed
+    CUDA plugin from that state, and lets the public J-facing lowering validate
+    the plugin before dispatching to the registered compiler path.
+    """
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("CUDA target compilation requires BackendSearchState")
+    if not isinstance(candidate, CudaSearchCandidate):
+        raise TypeError("CUDA target compilation requires CudaSearchCandidate")
+    neutral_state = BackendSearchState(
+        base=state.base,
+        target=state.target,
+        priors=(),
+        ignored_slots=(),
+    )
+    artifact = build_cuda_target_artifact(neutral_state, candidate)
+    from intentir.backend.protocol import LoweringRequest
+    from .program import lower_j_to_cuda
+
+    lowering = lower_j_to_cuda(
+        LoweringRequest(
+            j=neutral_state.base.j,
+            target=neutral_state.target,
+            variant="generic" if candidate.generic else "specialized",
+            c=artifact,
+            constexpr_bindings=neutral_state.base.constexpr_bindings,
+        ),
+        neutral_state.base.concrete_extents_map,
+    )
+    return lowering.artifact
 
 
 def search_cuda(
@@ -3674,6 +4662,13 @@ def search_cuda(
         raise ValueError("formal backend closure requires SearchAndClose")
     started = time.perf_counter_ns()
     contract_view = derive_cuda_contract_view(state)
+    if not include_generic and backend_compile._has_ragged_ops(
+        read_intent_module(state.base_ir)
+    ):
+        raise CudaContractError(
+            "CUDA Ragged lowering requires the generic descriptor-aware "
+            "candidate; include_generic=False cannot close this graph"
+        )
     if (
         axes is not None
         and not axes.search_structural_states
@@ -3754,7 +4749,7 @@ def search_cuda(
             break
         compile_started = time.perf_counter_ns()
         try:
-            program = compile_cuda_candidate(state, candidate)
+            program = compile_cuda_target_plugin(state, candidate)
         except ValueError as error:
             budget_consumed += 1
             attempts.append(
@@ -4060,6 +5055,7 @@ __all__ = [
     "B_TRANSFORM_RANK0_HOST_CAPTURE",
     "B_TRANSFORM_UNIFORM_HOST_CAPTURE",
     "CONTRACT_VIEW_VERSION",
+    "CUDA_LAYER_C_BACKEND_KIND",
     "LINALG_FUSED_FAST_PATH_ID",
     "SEARCH_PROTOCOL",
     "CudaContractError",
@@ -4071,13 +5067,23 @@ __all__ = [
     "SEARCH_PARTITION_UNPARTITIONED",
     "SearchAttempt",
     "admit_cuda_candidate_paths",
+    "build_cuda_target_plugin",
+    "build_cuda_target_artifact",
     "canonical_cuda_candidate",
     "compile_cuda_candidate",
+    "compile_cuda_target_plugin",
+    "cuda_allowed_authorizations",
+    "cuda_candidate_digest",
+    "cuda_candidate_key",
+    "cuda_layer_c_interface",
+    "cuda_plugin_loop_schedule_tile",
     "enumerate_cuda_candidates",
     "derive_cuda_contract_view",
     "derive_default_fast_path_id",
     "derive_default_lowering_path_kind",
     "project_cuda_c_fixed_candidate",
+    "resolve_cuda_candidate_key",
+    "resolve_cuda_target_plugin",
     "schedule_only_cuda_path_identity",
     "search_cuda",
 ]

@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from collections import Counter
+import hashlib
 import json
 from pathlib import Path
 import re
+import time
 from typing import Any, Callable, Mapping
 
 import numpy as np
 
 from intentir.ir.canonical_j import canonicalize_gate1_artifact
+from intentir.ir.value_dimension import resolve_runtime_output_shapes
 from intentir.verify.candidate_fanout import CandidateFanoutSearchReport
 from intentir.verify.gate1.model import (
+    Frontend,
     Gate1Artifact,
     ImplementationConfig,
     ParameterKind,
@@ -21,15 +25,33 @@ from intentir.verify.gate1.model import (
     ScheduleSlotKind,
     SemanticArchive,
 )
+from intentir.extraction.providers.client import ProviderError
 from intentir.extraction.lifters.miniswe import MiniSWELiftAdapter
 from intentir.extraction.lifters.codex_cli import CodexCLILiftAdapter
-from intentir.extraction.lifters.scrc import ResponsesSCRCLiftAdapter
+from intentir.extraction.lifters.scrc import (
+    CONSISTENCY_ONLY_AUTHORING_PROFILE,
+    ResponsesSCRCLiftAdapter,
+)
 from intentir.extraction.providers.provider import ProviderConfig
 from intentir.verify.adapters import (
     BoundGate1Adapter,
+    NativeGate2ExecutionAdapter,
     TritonGate2ExecutionAdapter,
 )
+from intentir.verify.frontend_workloads import (
+    PreparedFrontendDatasetWorkload,
+    build_frontend_dataset_gate2_suite,
+)
+from intentir.verify.gate1.cuda_compiler import (
+    CudaCompileCase,
+    CudaCompiler,
+    CudaKernelSource,
+)
 from intentir.verify.gate1.compiler import TritonCompiler
+from intentir.verify.gate1.native_orchestrate import (
+    CudaGate1Runner,
+    TileLangGate1Runner,
+)
 from intentir.verify.gate1.orchestrate import (
     Gate1Config,
     Gate1ExecutionResult,
@@ -42,17 +64,29 @@ from intentir.verify.gate1.replay import (
     RecordedReplayWriter,
     ReplayAttempt,
     ReplayGeneration,
+    ReplayIngressResult,
     ResponsesReplayWriter,
 )
 from intentir.verify.gate1.codex_replay import CodexCLIReplayWriter
-from intentir.verify.gate2.model import Gate2Status, Gate2SuiteResult
+from intentir.verify.gate1.tilelang_compiler import (
+    TileLangCompileCase,
+    TileLangCompiler,
+    TileLangKernelSource,
+)
+from intentir.verify.gate2.model import (
+    Gate2Status,
+    Gate2SuiteResult,
+    program_identity_digests,
+)
 from intentir.verify.gate2.compare import compare_outputs
 from intentir.verify.gate2.orchestrate import (
     Gate2Case,
     Gate2Runner,
     Gate2Suite,
 )
+from intentir.verify.gate2.native import CudaRunner, TileLangRunner
 from intentir.verify.gate2.policy import DEFAULT_GATE2_POLICY
+from intentir.verify.gate2.inputs import materialize_ragged_input_values
 from intentir.verify.gate2.scalar import ScalarLoweringRunner, ScalarLoweringSpec
 from intentir.verify.gate2.triton import (
     ArgumentRole,
@@ -64,9 +98,11 @@ from intentir.verify.scrc_batch import BatchClassification
 from intentir.verify.scrc_runner import (
     CallBudget,
     CandidateAttemptReport,
+    CandidateLiftError,
     FeedbackKind,
     LiftFeedback,
     MainStatus,
+    MAX_LIFT_CALLS,
     SCRCGateRunner,
     SCRCGate1SearchReport,
     SCRCProgressCallback,
@@ -78,6 +114,8 @@ from intentir.verify.workload_adapters import (
     BufferBinding,
     BufferInitializer,
     BufferRole,
+    GeneratedTargetSourceManifest,
+    GeneratedSourceLifecycleRecord,
     NoneBinding,
     PreparedTritonWorkload,
 )
@@ -86,6 +124,7 @@ from intentir.verify.workload_adapters import (
 RecordedLiftAdapter = (
     ResponsesSCRCLiftAdapter | MiniSWELiftAdapter | CodexCLILiftAdapter
 )
+PreparedWorkload = PreparedTritonWorkload | PreparedFrontendDatasetWorkload
 GATE1_DIAGNOSTIC_RECHECK_PROTOCOL = (
     "intentir.scrc.gate1-diagnostic-recheck.v1"
 )
@@ -118,22 +157,53 @@ class RecordedReplayWriterGroup:
 RecordedReplayEvidenceWriter = RecordedReplayWriter | RecordedReplayWriterGroup
 
 
+@dataclass(frozen=True)
+class RecordedReplayRound:
+    """Normal and masked Replay evidence for one formal Gate1 round.
+
+    Native frontends require a writer independent from every normal candidate so
+    the masked-J arm cannot share provider/session state with normal Replay.  The
+    round wrapper is host-side bookkeeping only; it does not add a persisted
+    proof field or alter Gate1's public schema.
+    """
+
+    normal: RecordedReplayEvidenceWriter
+    masked: RecordedReplayWriter | None = None
+
+
+RecordedReplayRoundEvidence = RecordedReplayEvidenceWriter | RecordedReplayRound
+
+
 def _new_replay_writer(
     replay_backend: str,
     *,
     provider: ProviderConfig,
     effort: str | None,
+    frontend: Frontend | str = Frontend.TRITON,
+    compile_checker: Callable[[str, Gate1Artifact, str], Any] | None = None,
     stop_requested: Callable[[], int | None] | None = None,
 ) -> RecordedReplayWriter:
     """Create one writer for exactly one formal Gate1 round."""
 
+    selected_frontend = Frontend(frontend)
+
     if replay_backend == "responses":
-        return ResponsesReplayWriter(provider=provider, effort=effort)
+        return ResponsesReplayWriter(
+            provider=provider,
+            effort=effort,
+            frontend=selected_frontend,
+            compile_checker=compile_checker,
+        )
     writer_kwargs: dict[str, Any] = {
         "provider": provider,
         "effort": effort,
+        "frontend": selected_frontend,
     }
-    if replay_backend == "codex" and (effort or provider.reasoning_effort) == "xhigh":
+    if compile_checker is not None and replay_backend in {"miniswe", "codex"}:
+        writer_kwargs["compile_checker"] = compile_checker
+    if replay_backend == "codex" and (
+        effort or provider.reasoning_effort
+    ).casefold() in {"xhigh", "max"}:
         writer_kwargs["repair_effort"] = "high"
     if stop_requested is not None:
         writer_kwargs["stop_requested"] = stop_requested
@@ -142,6 +212,223 @@ def _new_replay_writer(
     if replay_backend == "codex":
         return CodexCLIReplayWriter(**writer_kwargs)
     raise ValueError(f"unknown Replay backend: {replay_backend!r}")
+
+
+def _prepared_frontend(prepared: PreparedWorkload) -> Frontend:
+    """Return the one frontend selected by the prepared request.
+
+    The request is the lifecycle dispatch boundary.  Checking the prepared
+    record as well keeps a stale/mixed Dataset projection from silently using a
+    compiler for a different source representation.
+    """
+
+    try:
+        frontend = Frontend(prepared.request.frontend)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"prepared workload has no active frontend: {prepared.request.frontend!r}"
+        ) from exc
+    entry_frontend = str(prepared.entry.frontend)
+    if entry_frontend != frontend.value:
+        raise ValueError(
+            "prepared workload request and entry frontends differ: "
+            f"{frontend.value!r} != {entry_frontend!r}"
+        )
+    if frontend is Frontend.TRITON and not isinstance(
+        prepared, PreparedTritonWorkload
+    ):
+        raise TypeError("Triton requests require a PreparedTritonWorkload")
+    if frontend in {Frontend.CUDA, Frontend.TILELANG} and not isinstance(
+        prepared, PreparedFrontendDatasetWorkload
+    ):
+        raise TypeError(
+            f"{frontend.value} requests require a PreparedFrontendDatasetWorkload"
+        )
+    if frontend is Frontend.CUTE:
+        raise ValueError(
+            "CuTe has direct Gate1 capability only; no registered Dataset "
+            "workload preparation or three-way Gate2 path"
+        )
+    return frontend
+
+
+def _native_replay_compile_checker(
+    frontend: Frontend,
+    compiler: CudaCompiler | TileLangCompiler,
+    case: CudaCompileCase | TileLangCompileCase,
+) -> Callable[[str, Gate1Artifact, str], ReplayIngressResult]:
+    """Build a compile-only checker for native Replay construction probes.
+
+    Replay agents receive only the pass/fail result through their host tool.  A
+    native compiler still needs the frozen Harness ABI/launch case, so that
+    binding is captured here and is never copied into the source-blind packet.
+    Formal Gate1 recompiles and observes the exact bytes independently.
+    """
+
+    if frontend not in {Frontend.CUDA, Frontend.TILELANG}:
+        raise ValueError("native Replay compile checker requires CUDA or TileLang")
+
+    def check(
+        code: str,
+        artifact: Gate1Artifact,
+        function_name: str,
+    ) -> ReplayIngressResult:
+        del artifact  # The ingress packet already validated the artifact binding.
+        try:
+            if frontend is Frontend.CUDA:
+                if not isinstance(compiler, CudaCompiler) or not isinstance(
+                    case, CudaCompileCase
+                ):
+                    raise TypeError("CUDA Replay checker received a mismatched case")
+                source = CudaKernelSource.from_replay(code, function_name)
+            else:
+                if not isinstance(compiler, TileLangCompiler) or not isinstance(
+                    case, TileLangCompileCase
+                ):
+                    raise TypeError(
+                        "TileLang Replay checker received a mismatched case"
+                    )
+                source = TileLangKernelSource.from_replay(code, function_name)
+            result = compiler.compile(source, case)
+        except Exception as exc:
+            return ReplayIngressResult(
+                "fail",
+                diagnostics=(
+                    {
+                        "rule_code": "native_replay_compile_unavailable",
+                        "path": "<native-frontend-compile>",
+                        "anonymous_handles": [],
+                        "line": None,
+                        "detail": f"{type(exc).__name__}: {str(exc)[:2048]}",
+                    },
+                ),
+            )
+        if not result.ok:
+            return ReplayIngressResult(
+                "fail",
+                diagnostics=(
+                    {
+                        "rule_code": "native_replay_compile_failed",
+                        "path": "<native-frontend-compile>",
+                        "anonymous_handles": [],
+                        "line": None,
+                        "detail": str(result.diagnostic)[:2048]
+                        or "native compiler rejected Replay",
+                    },
+                ),
+            )
+        return ReplayIngressResult(
+            "pass",
+            code=code,
+            entry_function_name=None,
+        )
+
+    return check
+
+
+def _validate_replay_writer_contract(
+    writer: Any,
+    *,
+    frontend: Frontend,
+) -> RecordedReplayWriter:
+    """Validate one writer at the shared Replay/frontend ingress boundary.
+
+    A custom factory is an extension point for provider/session ownership, not
+    a way to bypass the selected frontend's compiler.  Keeping this check here
+    makes every normal and masked writer obey the same source representation
+    and native compile-only preflight contract.
+    """
+
+    if not callable(getattr(writer, "generate", None)):
+        raise TypeError("Replay writer must expose a callable generate method")
+    if not hasattr(writer, "records"):
+        raise TypeError("Replay writer must expose records for lifecycle evidence")
+    try:
+        writer_frontend = Frontend(getattr(writer, "frontend"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise TypeError(
+            "Replay writer must declare the selected frontend explicitly"
+        ) from exc
+    if writer_frontend is not frontend:
+        raise ValueError(
+            "Replay writer frontend differs from the prepared workload: "
+            f"{writer_frontend.value!r} != {frontend.value!r}"
+        )
+    if frontend in {Frontend.CUDA, Frontend.TILELANG} and not callable(
+        getattr(writer, "compile_checker", None)
+    ):
+        raise TypeError(
+            f"{frontend.value} Replay writer must carry its native compile checker"
+        )
+    return writer
+
+
+def _workload_compiler(
+    frontend: Frontend,
+    prepared: PreparedWorkload,
+) -> tuple[Any, Any]:
+    """Create the compiler and exact Gate1 case for one prepared frontend."""
+
+    case = prepared.request.binding.gate1_case
+    if frontend is Frontend.TRITON:
+        return TritonCompiler(timeout=240.0), case
+    if frontend is Frontend.CUDA:
+        if not isinstance(prepared, PreparedFrontendDatasetWorkload) or not isinstance(
+            case, CudaCompileCase
+        ):
+            raise TypeError("CUDA workload does not carry a CudaCompileCase")
+        return CudaCompiler(timeout=240.0), case
+    if frontend is Frontend.TILELANG:
+        if not isinstance(prepared, PreparedFrontendDatasetWorkload) or not isinstance(
+            case, TileLangCompileCase
+        ):
+            raise TypeError("TileLang workload does not carry a TileLangCompileCase")
+        return TileLangCompiler(timeout=300.0), case
+    raise ValueError(f"no workload compiler is registered for {frontend.value!r}")
+
+
+def _build_gate1_adapter(
+    frontend: Frontend,
+    *,
+    compiler: Any,
+    writer: Any,
+    masked_writer: RecordedReplayWriter | None,
+    run_masked_j: bool,
+) -> BoundGate1Adapter:
+    """Bind one frontend-specific Gate1 runner to a fresh Replay writer set."""
+
+    config = Gate1Config(run_masked_j=run_masked_j)
+    if frontend is Frontend.TRITON:
+        if masked_writer is not None:
+            raise ValueError("Triton Gate1 owns masked Replay on its normal writer")
+        if not isinstance(compiler, TritonCompiler):
+            raise TypeError("Triton workload requires TritonCompiler")
+        return BoundGate1Adapter(
+            Gate1Runner(compiler=compiler, writer=writer, config=config)
+        )
+    if frontend is Frontend.CUDA:
+        if not isinstance(compiler, CudaCompiler):
+            raise TypeError("CUDA workload requires CudaCompiler")
+        return BoundGate1Adapter(
+            CudaGate1Runner(
+                compiler=compiler,
+                writer=writer,
+                masked_writer=masked_writer,
+                config=config,
+            )
+        )
+    if frontend is Frontend.TILELANG:
+        if not isinstance(compiler, TileLangCompiler):
+            raise TypeError("TileLang workload requires TileLangCompiler")
+        return BoundGate1Adapter(
+            TileLangGate1Runner(
+                compiler=compiler,
+                writer=writer,
+                masked_writer=masked_writer,
+                config=config,
+            )
+        )
+    raise ValueError(f"no Gate1 runner is registered for {frontend.value!r}")
 
 
 def _numpy_dtype(dtype: str) -> np.dtype[Any]:
@@ -154,6 +441,16 @@ def _numpy_dtype(dtype: str) -> np.dtype[Any]:
         "i16": "int16",
         "i32": "int32",
         "i64": "int64",
+        "index": "int64",
+        "u8": "uint8",
+        "u16": "uint16",
+        "u32": "uint32",
+        "uint8": "uint8",
+        "uint16": "uint16",
+        "uint32": "uint32",
+        "ui8": "uint8",
+        "ui16": "uint16",
+        "ui32": "uint32",
     }
     normalized = aliases.get(dtype.removeprefix("torch."), dtype)
     if normalized == "bf16":
@@ -190,7 +487,8 @@ def _input_value(
         physical = rng.integers(0, 2, size=physical_shape).astype(dtype)
         return _logical_buffer_value(physical, buffer)
     if dtype.kind in {"i", "u"}:
-        physical = rng.integers(-3, 4, size=physical_shape).astype(dtype)
+        low = 0 if dtype.kind == "u" else -3
+        physical = rng.integers(low, 4, size=physical_shape).astype(dtype)
         return _logical_buffer_value(physical, buffer)
     physical = rng.normal(0.0, 0.25, size=physical_shape).astype(dtype)
     return _logical_buffer_value(physical, buffer)
@@ -233,10 +531,19 @@ def _bind_shape(
     dimensions: dict[str, int],
     *,
     tensor: str,
+    dynamic_output: bool = False,
 ) -> None:
     if len(declared) != len(actual):
         raise ValueError(f"J rank for {tensor!r} differs from the Harness buffer")
     for expected, extent in zip(declared, actual, strict=True):
+        if expected == "?":
+            if not dynamic_output:
+                raise ValueError(
+                    f"J data-dependent extent for {tensor!r} requires an "
+                    "output-only binding; dynamic input/inout buffers are "
+                    "outside the current ABI"
+                )
+            continue
         if isinstance(expected, int):
             if expected != extent:
                 raise ValueError(
@@ -310,6 +617,7 @@ def _build_workload_execution_case(
     dimensions: dict[str, int] = {}
     input_bindings: dict[str, str] = {}
     output_bindings: dict[str, str] = {}
+    observed_output_shapes: dict[str, tuple[int, ...]] = {}
     arguments: list[TritonArgument] = []
 
     for parameter in j.signature.parameters:
@@ -401,6 +709,7 @@ def _build_workload_execution_case(
             buffer.shape,
             dimensions,
             tensor=logical_ref,
+            dynamic_output=buffer.role is BufferRole.OUTPUT,
         )
         if buffer.role is BufferRole.INPUT:
             if logical_ref not in j_inputs or parameter.mode is ParameterMode.OUTPUT:
@@ -425,6 +734,7 @@ def _build_workload_execution_case(
             key = buffer.output_key or f"output_{parameter.name}"
             if output_bindings.setdefault(logical_ref, key) != key:
                 raise ValueError("multiple Harness outputs bind one J tensor")
+            observed_output_shapes[logical_ref] = tuple(buffer.shape)
             arguments.append(
                 TritonArgument(
                     parameter.name,
@@ -443,6 +753,7 @@ def _build_workload_execution_case(
             values[input_key] = _input_value(rng, buffer)
             input_bindings[logical_ref] = input_key
             output_bindings[logical_ref] = output_key
+            observed_output_shapes[logical_ref] = tuple(buffer.shape)
             arguments.append(
                 TritonArgument(
                     parameter.name,
@@ -459,6 +770,34 @@ def _build_workload_execution_case(
         raise ValueError("Harness input bindings differ from accepted J inputs")
     if set(output_bindings) != set(j_outputs):
         raise ValueError("Harness output bindings differ from accepted J outputs")
+    values = materialize_ragged_input_values(
+        j,
+        values,
+        input_bindings,
+    )
+    runtime_inputs = [
+        np.asarray(values[input_bindings[item.name]])
+        for item in j.intent.inputs
+    ]
+    resolved_output_shapes = resolve_runtime_output_shapes(
+        j.intent,
+        [item.shape for item in j.intent.outputs],
+        runtime_inputs,
+        dims=dimensions,
+    )
+    for output, resolved_shape in zip(
+        j.intent.outputs, resolved_output_shapes, strict=True
+    ):
+        observed_shape = observed_output_shapes.get(output.name)
+        if observed_shape is None:
+            raise ValueError(
+                f"Harness did not provide a concrete output shape for {output.name!r}"
+            )
+        if observed_shape != resolved_shape:
+            raise ValueError(
+                f"Harness output shape for {output.name!r} differs from the "
+                f"J-derived runtime shape: {observed_shape} != {resolved_shape}"
+            )
     refeval = ScalarLoweringSpec.create(
         j,
         dims=dimensions,
@@ -475,10 +814,22 @@ def _build_workload_execution_case(
         if launch_name in schedule:
             raise ValueError("C slots collide at one Triton launch option")
         schedule[launch_name] = c.values[slot.name]
+    source_program_sha256, source_execution_program_sha256 = program_identity_digests(
+        prepared.request.source.gate_source,
+        frontend="triton",
+    )
+    execution_lineage = prepared.manifest.execution_lineage()
+    execution_lineage.update(
+        {
+            "source_program_sha256": source_program_sha256,
+            "source_execution_program_sha256": source_execution_program_sha256,
+        }
+    )
     execution = TritonExecutionSpec(
         tuple(arguments),
         adapter.grid,
         schedule,
+        metadata=execution_lineage,
     )
     output_keys = tuple(
         output_bindings[item.name] for item in j.intent.outputs
@@ -494,6 +845,8 @@ def _build_workload_execution_case(
             "test_mode": test_mode,
             "adapter_protocol": adapter.protocol,
             "input_profile": adapter.input_profile,
+            "frontend": "triton",
+            **execution_lineage,
         },
     )
     return case
@@ -510,6 +863,7 @@ def build_workload_jc_suite(
         raise TypeError("workload J must be a SemanticArchive")
     if not isinstance(c, ImplementationConfig):
         raise TypeError("workload C must be an ImplementationConfig")
+    prepared = prepared.with_contract(j, c)
     case = _build_workload_execution_case(
         prepared,
         j,
@@ -535,7 +889,7 @@ def build_workload_gate2_suite(
 
 
 def run_workload_lift_semantic_probe(
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     artifact: Gate1Artifact,
 ) -> dict[str, Any]:
     """Run a public, non-certifying Source-vs-J probe for the Lift owner.
@@ -546,13 +900,95 @@ def run_workload_lift_semantic_probe(
     or hidden input enters this diagnostic.
     """
 
-    if tuple(sorted(artifact.c.values.items())) != prepared.request.binding.c_values:
+    frontend = _prepared_frontend(prepared)
+    if artifact.c.ordered_value_items() != prepared.request.binding.c_values:
         return {
             "protocol": LIFT_SEMANTIC_PROBE_PROTOCOL,
             "status": "unavailable",
             "diagnostic": "candidate C values differ from the frozen Harness binding",
             "authority": "public diagnostic only; not CandidateCheck or certification",
         }
+
+    if frontend is not Frontend.TRITON:
+        try:
+            suite = build_frontend_dataset_gate2_suite(
+                prepared,  # type: ignore[arg-type]
+                artifact,
+                seed=LIFT_SEMANTIC_PROBE_SEED,
+                case_id="finite-public-lift-probe-1",
+                test_mode="finite_public_before_gate1",
+            )
+            case = suite.cases[0]
+
+            def clone_values() -> dict[str, Any]:
+                return {
+                    name: value.copy() if isinstance(value, np.ndarray) else value
+                    for name, value in case.values.items()
+                }
+
+            if frontend is Frontend.CUDA:
+                source_runner = CudaRunner()
+            else:
+                source_runner = TileLangRunner()
+            source = source_runner.run(
+                "source",
+                prepared.request.source.gate_source,
+                case.triton,
+                clone_values(),
+            )
+            reference = ScalarLoweringRunner().run(
+                case.refeval, clone_values()
+            )
+            if not source.ok or not reference.ok:
+                failed = source if not source.ok else reference
+                return {
+                    "protocol": LIFT_SEMANTIC_PROBE_PROTOCOL,
+                    "status": "unavailable",
+                    "frontend": frontend.value,
+                    "failed_leg": failed.leg,
+                    "unsupported": failed.unsupported,
+                    "diagnostic": failed.error,
+                    "authority": (
+                        "public diagnostic only; native execution infrastructure or "
+                        "unsupported reference does not reject or certify the candidate"
+                    ),
+                }
+            agreement = compare_outputs(
+                "source",
+                source.outputs,
+                "j",
+                reference.outputs,
+                j=case.j,
+                input_bindings=case.refeval.input_binding_map,
+                output_bindings=case.refeval.output_binding_map,
+                inputs=case.values,
+                policy=DEFAULT_GATE2_POLICY,
+            )
+            return {
+                "protocol": LIFT_SEMANTIC_PROBE_PROTOCOL,
+                "status": "pass" if agreement.passed else "diverged",
+                "frontend": frontend.value,
+                "case_id": case.case_id,
+                "seed": LIFT_SEMANTIC_PROBE_SEED,
+                "comparison": agreement.to_json(),
+                "authority": (
+                    "public native Source-vs-J diagnostic only; no artifact field is "
+                    "generated, repaired, accepted, or certified"
+                ),
+            }
+        except Exception as exc:
+            return {
+                "protocol": LIFT_SEMANTIC_PROBE_PROTOCOL,
+                "status": "unavailable",
+                "frontend": frontend.value,
+                "failed_leg": "native_source_or_j",
+                "diagnostic": f"{type(exc).__name__}: {exc}",
+                "authority": (
+                    "public diagnostic only; native probe failure does not reject "
+                    "or certify the candidate"
+                ),
+            }
+
     public_buffer_bytes = sum(
         int(np.prod(binding.shape, dtype=np.int64))
         * _numpy_dtype(binding.dtype).itemsize
@@ -649,6 +1085,262 @@ def run_workload_lift_semantic_probe(
         }
 
 
+def run_prepared_workload_consistency(
+    prepared: PreparedWorkload,
+    *,
+    provider: ProviderConfig,
+    effort: str | None = None,
+    max_lift_calls: int = MAX_LIFT_CALLS,
+) -> WorkloadConsistencyResult:
+    """Run only the real Source-to-J consistency path for one workload.
+
+    This is intentionally a diagnostic-only path for the current development
+    objective.  It retains the model-authored artifact boundary and the real
+    public Source-vs-J execution probe, while omitting source-blind Replay,
+    formal Gate1, masked-J, and hidden Gate2.  A rejected candidate may use the
+    existing value-free continuation contract for at most ``max_lift_calls``
+    logical calls; an empty initial provider turn remains terminal and is never
+    retried without a prior draft or artifact.
+    """
+
+    if not isinstance(max_lift_calls, int) or isinstance(max_lift_calls, bool):
+        raise TypeError("max_lift_calls must be an integer")
+    if not 1 <= max_lift_calls <= MAX_LIFT_CALLS:
+        raise ValueError(
+            f"max_lift_calls must be in [1, {MAX_LIFT_CALLS}]"
+        )
+
+    consistency_started = time.monotonic()
+    stage_metrics: dict[str, dict[str, Any]] = {}
+
+    def record_stage(
+        name: str,
+        started: float,
+        status: str,
+        **details: Any,
+    ) -> None:
+        entry = stage_metrics.setdefault(
+            name,
+            {"elapsed_ms": 0.0, "runs": 0},
+        )
+        entry["elapsed_ms"] += max(
+            0.0,
+            (time.monotonic() - started) * 1000.0,
+        )
+        entry["runs"] += 1
+        entry["status"] = status
+        entry.update(details)
+
+    def completed_metrics(status: str) -> dict[str, Mapping[str, Any]]:
+        result = {
+            name: dict(value) for name, value in stage_metrics.items()
+        }
+        result["consistency_total"] = {
+            "elapsed_ms": max(
+                0.0,
+                (time.monotonic() - consistency_started) * 1000.0,
+            ),
+            "runs": 1,
+            "status": status,
+        }
+        return result
+
+    frontend = _prepared_frontend(prepared)
+    # Consistency-only is the fast semantic path: the model still has to author
+    # a complete value-free artifact, but the initial direct Lift uses the
+    # provider's no-reasoning mode so it can spend the bounded turn on the
+    # Source-to-J artifact itself.  An explicit caller effort remains
+    # authoritative for controlled experiments and formal workflows keep their
+    # configured reasoning effort.
+    resolved_effort = str(effort or "none")
+    lift = ResponsesSCRCLiftAdapter(
+        provider=provider,
+        compiler_view=prepared.compiler_view,
+        effort=resolved_effort,
+        authoring_profile=CONSISTENCY_ONLY_AUTHORING_PROFILE,
+        source_symbol=getattr(
+            prepared.source_slice,
+            "function",
+            prepared.entry.symbol,
+        ),
+    )
+
+    feedback: LiftFeedback | None = None
+    previous_artifact: Gate1Artifact | None = None
+    physical_provider_calls = 0
+    artifact_digest: str | None = None
+    artifact_schema: str | None = None
+    typecheck_report: TypeCheckReport | None = None
+    semantic_probe: Mapping[str, Any] | None = None
+    diagnostics: Mapping[str, Any] = {}
+    lift_metadata: Mapping[str, Any] = {}
+
+    def make_result(status: str, lift_calls: int) -> WorkloadConsistencyResult:
+        return WorkloadConsistencyResult(
+            status=status,
+            model=provider.model,
+            reasoning_effort=resolved_effort,
+            frontend=frontend.value,
+            lift_calls=lift_calls,
+            physical_provider_calls=physical_provider_calls,
+            artifact_digest=artifact_digest,
+            artifact_schema=artifact_schema,
+            typecheck=typecheck_report,
+            semantic_probe=semantic_probe,
+            diagnostics=diagnostics,
+            lift_metadata=lift_metadata,
+            stage_metrics=completed_metrics(status),
+        )
+
+    for lift_call in range(1, max_lift_calls + 1):
+        lift_started = time.monotonic()
+        try:
+            lift_result = lift.lift(prepared.request, feedback)
+        except CandidateLiftError as exc:
+            record_stage(
+                "lift",
+                lift_started,
+                "rejected",
+                attempt=lift_call,
+            )
+            physical_provider_calls += exc.physical_calls
+            failure_diagnostics = dict(exc.diagnostics)
+            failure_diagnostics.setdefault("failure_class", "lift_rejected")
+            failure_diagnostics["logical_lift_call"] = lift_call
+            failure_diagnostics["terminal"] = exc.terminal
+            diagnostics = failure_diagnostics
+
+            candidate_draft = exc.candidate_draft
+            can_continue = (
+                not exc.terminal
+                and lift_call < max_lift_calls
+                and (candidate_draft is not None or previous_artifact is not None)
+            )
+            if not can_continue:
+                return make_result("lift_rejected", lift_call)
+
+            feedback = LiftFeedback(
+                FeedbackKind.LIFT,
+                failure_diagnostics,
+                previous_artifact=(
+                    None if candidate_draft is not None else previous_artifact
+                ),
+                previous_candidate=candidate_draft,
+            )
+            if candidate_draft is not None:
+                previous_artifact = None
+            continue
+
+        record_stage(
+            "lift",
+            lift_started,
+            "finished",
+            attempt=lift_call,
+        )
+        physical_provider_calls += lift_result.physical_calls
+        artifact = canonicalize_gate1_artifact(lift_result.artifact)
+        bind_started = time.monotonic()
+        prepared.request.binding.validate_artifact(artifact)
+        record_stage(
+            "bind_source",
+            bind_started,
+            "finished",
+            attempt=lift_call,
+        )
+        previous_artifact = artifact
+        artifact_digest = canonical_artifact_digest(artifact)
+        artifact_schema = artifact.wire_schema
+        lift_metadata = {
+            key: lift_result.metadata[key]
+            for key in (
+                "model",
+                "response_model",
+                "elapsed_ms",
+                "lift_timeout_seconds",
+                "artifact_schema",
+            )
+            if key in lift_result.metadata
+        }
+        worker_stage_metrics = lift_result.metadata.get("stage_metrics")
+        if isinstance(worker_stage_metrics, Mapping):
+            lift_metadata = {
+                **dict(lift_metadata),
+                "stage_metrics": dict(worker_stage_metrics),
+            }
+
+        typecheck_started = time.monotonic()
+        typecheck_report = type_check(
+            artifact.j,
+            artifact.c,
+            artifact.pi,
+            require_program_axes=artifact.wire_schema == artifact.SCHEMA,
+        )
+        record_stage(
+            "typecheck",
+            typecheck_started,
+            typecheck_report.status.value,
+            attempt=lift_call,
+        )
+        if not typecheck_report.passed:
+            diagnostics = {
+                "failure_class": "typecheck_failed",
+                "logical_lift_call": lift_call,
+                "typecheck": typecheck_report.to_json(),
+            }
+            if lift_call == max_lift_calls:
+                return make_result("typecheck_failed", lift_call)
+            feedback = LiftFeedback(
+                FeedbackKind.TYPECHECK,
+                diagnostics,
+                previous_artifact=artifact,
+            )
+            continue
+
+        semantic_probe_started = time.monotonic()
+        semantic_probe = run_workload_lift_semantic_probe(prepared, artifact)
+        probe_status = semantic_probe.get("status")
+        record_stage(
+            "semantic_probe",
+            semantic_probe_started,
+            str(probe_status or "unavailable"),
+            attempt=lift_call,
+        )
+        if probe_status == "pass":
+            return make_result("consistent", lift_call)
+        if probe_status == "diverged" and lift_call < max_lift_calls:
+            diagnostics = {
+                "diagnostic": "public Source-vs-J semantic probe found a divergence",
+                "failure_class": "lift_semantic_probe_diverged",
+                "logical_lift_call": lift_call,
+                "semantic_probe": semantic_probe,
+                "authority": (
+                    "diagnostic-only public Source-vs-J comparison; it never edits "
+                    "or certifies the artifact"
+                ),
+            }
+            feedback = LiftFeedback(
+                FeedbackKind.LIFT,
+                diagnostics,
+                previous_artifact=artifact,
+            )
+            continue
+
+        if probe_status == "diverged":
+            diagnostics = {
+                "failure_class": "lift_semantic_probe_diverged",
+                "logical_lift_call": lift_call,
+            }
+            return make_result("semantic_diverged", lift_call)
+
+        diagnostics = {
+            "failure_class": "semantic_probe_unavailable",
+            "logical_lift_call": lift_call,
+        }
+        return make_result("semantic_probe_unavailable", lift_call)
+
+    raise RuntimeError("consistency path exhausted without a terminal result")
+
+
 def classify_scrc_report(report: SCRCRunReport) -> BatchClassification:
     """Project one canonical lifecycle report into the batch taxonomy."""
 
@@ -666,6 +1358,12 @@ def classify_scrc_report(report: SCRCRunReport) -> BatchClassification:
         return BatchClassification.LIFT_RESPONSE_REJECTED
     terminal = report.attempts[-1]
     if terminal.formal_round is None:
+        if (
+            terminal.feedback is not None
+            and terminal.feedback.diagnostics.get("failure_class")
+            == "lift_semantic_probe_diverged"
+        ):
+            return BatchClassification.LIFT_RESPONSE_REJECTED
         if terminal.typecheck is not None:
             return BatchClassification.TYPECHECK_FAILED
         return BatchClassification.LIFT_RESPONSE_REJECTED
@@ -694,6 +1392,38 @@ def _attempts_diagnostic(attempts: tuple[Any, ...]) -> str:
         terminal = attempts[-1]
         if terminal.feedback is not None:
             diagnostics = terminal.feedback.diagnostics
+            candidate_check = diagnostics.get("candidate_check")
+            if isinstance(candidate_check, Mapping):
+                issues = candidate_check.get("diagnostics")
+                if isinstance(issues, list):
+                    rendered: list[str] = []
+                    for issue in issues:
+                        if not isinstance(issue, Mapping):
+                            continue
+                        rule_code = issue.get("rule_code") or issue.get(
+                            "code", "candidate_check"
+                        )
+                        path = issue.get("path", "<candidate>")
+                        observed = issue.get("observed_refs_or_types")
+                        if isinstance(observed, list):
+                            detail = " | ".join(str(item) for item in observed)
+                        elif observed is None:
+                            detail = ""
+                        else:
+                            detail = str(observed)
+                        rendered.append(
+                            f"{rule_code}@{path}: {detail}"
+                            if detail
+                            else f"{rule_code}@{path}"
+                        )
+                    if rendered:
+                        # CandidateCheck already bounds each diagnostic, but
+                        # keep the batch summary compact when a provider or a
+                        # future checker supplies many independent issues.
+                        summary = "; ".join(rendered)
+                        if len(summary) > 8192:
+                            return summary[:8180] + "...<truncated>"
+                        return summary
             if isinstance(diagnostics.get("diagnostic"), str):
                 return diagnostics["diagnostic"]
             typecheck = diagnostics.get("typecheck")
@@ -743,6 +1473,13 @@ def scrc_attempt_stage_counts(
     stages: Counter[str] = Counter()
     for attempt in report.attempts:
         if attempt.formal_round is None:
+            if (
+                attempt.feedback is not None
+                and attempt.feedback.diagnostics.get("failure_class")
+                == "lift_semantic_probe_diverged"
+            ):
+                stages["semantic_probe_diverged"] += 1
+                continue
             stages[
                 "typecheck_failed"
                 if attempt.typecheck is not None
@@ -778,7 +1515,7 @@ def scrc_attempt_stage_counts(
 class WorkloadExecution:
     report: SCRCRunReport
     lift: RecordedLiftAdapter
-    replay_writers: tuple[RecordedReplayEvidenceWriter, ...]
+    replay_writers: tuple[RecordedReplayRoundEvidence, ...]
     gate2_attempts: tuple[Gate2SuiteResult, ...] = ()
 
 
@@ -787,7 +1524,7 @@ class WorkloadGate1Search:
     report: SCRCGate1SearchReport
     runner: SCRCGateRunner
     lift: RecordedLiftAdapter
-    replay_writers: tuple[RecordedReplayEvidenceWriter, ...]
+    replay_writers: tuple[RecordedReplayRoundEvidence, ...]
 
 
 @dataclass(frozen=True)
@@ -811,23 +1548,115 @@ class WorkloadGate1Recheck:
         return self.gate1 is not None and self.gate1.passed
 
 
+@dataclass(frozen=True)
+class WorkloadConsistencyResult:
+    """Diagnostic-only result for the current Source-to-J objective.
+
+    This result deliberately stops before source-blind Replay, formal Gate1,
+    and Gate2.  It still requires the real model-authored artifact to pass
+    CandidateCheck/BindSource, TypeCheck, and the public Source-vs-J execution
+    probe.  A passing result is evidence of semantic agreement only; it is not
+    an SCRC closure or a substitute for the complete lifecycle.
+    """
+
+    status: str
+    model: str
+    reasoning_effort: str
+    frontend: str
+    lift_calls: int
+    physical_provider_calls: int
+    artifact_digest: str | None = None
+    artifact_schema: str | None = None
+    typecheck: TypeCheckReport | None = None
+    semantic_probe: Mapping[str, Any] | None = None
+    diagnostics: Mapping[str, Any] = field(default_factory=dict)
+    lift_metadata: Mapping[str, Any] = field(default_factory=dict)
+    stage_metrics: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        allowed = {
+            "consistent",
+            "lift_rejected",
+            "typecheck_failed",
+            "semantic_diverged",
+            "semantic_probe_unavailable",
+        }
+        if self.status not in allowed:
+            raise ValueError(
+                "unknown workload consistency status: " + repr(self.status)
+            )
+        if self.lift_calls < 0 or self.physical_provider_calls < 0:
+            raise ValueError("consistency call counts must be non-negative")
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "consistent"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "diagnostic_only": True,
+            "closure": False,
+            "status": self.status,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
+            "frontend": self.frontend,
+            "lift_calls": self.lift_calls,
+            "physical_provider_calls": self.physical_provider_calls,
+            "artifact_digest": self.artifact_digest,
+            "artifact_schema": self.artifact_schema,
+            "typecheck": (
+                self.typecheck.to_json() if self.typecheck is not None else None
+            ),
+            "semantic_probe": (
+                dict(self.semantic_probe)
+                if self.semantic_probe is not None
+                else None
+            ),
+            "diagnostics": dict(self.diagnostics),
+            "lift_metadata": dict(self.lift_metadata),
+            "stage_metrics": {
+                str(key): dict(value)
+                for key, value in self.stage_metrics.items()
+            },
+        }
+
+
 class WorkloadExecutionError(RuntimeError):
     def __init__(
         self,
         cause: BaseException,
         lift: RecordedLiftAdapter,
-        replay_writers: tuple[RecordedReplayEvidenceWriter, ...],
+        replay_writers: tuple[RecordedReplayRoundEvidence, ...],
+        *,
+        stage_metrics: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         self.cause = cause
         self.lift = lift
         self.replay_writers = replay_writers
         evidence = getattr(cause, "evidence", None)
         self.evidence = dict(evidence) if isinstance(evidence, Mapping) else {}
+        inherited_metrics = self.evidence.get("stage_metrics")
+        merged_metrics: dict[str, Mapping[str, Any]] = {}
+        if isinstance(inherited_metrics, Mapping):
+            merged_metrics.update(
+                {
+                    str(name): value
+                    for name, value in inherited_metrics.items()
+                    if isinstance(value, Mapping)
+                }
+            )
+        if stage_metrics:
+            merged_metrics.update(stage_metrics)
+        self.stage_metrics = {
+            str(name): dict(value)
+            for name, value in merged_metrics.items()
+            if isinstance(value, Mapping)
+        }
         super().__init__(f"{type(cause).__name__}: {cause}")
 
 
 def recheck_prepared_workload_gate1(
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     artifact: Gate1Artifact,
     *,
     provider: ProviderConfig,
@@ -842,6 +1671,7 @@ def recheck_prepared_workload_gate1(
     is returned as diagnostic evidence and never reaches Replay.
     """
 
+    frontend = _prepared_frontend(prepared)
     canonical = canonicalize_gate1_artifact(artifact)
     digest = canonical_artifact_digest(canonical)
     checked = type_check(
@@ -859,17 +1689,25 @@ def recheck_prepared_workload_gate1(
             None,
         )
 
+    compiler, case = _workload_compiler(frontend, prepared)
+    compile_checker = (
+        _native_replay_compile_checker(frontend, compiler, case)
+        if frontend in {Frontend.CUDA, Frontend.TILELANG}
+        else None
+    )
     writer = _new_replay_writer(
         replay_backend,
         provider=provider,
         effort=effort,
+        frontend=frontend,
+        compile_checker=compile_checker,
     )
-    gate1 = BoundGate1Adapter(
-        Gate1Runner(
-            compiler=TritonCompiler(timeout=240.0),
-            writer=writer,
-            config=Gate1Config(run_masked_j=False),
-        )
+    gate1 = _build_gate1_adapter(
+        frontend,
+        compiler=compiler,
+        writer=writer,
+        masked_writer=None,
+        run_masked_j=False,
     ).run(canonical, prepared.request)
     if gate1.artifact_digest != digest:
         raise RuntimeError("fixed-artifact Gate1 digest changed during recheck")
@@ -885,7 +1723,7 @@ def recheck_prepared_workload_gate1(
 
 
 def _build_workload_runtime(
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     *,
     provider: ProviderConfig,
     effort: str | None = None,
@@ -901,7 +1739,7 @@ def _build_workload_runtime(
 ) -> tuple[
     SCRCGateRunner,
     RecordedLiftAdapter,
-    list[RecordedReplayEvidenceWriter],
+    list[RecordedReplayRoundEvidence],
 ]:
     if not isinstance(replay_width, int) or isinstance(replay_width, bool):
         raise TypeError("replay_width must be an integer")
@@ -911,6 +1749,7 @@ def _build_workload_runtime(
         raise ValueError(
             "lift_workflow must be 'single'; staged multi-writer Lift was retired"
         )
+    frontend = _prepared_frontend(prepared)
     lift_class: type[RecordedLiftAdapter]
     if lift_backend == "responses":
         lift_class = ResponsesSCRCLiftAdapter
@@ -924,7 +1763,11 @@ def _build_workload_runtime(
         "provider": provider,
         "compiler_view": prepared.compiler_view,
         "effort": effort,
-        "source_symbol": prepared.entry.symbol,
+        "source_symbol": getattr(
+            prepared.source_slice,
+            "function",
+            prepared.entry.symbol,
+        ),
     }
     if lift_backend in {"miniswe", "codex"}:
         lift_kwargs["workflow"] = lift_workflow
@@ -932,7 +1775,9 @@ def _build_workload_runtime(
         lift_kwargs["semantic_probe"] = lambda artifact: (
             run_workload_lift_semantic_probe(prepared, artifact)
         )
-    if lift_backend == "codex" and (effort or provider.reasoning_effort) == "xhigh":
+    if lift_backend == "codex" and (
+        effort or provider.reasoning_effort
+    ).casefold() in {"xhigh", "max"}:
         lift_kwargs["repair_effort"] = "high"
         lift_kwargs["stop_requested"] = stop_requested
     lift = lift_class(
@@ -940,53 +1785,121 @@ def _build_workload_runtime(
     )
     effective_replay_provider = replay_provider or provider
     effective_replay_effort = effort if replay_effort is None else replay_effort
-    writers: list[RecordedReplayEvidenceWriter] = []
-    compiler = TritonCompiler(timeout=240.0)
+    writers: list[RecordedReplayRoundEvidence] = []
+    compiler, _case = _workload_compiler(frontend, prepared)
+    native_checker = (
+        _native_replay_compile_checker(frontend, compiler, _case)
+        if frontend in {Frontend.CUDA, Frontend.TILELANG}
+        else None
+    )
+
+    def new_writer() -> RecordedReplayWriter:
+        writer = (
+            replay_writer_factory()
+            if replay_writer_factory is not None
+            else _new_replay_writer(
+                replay_backend,
+                provider=effective_replay_provider,
+                effort=effective_replay_effort,
+                frontend=frontend,
+                compile_checker=native_checker,
+                stop_requested=stop_requested,
+            )
+        )
+        return _validate_replay_writer_contract(writer, frontend=frontend)
 
     def gate1_factory(_formal_round: int) -> BoundGate1Adapter:
-        round_writers = tuple(
-            (
-                replay_writer_factory()
-                if replay_writer_factory is not None
-                else _new_replay_writer(
-                    replay_backend,
-                    provider=effective_replay_provider,
-                    effort=effective_replay_effort,
-                    stop_requested=stop_requested,
-                )
-            )
-            for _ in range(replay_width)
-        )
+        round_writers = tuple(new_writer() for _ in range(replay_width))
         writer_evidence: RecordedReplayEvidenceWriter
         if replay_width == 1:
             writer_evidence = round_writers[0]
         else:
             writer_evidence = RecordedReplayWriterGroup(round_writers)
-        writers.append(writer_evidence)
-        return BoundGate1Adapter(
-            Gate1Runner(
+        if frontend is Frontend.TRITON:
+            writers.append(writer_evidence)
+            return _build_gate1_adapter(
+                frontend,
                 compiler=compiler,
                 writer=(
                     round_writers[0]
                     if replay_width == 1
                     else round_writers
                 ),
-                config=Gate1Config(run_masked_j=run_masked_j),
+                masked_writer=None,
+                run_masked_j=run_masked_j,
             )
+        masked_writer = new_writer() if run_masked_j else None
+        writers.append(RecordedReplayRound(writer_evidence, masked_writer))
+        return _build_gate1_adapter(
+            frontend,
+            compiler=compiler,
+            writer=(
+                round_writers[0]
+                if replay_width == 1
+                else round_writers
+            ),
+            masked_writer=masked_writer,
+            run_masked_j=run_masked_j,
         )
 
-    gate2 = TritonGate2ExecutionAdapter(
-        Gate2Runner(),
-        lambda artifact, _gate1, _binding: build_workload_gate2_suite(
-            prepared, artifact
-        ),
+    if frontend is Frontend.TRITON:
+        gate2 = TritonGate2ExecutionAdapter(
+            Gate2Runner(),
+            lambda artifact, _gate1, _binding: build_workload_gate2_suite(
+                prepared, artifact  # type: ignore[arg-type]
+            ),
+        )
+    elif frontend is Frontend.CUDA:
+        gate2 = NativeGate2ExecutionAdapter(
+            "cuda",
+            Gate2Runner(
+                source_runner=CudaRunner(compiler),
+                replay_runner=CudaRunner(compiler),
+            ),
+            lambda artifact, _gate1, _binding: build_frontend_dataset_gate2_suite(
+                prepared,  # type: ignore[arg-type]
+                artifact,
+            ),
+        )
+    elif frontend is Frontend.TILELANG:
+        gate2 = NativeGate2ExecutionAdapter(
+            "tilelang",
+            Gate2Runner(
+                source_runner=TileLangRunner(),
+                replay_runner=TileLangRunner(),
+            ),
+            lambda artifact, _gate1, _binding: build_frontend_dataset_gate2_suite(
+                prepared,  # type: ignore[arg-type]
+                artifact,
+            ),
+        )
+    else:  # pragma: no cover - _prepared_frontend closes this set
+        raise ValueError(f"no Gate2 adapter is registered for {frontend.value!r}")
+
+    # Responses and MiniSWE return a checked artifact directly, so the shared
+    # runner performs the same public Source-vs-J probe before any Replay/Gate1
+    # call. Codex owns an equivalent same-thread probe inside its persistent
+    # session; do not execute that expensive native/reference probe twice.
+    semantic_probe = (
+        (
+            lambda artifact: run_workload_lift_semantic_probe(prepared, artifact)
+        )
+        if lift_backend in {"responses", "miniswe"}
+        else None
     )
-    runner = SCRCGateRunner(SCRCRunDependencies(lift, gate1_factory, gate2))
+    runner = SCRCGateRunner(
+        SCRCRunDependencies(
+            lift,
+            gate1_factory,
+            gate2,
+            semantic_probe=semantic_probe,
+        )
+    )
     return runner, lift, writers
 
 
 def search_prepared_workload_gate1(
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     *,
     provider: ProviderConfig,
     initial_feedback: LiftFeedback | None = None,
@@ -1001,6 +1914,7 @@ def search_prepared_workload_gate1(
     replay_writer_factory: Callable[[], RecordedReplayWriter] | None = None,
     retry_initial_artifact: bool = False,
     max_gate1_rounds: int | None = None,
+    max_lift_calls: int | None = None,
     max_pre_replay_rejections: int | None = None,
     stop_requested: Callable[[], int | None] | None = None,
     progress_callback: SCRCProgressCallback | None = None,
@@ -1024,6 +1938,8 @@ def search_prepared_workload_gate1(
     request = prepared.request
     if max_gate1_rounds is not None:
         request = replace(request, max_gate1_rounds=max_gate1_rounds)
+    if max_lift_calls is not None:
+        request = replace(request, max_lift_calls=max_lift_calls)
     if max_pre_replay_rejections is not None:
         request = replace(
             request,
@@ -1033,6 +1949,7 @@ def search_prepared_workload_gate1(
         # Legacy one-shot writers do not expose a cumulative owner-time terminal
         # signal, so retain their historical safety override.
         request = replace(request, max_pre_replay_rejections=3)
+    search_started = time.monotonic()
     try:
         report = runner.search_gate1(
             request,
@@ -1042,25 +1959,68 @@ def search_prepared_workload_gate1(
             progress_callback=progress_callback,
         )
     except Exception as exc:
-        raise WorkloadExecutionError(exc, lift, tuple(writers)) from exc
+        stage_metrics: dict[str, dict[str, Any]] = {
+            "search_total": {
+                "elapsed_ms": max(
+                    0.0, (time.monotonic() - search_started) * 1000.0
+                ),
+                "runs": 1,
+                "status": "infrastructure_error",
+            }
+        }
+        if isinstance(exc, ProviderError):
+            stage_metrics["lift"] = {
+                "elapsed_ms": max(0.0, float(exc.elapsed_ms)),
+                "runs": 1,
+                "status": "infrastructure_error",
+                "attempts": exc.attempts,
+                "physical_provider_calls": exc.attempts,
+                "failure_class": exc.failure_class,
+            }
+        raise WorkloadExecutionError(
+            exc,
+            lift,
+            tuple(writers),
+            stage_metrics=stage_metrics,
+        ) from exc
     return WorkloadGate1Search(report, runner, lift, tuple(writers))
 
 
 def complete_prepared_workload_gate2(
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     search: WorkloadGate1Search,
 ) -> WorkloadExecution:
     """Execute hidden Gate2 once for the preselected Gate1-closed branch."""
 
     if not search.report.closed:
         raise ValueError("cannot execute Gate2 for a branch without Gate1 closure")
+    gate2_started = time.monotonic()
     try:
         report = search.runner.complete_gate2(
             prepared.request, search.report
         )
     except Exception as exc:
+        stage_metrics = {
+            "gate2": {
+                "elapsed_ms": max(
+                    0.0, (time.monotonic() - gate2_started) * 1000.0
+                ),
+                "runs": 1,
+                "status": "infrastructure_error",
+            },
+            "gate2_total": {
+                "elapsed_ms": max(
+                    0.0, (time.monotonic() - gate2_started) * 1000.0
+                ),
+                "runs": 1,
+                "status": "infrastructure_error",
+            },
+        }
         raise WorkloadExecutionError(
-            exc, search.lift, search.replay_writers
+            exc,
+            search.lift,
+            search.replay_writers,
+            stage_metrics=stage_metrics,
         ) from exc
     return WorkloadExecution(
         report,
@@ -1130,7 +2090,7 @@ def _rebase_fixed_artifact_retry_attempt(
 
 
 def retry_prepared_workload_gate1_fixed_artifact(
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     artifact: Gate1Artifact,
     *,
     provider: ProviderConfig,
@@ -1252,6 +2212,39 @@ def _add_call_budgets(left: CallBudget, right: CallBudget) -> CallBudget:
     )
 
 
+def _merge_stage_metrics(
+    *groups: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Accumulate stage timings while retaining the latest stage status.
+
+    A Gate1 search owns the timings for its Lift/BindSource/TypeCheck/Replay
+    stages.  Wrapper-level no-closure and fixed-artifact retry paths must carry
+    those timings into the persisted ``SCRCRunReport`` instead of rebuilding a
+    report with the default empty mapping.  ``elapsed_ms`` and ``runs`` are
+    additive across independent searches; other fields describe the latest
+    observation for that stage.
+    """
+
+    merged: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for name, raw in group.items():
+            if not isinstance(raw, Mapping):
+                continue
+            current = merged.setdefault(str(name), {})
+            for key, value in raw.items():
+                if key in {"elapsed_ms", "runs"}:
+                    previous = current.get(key)
+                    if isinstance(previous, (int, float)) and isinstance(
+                        value, (int, float)
+                    ):
+                        current[key] = previous + value
+                    elif key not in current:
+                        current[key] = value
+                else:
+                    current[key] = value
+    return merged
+
+
 def _gate2_only_budget(gate2: Gate2SuiteResult) -> CallBudget:
     case_count = len(gate2.cases)
     return CallBudget(
@@ -1294,6 +2287,18 @@ def merge_fixed_artifact_replay_retry_execution(
             budget,
             _gate2_only_budget(execution.report.gate2),
         )
+    stage_metrics = _merge_stage_metrics(
+        base.report.stage_metrics,
+        *(search.report.stage_metrics for search in retry_searches),
+        *(
+            {
+                key: value
+                for key, value in execution.report.stage_metrics.items()
+                if key in {"gate2", "gate2_total"}
+            }
+            for execution in retry_executions
+        ),
+    )
     final = retry_executions[-1] if retry_executions else base
     report = SCRCRunReport(
         main_status=final.report.main_status,
@@ -1302,6 +2307,7 @@ def merge_fixed_artifact_replay_retry_execution(
         gate2=final.report.gate2,
         j_necessity_status=final.report.j_necessity_status,
         call_budget=budget,
+        stage_metrics=stage_metrics,
     )
     return WorkloadExecution(
         report,
@@ -1312,7 +2318,7 @@ def merge_fixed_artifact_replay_retry_execution(
 
 
 def execute_prepared_workload(
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     *,
     provider: ProviderConfig,
     effort: str | None = None,
@@ -1322,6 +2328,7 @@ def execute_prepared_workload(
     lift_backend: str = "responses",
     lift_workflow: str = "single",
     replay_backend: str = "responses",
+    max_lift_calls: int | None = None,
     progress_callback: SCRCProgressCallback | None = None,
 ) -> WorkloadExecution:
     """Run one independent real case through the canonical full lifecycle."""
@@ -1336,6 +2343,7 @@ def execute_prepared_workload(
         lift_backend=lift_backend,
         lift_workflow=lift_workflow,
         replay_backend=replay_backend,
+        max_lift_calls=max_lift_calls,
         progress_callback=progress_callback,
     )
     if search.report.closed:
@@ -1347,6 +2355,7 @@ def execute_prepared_workload(
         None,
         None,
         search.report.call_budget,
+        stage_metrics=search.report.stage_metrics,
     )
     return WorkloadExecution(report, search.lift, search.replay_writers)
 
@@ -1432,9 +2441,139 @@ def _read_recheck_lineage_object(path: Path, label: str) -> dict[str, Any]:
     return value
 
 
+_GENERATED_SOURCE_MANIFEST_KEY = "generated_target_source_manifest"
+_GENERATED_SOURCE_MANIFEST_DIGEST_KEY = (
+    "generated_target_source_manifest_digest"
+)
+
+
+def _prepared_manifest_lineage(prepared: PreparedWorkload) -> dict[str, Any]:
+    """Return the shared generated-source manifest lineage for every frontend."""
+
+    manifest = getattr(prepared, "manifest", None)
+    if manifest is None:
+        return {}
+    return manifest.execution_lineage()
+
+
+def _execution_manifest_lineage(
+    prepared: PreparedWorkload,
+) -> dict[str, Any]:
+    """Return only the manifest identity that was available at execution time."""
+
+    lineage = _prepared_manifest_lineage(prepared)
+    keys = {
+        _GENERATED_SOURCE_MANIFEST_KEY,
+        _GENERATED_SOURCE_MANIFEST_DIGEST_KEY,
+        "execution_generated_target_source_manifest",
+        "execution_generated_target_source_manifest_digest",
+        "source_slice_sha256",
+        "source_location",
+        "device_entry_symbol",
+        "lineage_required",
+    }
+    return {key: lineage[key] for key in keys if key in lineage}
+
+
+def _workload_source_projection(prepared: PreparedWorkload) -> dict[str, Any]:
+    projection = {
+        **prepared.source_slice.to_json(),
+        "source_location": prepared.source_location,
+        "lift_source_kind": prepared.request.source.lift_source_kind,
+        "lift_source_sha256": hashlib.sha256(
+            prepared.request.source.text.encode("utf-8")
+        ).hexdigest(),
+    }
+    projection.update(_prepared_manifest_lineage(prepared))
+    # The compatibility ``source_*`` lineage keys describe the execution
+    # snapshot.  Keep the currently selected source projection explicit as
+    # well, so a later re-ingress cannot make the persisted projection appear
+    # to be the old source while its final manifest points at new bytes.
+    projection.update(
+        {
+            "selected_source_slice_sha256": hashlib.sha256(
+                prepared.source_slice.code.encode("utf-8")
+            ).hexdigest(),
+            "selected_source_location": prepared.source_location,
+            "selected_device_entry_symbol": prepared.source_slice.function,
+        }
+    )
+    return projection
+
+
+def _bind_prepared_manifest(
+    prepared: PreparedWorkload,
+    artifact: Gate1Artifact,
+) -> PreparedWorkload:
+    with_contract = getattr(prepared, "with_contract", None)
+    if callable(with_contract):
+        return with_contract(artifact.j, artifact.c)
+    return prepared
+
+
+def _attach_gate2_lifecycle(
+    prepared: PreparedWorkload,
+    gate2: Gate2SuiteResult,
+) -> PreparedWorkload:
+    """Attach only runner-verified lifecycle records to the final manifest."""
+
+    if not gate2.cases:
+        return prepared
+    records: list[GeneratedSourceLifecycleRecord] = []
+    for case in gate2.cases:
+        raw_records = case.metadata.get("lifecycle_records")
+        if raw_records is None:
+            continue
+        if not isinstance(raw_records, list):
+            raise ValueError("Gate2 lifecycle_records must be a JSON array")
+        current = tuple(
+            GeneratedSourceLifecycleRecord.from_dict(item)
+            for item in raw_records
+        )
+        if records and current != tuple(records):
+            raise ValueError(
+                "Gate2 cases in one suite produced different lifecycle records"
+            )
+        records = list(current)
+    if not records:
+        return prepared
+    manifest = getattr(prepared, "manifest", None)
+    if manifest is None:
+        raise ValueError("Gate2 lifecycle evidence requires a prepared manifest")
+    expected_slice = manifest.source_slice_sha256
+    if records[0].source_slice_sha256 != expected_slice:
+        raise ValueError(
+            "Gate2 lifecycle source slice differs from the prepared manifest"
+        )
+    with_records = getattr(prepared, "with_lifecycle_records", None)
+    if not callable(with_records):
+        raise TypeError("prepared workload cannot accept lifecycle records")
+    return with_records(records)
+
+
+def _refresh_workload_manifest_lineage(
+    run_dir: Path,
+    prepared: PreparedWorkload,
+) -> None:
+    """Refresh only the manifest fields in the existing run lineage."""
+
+    if not _prepared_manifest_lineage(prepared):
+        return
+    source_projection_path = run_dir / "source_projection.json"
+    request_path = run_dir / "request.json"
+    if not source_projection_path.is_file() or not request_path.is_file():
+        raise ValueError(
+            "workload evidence must be initialized before manifest lineage is refreshed"
+        )
+    request = _read_recheck_lineage_object(request_path, "request.json")
+    _write_json(source_projection_path, _workload_source_projection(prepared))
+    request.update(_prepared_manifest_lineage(prepared))
+    _write_json(request_path, request)
+
+
 def validate_workload_gate1_recheck_parent(
     parent_evidence: str | Path,
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     artifact: Gate1Artifact,
 ) -> Path:
     """Bind a diagnostic recheck to one exact parent case/source/artifact.
@@ -1486,7 +2625,6 @@ def validate_workload_gate1_recheck_parent(
         "frontend": prepared.entry.frontend,
         "c0": prepared.request.binding.values,
         "grid": list(prepared.adapter.grid),
-        "source_to_opaque": dict(prepared.source_to_opaque),
     }
     missing_request = sorted(set(expected_request) - set(request))
     if missing_request:
@@ -1502,17 +2640,148 @@ def validate_workload_gate1_recheck_parent(
             "parent Gate1 request differs from selected workload: "
             + ", ".join(mismatched_request)
         )
+    parent_source_to_opaque = request.get("source_to_opaque")
+    if not isinstance(parent_source_to_opaque, Mapping):
+        raise ValueError("parent Gate1 request has no source_to_opaque mapping")
+    if any(
+        not isinstance(source, str)
+        or not isinstance(opaque, str)
+        for source, opaque in parent_source_to_opaque.items()
+    ):
+        raise ValueError("parent Gate1 source_to_opaque mapping is malformed")
+    expected_source_to_opaque = dict(prepared.source_to_opaque)
+    missing_abi = sorted(
+        source
+        for source in expected_source_to_opaque
+        if source not in parent_source_to_opaque
+    )
+    mismatched_abi = sorted(
+        source
+        for source, expected in expected_source_to_opaque.items()
+        if parent_source_to_opaque.get(source) != expected
+    )
+    if missing_abi or mismatched_abi:
+        details: list[str] = []
+        if missing_abi:
+            details.append("missing ABI source name(s): " + ", ".join(missing_abi))
+        if mismatched_abi:
+            details.append(
+                "mismatched ABI source name(s): " + ", ".join(mismatched_abi)
+            )
+        raise ValueError(
+            "parent Gate1 source_to_opaque mapping differs from selected workload: "
+            + "; ".join(details)
+        )
+    legacy_physical = sorted(
+        source
+        for source, opaque in parent_source_to_opaque.items()
+        if source not in expected_source_to_opaque
+        and re.fullmatch(r"(?:p|c)[0-9]+", opaque) is not None
+    )
+    if legacy_physical:
+        raise ValueError(
+            "parent Gate1 source_to_opaque has extra physical ABI mapping(s): "
+            + ", ".join(legacy_physical)
+        )
     if artifact.c.values != request["c0"]:
         raise ValueError("input artifact C differs from parent Gate1 request c0")
+
+    bound_prepared = _bind_prepared_manifest(prepared, artifact)
+    # Gate1 parent identity is the execution snapshot.  Gate2 may have
+    # appended lifecycle records to the same run and therefore changed the
+    # final manifest digest; comparing that future digest here would create a
+    # false claim that Gate1 executed against it.
+    expected_manifest_lineage = _execution_manifest_lineage(bound_prepared)
+    manifest_keys = set(expected_manifest_lineage)
+    recorded_manifest_keys = manifest_keys & set(request)
+    legacy_manifest_lineage = not recorded_manifest_keys
+    if not legacy_manifest_lineage:
+        missing_manifest = sorted(manifest_keys - set(request))
+        if missing_manifest:
+            raise ValueError(
+                "parent Gate1 request has incomplete generated-source manifest "
+                "lineage: " + ", ".join(missing_manifest)
+            )
+        for key, expected in expected_manifest_lineage.items():
+            if request[key] != expected:
+                raise ValueError(
+                    "parent Gate1 generated-source manifest differs from the "
+                    f"selected workload: {key}"
+                )
+    final_manifest_payload = request.get(
+        "final_generated_target_source_manifest"
+    )
+    final_manifest_digest = request.get(
+        "final_generated_target_source_manifest_digest"
+    )
+    if (final_manifest_payload is None) != (final_manifest_digest is None):
+        raise ValueError(
+            "parent Gate1 request has an incomplete final manifest lineage"
+        )
+    if final_manifest_payload is not None:
+        try:
+            final_manifest = GeneratedTargetSourceManifest.from_dict(
+                final_manifest_payload
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "parent Gate1 final manifest lineage is malformed"
+            ) from exc
+        if final_manifest.digest != final_manifest_digest:
+            raise ValueError(
+                "parent Gate1 final manifest digest does not match its payload"
+            )
 
     projection = _read_recheck_lineage_object(
         lineage_root / "source_projection.json", "source_projection.json"
     )
-    expected_projection = {
-        **prepared.source_slice.to_json(),
-        "source_location": prepared.source_location,
-    }
-    if projection != expected_projection:
+    expected_projection = _workload_source_projection(bound_prepared)
+    projection_lineage_keys = set(_prepared_manifest_lineage(bound_prepared))
+    projection_lineage_keys.update(
+        {
+            "selected_source_slice_sha256",
+            "selected_source_location",
+            "selected_device_entry_symbol",
+        }
+    )
+    if legacy_manifest_lineage:
+        projection_lineage_keys.update(
+            key
+            for key in expected_manifest_lineage
+            if key not in projection
+        )
+        # These source identity fields were introduced together with the
+        # generated-source manifest.  An older parent can still be checked
+        # against the exact source.py and source-slice digest below; do not
+        # reject it solely because the old projection did not persist the
+        # redundant source-kind/hash pair.
+        projection_lineage_keys.update(
+            key
+            for key in ("lift_source_kind", "lift_source_sha256")
+            if key not in projection
+        )
+    for key, expected in expected_projection.items():
+        if key in projection_lineage_keys:
+            continue
+        if projection.get(key) != expected:
+            raise ValueError(
+                "parent Gate1 source projection differs from selected workload"
+            )
+    for key, expected in _execution_manifest_lineage(bound_prepared).items():
+        if legacy_manifest_lineage and key not in projection:
+            continue
+        if projection.get(key) != expected:
+            raise ValueError(
+                "parent Gate1 source projection execution lineage differs"
+            )
+    expected_source_slice_sha256 = hashlib.sha256(
+        bound_prepared.source_slice.code.encode("utf-8")
+    ).hexdigest()
+    recorded_source_slice_sha256 = projection.get("selected_source_slice_sha256")
+    if (
+        recorded_source_slice_sha256 is not None
+        and recorded_source_slice_sha256 != expected_source_slice_sha256
+    ):
         raise ValueError(
             "parent Gate1 source projection differs from selected workload"
         )
@@ -1520,14 +2789,14 @@ def validate_workload_gate1_recheck_parent(
         parent_source = (lineage_root / "source.py").read_text(encoding="utf-8")
     except OSError as exc:
         raise ValueError(f"parent Gate1 source.py is unreadable: {exc}") from exc
-    if parent_source != prepared.source_slice.code:
+    if parent_source != prepared.request.source.text:
         raise ValueError("parent Gate1 source differs from selected workload")
     return lineage_root
 
 
 def initialize_workload_gate1_recheck_evidence(
     recheck_dir: Path,
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     *,
     provider: ProviderConfig,
     effort: str | None,
@@ -1549,15 +2818,12 @@ def initialize_workload_gate1_recheck_evidence(
         raise ValueError("Gate1 recheck evidence directory must be empty")
 
     (recheck_dir / "source.py").write_text(
-        prepared.source_slice.code, encoding="utf-8"
+        prepared.request.source.text, encoding="utf-8"
     )
     _write_json(recheck_dir / "adapter.json", prepared.adapter.to_json())
     _write_json(
         recheck_dir / "source_projection.json",
-        {
-            **prepared.source_slice.to_json(),
-            "source_location": prepared.source_location,
-        },
+        _workload_source_projection(prepared),
     )
     _write_json(
         recheck_dir / "request.json",
@@ -1578,13 +2844,14 @@ def initialize_workload_gate1_recheck_evidence(
             "grid": list(prepared.adapter.grid),
             "run_masked_j": False,
             "source_to_opaque": dict(prepared.source_to_opaque),
+            **_prepared_manifest_lineage(prepared),
         },
     )
 
 
 def initialize_workload_evidence(
     run_dir: Path,
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     *,
     provider: ProviderConfig,
     effort: str | None,
@@ -1594,20 +2861,31 @@ def initialize_workload_evidence(
     lift_backend: str = "responses",
     lift_workflow: str = "single",
     replay_backend: str = "responses",
+    max_lift_calls: int | None = None,
     search_metadata: Mapping[str, Any] | None = None,
 ) -> None:
+    effective_max_lift_calls = (
+        prepared.request.max_lift_calls
+        if max_lift_calls is None
+        else max_lift_calls
+    )
+    if (
+        not isinstance(effective_max_lift_calls, int)
+        or effective_max_lift_calls < 1
+        or effective_max_lift_calls > MAX_LIFT_CALLS
+    ):
+        raise ValueError(
+            f"max_lift_calls must be in [1, {MAX_LIFT_CALLS}]"
+        )
     effective_replay_provider = replay_provider or provider
     effective_replay_effort = effort if replay_effort is None else replay_effort
     (run_dir / "source.py").write_text(
-        prepared.source_slice.code, encoding="utf-8"
+        prepared.request.source.text, encoding="utf-8"
     )
     _write_json(run_dir / "adapter.json", prepared.adapter.to_json())
     _write_json(
         run_dir / "source_projection.json",
-        {
-            **prepared.source_slice.to_json(),
-            "source_location": prepared.source_location,
-        },
+        _workload_source_projection(prepared),
     )
     request_record = {
         "case_id": prepared.entry.case_id,
@@ -1621,6 +2899,7 @@ def initialize_workload_evidence(
         ),
         "lift_backend": lift_backend,
         "lift_workflow": lift_workflow,
+        "max_lift_calls": effective_max_lift_calls,
         "replay_backend": replay_backend,
         "frontend": prepared.entry.frontend,
         "observer_profile": prepared.entry.observer_profile,
@@ -1629,6 +2908,7 @@ def initialize_workload_evidence(
         "grid": list(prepared.adapter.grid),
         "run_masked_j": run_masked_j,
         "source_to_opaque": dict(prepared.source_to_opaque),
+        **_prepared_manifest_lineage(prepared),
     }
     if search_metadata is not None:
         request_record["candidate_search"] = dict(search_metadata)
@@ -1749,7 +3029,7 @@ def _save_replay_record_evidence(
 
 def save_workload_gate1_recheck(
     recheck_dir: Path,
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     result: WorkloadGate1Recheck,
 ) -> None:
     """Persist fixed-artifact diagnostic evidence without a new verdict."""
@@ -1766,6 +3046,14 @@ def save_workload_gate1_recheck(
         raise ValueError("fixed-artifact recheck result must be diagnostic-only")
     if canonical_artifact_digest(result.artifact) != result.artifact_digest:
         raise ValueError("fixed-artifact recheck digest differs from artifact")
+
+    bound_prepared = _bind_prepared_manifest(prepared, result.artifact)
+    _write_json(
+        recheck_dir / "source_projection.json",
+        _workload_source_projection(bound_prepared),
+    )
+    request.update(_prepared_manifest_lineage(bound_prepared))
+    _write_json(request_path, request)
 
     _write_json(recheck_dir / "artifact.json", result.artifact.to_json())
     _write_json(recheck_dir / "typecheck.json", result.typecheck.to_json())
@@ -1851,11 +3139,33 @@ def save_workload_gate1_recheck(
 
 def save_workload_execution(
     run_dir: Path,
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     execution: WorkloadExecution,
 ) -> None:
     report = execution.report
-    _write_json(run_dir / "report.json", report.to_json())
+    bound_prepared = prepared
+    if report.accepted_attempt is not None:
+        accepted_attempts = tuple(
+            attempt
+            for attempt in report.attempts
+            if attempt.formal_round == report.accepted_attempt
+        )
+        if len(accepted_attempts) != 1:
+            raise ValueError(
+                "report does not identify exactly one accepted workload attempt"
+            )
+        accepted_artifact = accepted_attempts[0].artifact
+        if accepted_artifact is None:
+            raise ValueError("accepted workload attempt lacks its Gate1 artifact")
+        bound_prepared = _bind_prepared_manifest(prepared, accepted_artifact)
+    if report.gate2 is not None:
+        bound_prepared = _attach_gate2_lifecycle(bound_prepared, report.gate2)
+    _refresh_workload_manifest_lineage(run_dir, bound_prepared)
+    report_payload = report.to_json()
+    report_payload["manifest_lineage"] = _prepared_manifest_lineage(
+        bound_prepared
+    )
+    _write_json(run_dir / "report.json", report_payload)
     _save_attempt_evidence(
         run_dir,
         report.attempts,
@@ -1875,7 +3185,11 @@ def save_workload_execution(
                 gate2_attempt.to_json(),
             )
     if report.gate2 is not None:
-        _write_json(run_dir / "gate2.json", report.gate2.to_json())
+        gate2_payload = report.gate2.to_json()
+        gate2_payload["manifest_lineage"] = _prepared_manifest_lineage(
+            bound_prepared
+        )
+        _write_json(run_dir / "gate2.json", gate2_payload)
     classification = classify_scrc_report(report)
     summary = [
         f"# {prepared.entry.case_id} {run_dir.name}",
@@ -1918,13 +3232,16 @@ def _save_attempt_evidence(
     run_dir: Path,
     attempts: tuple[Any, ...],
     lift: RecordedLiftAdapter,
-    replay_writers: tuple[RecordedReplayEvidenceWriter, ...],
+    replay_writers: tuple[RecordedReplayRoundEvidence, ...],
 ) -> None:
     for index, attempt in enumerate(attempts, start=1):
         attempt_dir = run_dir / f"attempt-{index:02d}"
         attempt_dir.mkdir()
         if attempt.artifact is not None:
             _write_json(attempt_dir / "artifact.json", attempt.artifact.to_json())
+        interface = attempt.lift_metadata.get("layer_c_interface")
+        if isinstance(interface, Mapping):
+            _write_json(attempt_dir / "layer_c_interface.json", interface)
         if attempt.typecheck is not None:
             _write_json(
                 attempt_dir / "typecheck.json", attempt.typecheck.to_json()
@@ -2012,6 +3329,10 @@ def _save_attempt_evidence(
         formal_attempts, replay_writers, strict=True
     ):
         record_entries: list[tuple[str, ReplayGeneration | ReplayAttempt]] = []
+        masked_writer: RecordedReplayWriter | None = None
+        if isinstance(writer, RecordedReplayRound):
+            masked_writer = writer.masked
+            writer = writer.normal
         if isinstance(writer, RecordedReplayWriterGroup):
             if attempt.gate1 is None:
                 raise ValueError("Replay writer fan-out lacks Gate1 evidence")
@@ -2064,6 +3385,23 @@ def _save_attempt_evidence(
                     else f"replay_extra_{record_index:02d}"
                 )
                 record_entries.append((prefix, record))
+        if masked_writer is not None:
+            for record_index, record in enumerate(masked_writer.records, start=1):
+                prefix = (
+                    "masked_j_replay"
+                    if record_index == 1
+                    else f"masked_j_replay_extra_{record_index:02d}"
+                )
+                record_entries.append((prefix, record))
+            if (
+                not masked_writer.records
+                and attempt.gate1 is not None
+                and attempt.gate1.masked_j is not None
+                and attempt.gate1.masked_j.generation is not None
+            ):
+                record_entries.append(
+                    ("masked_j_replay", attempt.gate1.masked_j.generation)
+                )
         for prefix, record in record_entries:
             exact_name = (
                 f"{prefix}.py"
@@ -2080,7 +3418,7 @@ def _save_attempt_evidence(
 
 def save_workload_gate1_search(
     run_dir: Path,
-    prepared: PreparedTritonWorkload,
+    prepared: PreparedWorkload,
     search: WorkloadGate1Search,
     *,
     selected_for_gate2: bool,
@@ -2120,10 +3458,19 @@ def save_candidate_fanout_report(
     winner_result: Mapping[str, Any] | None,
     lift_backend: str = "responses",
     replay_backend: str = "responses",
+    max_lift_calls: int = MAX_LIFT_CALLS,
 ) -> None:
+    if (
+        type(max_lift_calls) is not int
+        or not 1 <= max_lift_calls <= MAX_LIFT_CALLS
+    ):
+        raise ValueError(
+            f"max_lift_calls must be in [1, {MAX_LIFT_CALLS}]"
+        )
     payload = report.to_json()
     payload["lift_backend"] = lift_backend
     payload["replay_backend"] = replay_backend
+    payload["max_lift_calls"] = max_lift_calls
     payload["winner_result"] = (
         dict(winner_result) if winner_result is not None else None
     )
@@ -2135,6 +3482,7 @@ def save_candidate_fanout_report(
         f"- selection_rule: `{report.selection_rule}`",
         f"- lift_backend: `{lift_backend}`",
         f"- replay_backend: `{replay_backend}`",
+        f"- max_lift_calls: `{max_lift_calls}`",
         "- winner_branch_id: `"
         + (str(report.winner.branch_id) if report.winner is not None else "None")
         + "`",
@@ -2166,13 +3514,23 @@ def save_workload_failure(
     evidence: Mapping[str, Any] | None = None,
     runtime: WorkloadExecutionError | None = None,
 ) -> None:
+    if runtime is None and isinstance(error, WorkloadExecutionError):
+        runtime = error
     cause = runtime.cause if runtime is not None else error
+    partial_evidence = dict(runtime.evidence) if runtime is not None else {}
+    if evidence is not None:
+        partial_evidence.update(evidence)
+    if runtime is not None and runtime.stage_metrics:
+        partial_evidence["stage_metrics"] = {
+            str(name): dict(value)
+            for name, value in runtime.stage_metrics.items()
+        }
     _write_json(
         run_dir / "failure.json",
         {
             "failure_class": type(cause).__name__,
             "diagnostic": str(cause),
-            "partial_evidence": dict(evidence or {}),
+            "partial_evidence": partial_evidence,
         },
     )
     if runtime is not None:
@@ -2183,6 +3541,10 @@ def save_workload_failure(
                 extraction = record.extraction
                 _write_json(
                     call_dir / "artifact.json", extraction.artifact.to_json()
+                )
+                _write_json(
+                    call_dir / "layer_c_interface.json",
+                    extraction.layer_c_interface_payload,
                 )
                 (call_dir / "response.txt").write_text(
                     extraction.provenance.response_text, encoding="utf-8"
@@ -2237,7 +3599,18 @@ def save_workload_failure(
         ):
             call_dir = run_dir / f"gate1-call-{writer_index:02d}"
             call_dir.mkdir()
-            for record_index, record in enumerate(writer.records, start=1):
+            normal_writer = (
+                writer.normal
+                if isinstance(writer, RecordedReplayRound)
+                else writer
+            )
+            records = list(normal_writer.records)
+            masked_writer = (
+                writer.masked if isinstance(writer, RecordedReplayRound) else None
+            )
+            if masked_writer is not None:
+                records.extend(masked_writer.records)
+            for record_index, record in enumerate(records, start=1):
                 prefix = (
                     "replay"
                     if record_index == 1
@@ -2272,6 +3645,7 @@ __all__ = [
     "WorkloadExecutionError",
     "WorkloadGate1Search",
     "WorkloadGate1Recheck",
+    "WorkloadConsistencyResult",
     "build_workload_gate2_suite",
     "build_workload_jc_suite",
     "classify_scrc_report",
@@ -2286,6 +3660,7 @@ __all__ = [
     "recheck_prepared_workload_gate1",
     "retry_prepared_workload_gate1_fixed_artifact",
     "run_workload_lift_semantic_probe",
+    "run_prepared_workload_consistency",
     "save_candidate_fanout_report",
     "save_workload_execution",
     "save_workload_failure",

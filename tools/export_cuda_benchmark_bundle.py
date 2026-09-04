@@ -10,6 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
+
 import intentir.backend.cuda.compile as backend_compile
 from intentir.backend.ablation import (
     ExperimentArm,
@@ -39,7 +41,7 @@ from intentir.backend.cuda.production_cases import (
 )
 from intentir.backend.cuda.search import (
     admit_cuda_candidate_paths,
-    compile_cuda_candidate,
+    compile_cuda_target_plugin,
     derive_cuda_contract_view,
     enumerate_cuda_candidates,
     project_cuda_c_fixed_candidate,
@@ -53,6 +55,7 @@ from intentir.backend.portable_workload import encode_workload_recipe
 from intentir.backend.protocol import BackendTarget
 from intentir.backend.workload_cost import derive_j_workload_cost
 from intentir.ir.production_snapshot import load_production_snapshot
+from intentir.ir.value_dimension import resolve_runtime_output_shapes
 from intentir.verify.gate1._triton_worker import _normalize_deprecated_triton_dot
 from intentir.verify.gate2.scalar import ScalarLoweringRunner
 from intentir.verify.scrc_workload_run import build_workload_jc_suite
@@ -62,7 +65,17 @@ BUNDLE_PROTOCOL = "intentir.production.cuda-search-bundle.v3"
 
 
 def _shape(shape: list[int | str], dims: dict[str, int]) -> list[int]:
-    return [int(dims[item]) if isinstance(item, str) else item for item in shape]
+    resolved: list[int] = []
+    for item in shape:
+        if item == "?":
+            raise ValueError("input shape cannot contain a data-dependent extent")
+        if isinstance(item, str):
+            if item not in dims:
+                raise ValueError(f"input shape has an unbound J extent {item!r}")
+            resolved.append(int(dims[item]))
+        else:
+            resolved.append(int(item))
+    return resolved
 
 
 def _fixed_path_for_axes(
@@ -99,6 +112,30 @@ def _entry(
     comparison_policy.validate_j(snapshot.j)
     case = suite.cases[0]
     dims = case.refeval.dims_map
+    runtime_inputs = [
+        np.asarray(case.values[case.refeval.input_binding_map[item.name]])
+        for item in snapshot.j.intent.inputs
+    ]
+    runtime_output_shapes = resolve_runtime_output_shapes(
+        snapshot.j.intent,
+        [item.shape for item in snapshot.j.intent.outputs],
+        runtime_inputs,
+        dims=dims,
+    )
+    case_output_shapes = {
+        argument.output_key or argument.name: tuple(argument.shape or ())
+        for argument in case.triton.arguments
+        if argument.role.value in {"output", "inout"}
+    }
+    for output, shape in zip(
+        snapshot.j.intent.outputs, runtime_output_shapes, strict=True
+    ):
+        output_key = case.refeval.output_binding_map[output.name]
+        if case_output_shapes.get(output_key) != shape:
+            raise ValueError(
+                f"Harness output shape for {output.name!r} differs from the "
+                f"J-derived runtime shape: {case_output_shapes.get(output_key)} != {shape}"
+            )
     constexpr_bindings = constexpr_input_bindings(
         snapshot.j,
         case.refeval.input_binding_map,
@@ -109,21 +146,23 @@ def _entry(
         dims,
         constexpr_bindings=constexpr_bindings,
     )
+    target = BackendTarget("cuda", backend_compile.CHIP)
     workload_cost = derive_j_workload_cost(materialized)
     state = attach_c(
         materialized,
         snapshot.c,
-        BackendTarget("cuda", backend_compile.CHIP),
+        target,
     )
-    contract_view = derive_cuda_contract_view(state)
     unseeded_state = attach_c(
         materialized,
         None,
-        BackendTarget("cuda", backend_compile.CHIP),
+        target,
     )
+    seeded_contract = derive_cuda_contract_view(state)
     unseeded_contract = derive_cuda_contract_view(unseeded_state)
-    if contract_view.to_dict() != unseeded_contract.to_dict():
+    if seeded_contract.to_dict() != unseeded_contract.to_dict():
         raise AssertionError("ContractView changed when C was erased")
+    contract_view = unseeded_contract
     seeded_kind, seeded_fast_path = _fixed_path_for_axes(state, axes)
     unseeded_kind, unseeded_fast_path = _fixed_path_for_axes(
         unseeded_state, axes
@@ -222,7 +261,7 @@ def _entry(
             return existing
         started = time.perf_counter_ns()
         try:
-            program = compile_cuda_candidate(state, candidate)
+            program = compile_cuda_target_plugin(unseeded_state, candidate)
             concrete_state = candidate.concrete_state(program)
             extracted = extract_portable_launch(program, materialized.intent_mlir)
             result = {
@@ -465,6 +504,16 @@ def _entry(
             raise RuntimeError(f"canonical J reference failed: {reference.error}")
         else:
             reference_outputs = reference.outputs
+        for output, shape in zip(
+            snapshot.j.intent.outputs, runtime_output_shapes, strict=True
+        ):
+            output_key = case.refeval.output_binding_map[output.name]
+            actual_shape = tuple(np.asarray(reference_outputs[output_key]).shape)
+            if actual_shape != shape:
+                raise RuntimeError(
+                    f"canonical J output shape for {output.name!r} differs from "
+                    f"the J-derived runtime shape: {actual_shape} != {shape}"
+                )
         workload_payload = {
             "values": encode_values(case.values),
             "reference_outputs": encode_values(reference_outputs),
@@ -554,9 +603,12 @@ def _entry(
             {
                 "name": item.name,
                 "dtype": item.dtype,
-                "shape": _shape(item.shape, dims),
+                "shape": list(shape),
+                "shape_contract": list(item.shape),
             }
-            for item in snapshot.j.intent.outputs
+            for item, shape in zip(
+                snapshot.j.intent.outputs, runtime_output_shapes, strict=True
+            )
         ],
         "input_bindings": case.refeval.input_binding_map,
         "output_bindings": case.refeval.output_binding_map,

@@ -21,9 +21,23 @@ from typing import Any, ClassVar, TypeVar
 
 from intentir.ir.intent_op_contract import (
     IntentOpContractError,
+    canonicalize_dtype,
+    is_non_boolean_integer_dtype,
+    is_scalar_literal,
     validate_intent_op_structure,
 )
-from intentir.ir.model import IntentFunction
+from intentir.ir.dimension_relation import (
+    DIMENSION_INT64_MAX,
+    DIMENSION_RELATION_OPS,
+    declared_dimension_handles,
+)
+from intentir.ir.dim_expr import dimension_expression_references
+from intentir.ir.model import (
+    IntentFunction,
+    ValueType,
+    walk_intent_op_paths,
+    walk_intent_ops,
+)
 from intentir.verify.gate1.pi import (
     NORMALIZATION_WITNESS_SCHEMA,
     RealizationWitness,
@@ -133,10 +147,15 @@ def render_boundary_access_wire_grammar() -> str:
         "one EffectSpec whose kind, target, node_ref (including null), and "
         "access_ref exactly match that access. Do not move these facts to pi, "
         "omit the matching effect, or invent them when the source has none. "
+        "boundary.broadcasts is only an implicit operand-broadcast relation for "
+        "a map_binary or select node; never attach one to an explicit "
+        "broadcast_in_dim or another operation. "
         "For a predicated pure-functional boundary, the observable store "
         "producer carries an explicit result type equal to the J output. A "
-        "direct same-handle output needs no output_mapping; otherwise returns "
-        "or output_mappings may uniquely bind it, and both must agree if present. "
+        "direct same-handle output needs no output_mapping. Prefer a complete "
+        "returns list in output ABI order; output_mappings is sparse and may "
+        "also name an output only when its value exactly agrees with returns. "
+        "Do not omit a returns entry merely because an output_mapping exists. "
         "consumer_extensions is the sole artifact.v4+ authority for a physical "
         "outside-domain contribution to one sum/max/min reduce or scan operand. "
         "It references the predicate-bearing access instead of copying or "
@@ -231,12 +250,78 @@ def _strict_object(
     return result
 
 
+def _nested_root_owned_field_paths(
+    value: Any,
+    *,
+    path: str,
+) -> tuple[str, ...]:
+    """Find root-owned ``c``/``pi`` keys anywhere inside one J subtree.
+
+    ``c`` and ``pi`` are envelope siblings of ``j``. Checking only the first
+    few known containers is insufficient because a malformed candidate can
+    hide either key inside an operation, a conditional arm, a loop carry, or
+    an open JSON ``attrs`` object. Keep the traversal here so Gate1, Replay,
+    and the typed semantic archive share one ownership boundary.
+    """
+
+    found: list[str] = []
+
+    def visit(item: Any, item_path: str) -> None:
+        if isinstance(item, dict):
+            for key, child in item.items():
+                key_path = (
+                    f"{item_path}.{key}"
+                    if isinstance(key, str)
+                    else f"{item_path}[{key!r}]"
+                )
+                if key in {"c", "pi"}:
+                    found.append(key_path)
+                visit(child, key_path)
+        elif isinstance(item, list):
+            for index, child in enumerate(item):
+                visit(child, f"{item_path}[{index}]")
+
+    visit(value, path)
+    return tuple(found)
+
+
 def _string(value: Any, path: str, *, nonempty: bool = True) -> str:
     if not isinstance(value, str):
         raise SchemaError(f"{path} must be a string")
     if nonempty and not value:
         raise SchemaError(f"{path} must not be empty")
     return value
+
+
+def _handle(
+    value: Any,
+    path: str,
+    pattern: str,
+    description: str,
+) -> str:
+    result = _string(value, path)
+    if re.fullmatch(pattern, result) is None:
+        raise SchemaError(f"{path} must be {description}")
+    return result
+
+
+def _handle_list(
+    value: Any,
+    path: str,
+    pattern: str,
+    description: str,
+    *,
+    unique: bool = False,
+) -> list[str]:
+    if not isinstance(value, list):
+        raise SchemaError(f"{path} must be an array")
+    result = [
+        _handle(item, f"{path}[{index}]", pattern, description)
+        for index, item in enumerate(value)
+    ]
+    if unique and len(result) != len(set(result)):
+        raise SchemaError(f"{path} must not contain duplicates")
+    return result
 
 
 def _boolean(value: Any, path: str) -> bool:
@@ -289,6 +374,13 @@ def _dtype_key(value: str) -> str:
         "int16": "i16",
         "int32": "i32",
         "int64": "i64",
+        "index": "i64",
+        "uint8": "u8",
+        "uint16": "u16",
+        "uint32": "u32",
+        "ui8": "u8",
+        "ui16": "u16",
+        "ui32": "u32",
         "bool": "i1",
     }
     return aliases.get(key, key)
@@ -344,6 +436,12 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
     contract and checks its positional ``result``/``yield`` witnesses.
     """
 
+    nested_root_owned = _nested_root_owned_field_paths(value, path=path)
+    if nested_root_owned:
+        raise SchemaError(
+            f"{nested_root_owned[0]} is a root-owned field nested under J; "
+            "root.c and root.pi must be siblings of root.j"
+        )
     root = _object(value, path)
     if "intent_function" in root:
         root = _strict_object(
@@ -359,7 +457,7 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
         fn,
         path=f"{path}.intent_function",
         allowed={"name", "inputs", "outputs", "returns", "body"},
-        required={"name"},
+        required={"name", "inputs", "outputs", "returns", "body"},
     )
     _string(fn["name"], f"{path}.intent_function.name")
 
@@ -370,14 +468,31 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
             allowed={"name", "dtype", "shape"},
             required={"name", "dtype", "shape"},
         )
-        _string(tensor["name"], f"{tensor_path}.name")
-        _string(tensor["dtype"], f"{tensor_path}.dtype")
+        tensor_name = _string(tensor["name"], f"{tensor_path}.name")
+        if re.fullmatch(r"t[0-9]+", tensor_name) is None:
+            raise SchemaError(
+                f"{tensor_path}.name must be a logical tensor t* handle; "
+                "physical p* parameters belong only to J.signature.parameters"
+            )
+        try:
+            canonicalize_dtype(
+                tensor["dtype"], context=f"{tensor_path}.dtype"
+            )
+        except (TypeError, ValueError) as exc:
+            raise SchemaError(str(exc)) from exc
         shape = tensor["shape"]
         if not isinstance(shape, list):
             raise SchemaError(f"{tensor_path}.shape must be an array")
         for index, dim in enumerate(shape):
             if isinstance(dim, str):
                 _string(dim, f"{tensor_path}.shape[{index}]")
+                if re.search(
+                    r"(?<![A-Za-z0-9_])p[0-9]+(?![A-Za-z0-9_])", dim
+                ):
+                    raise SchemaError(
+                        f"{tensor_path}.shape[{index}] cannot reference "
+                        "physical parameter p* in a logical shape"
+                    )
             else:
                 _integer(dim, f"{tensor_path}.shape[{index}]", minimum=0)
 
@@ -392,8 +507,15 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
             validate_tensor(tensor, tensor_path)
             tensor_object = _object(tensor, tensor_path)
             name = _string(tensor_object["name"], f"{tensor_path}.name")
+            try:
+                tensor_dtype = canonicalize_dtype(
+                    tensor_object["dtype"],
+                    context=f"{tensor_path}.dtype",
+                )
+            except (TypeError, ValueError) as exc:
+                raise SchemaError(str(exc)) from exc
             contract = (
-                _string(tensor_object["dtype"], f"{tensor_path}.dtype"),
+                tensor_dtype,
                 list(tensor_object["shape"]),
             )
             previous = tensor_contracts.get(name)
@@ -412,48 +534,94 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
             tensor_contracts[name] = contract
             tensor_collections[name] = collection
 
+    # Keep the authored tensor portion of the value environment available
+    # while validating later operations.  ``tensor_contracts`` only covers
+    # the function boundary; derived values such as ``ragged_outer`` are
+    # checked as soon as their explicit operation type is encountered.
+    authored_value_contracts = dict(tensor_contracts)
+    authored_value_types: dict[str, ValueType] = {
+        name: ValueType.tensor(dtype, shape)
+        for name, (dtype, shape) in tensor_contracts.items()
+    }
+
     semantic_dimensions = {
-        dim
+        reference
         for _dtype, shape in tensor_contracts.values()
         for dim in shape
-        if isinstance(dim, str)
-    }
-    literal_initializers = {
-        "NEG_INF", "POS_INF", "ZERO", "ONE", "zeros", "ones",
-        "false", "true",
+        for reference in dimension_expression_references(dim)
+        if reference != "?"
     }
     declared_node_ids: set[str] = set()
     branch_local_definitions: set[str] = set()
 
     def is_literal_reference(item: Any) -> bool:
-        if item is None or isinstance(item, (bool, int, float)):
-            return True
-        if not isinstance(item, str):
-            return False
-        if item in literal_initializers:
-            return True
-        try:
-            float(item)
-        except ValueError:
-            return False
-        return True
+        return is_scalar_literal(item)
+
+    def require_tensor_handle(value: Any, value_path: str) -> str:
+        result = _string(value, value_path)
+        if re.fullmatch(r"t[0-9]+", result) is None:
+            raise SchemaError(
+                f"{value_path} must be a logical tensor t* handle; "
+                "physical p* parameters cannot be used as J values"
+            )
+        return result
+
+    def require_value_handle(value: Any, value_path: str) -> str:
+        result = _string(value, value_path)
+        if re.fullmatch(r"(?:t|v)[0-9]+", result) is None:
+            raise SchemaError(
+                f"{value_path} must reference a logical t* or SSA v* value; "
+                "physical p* parameters cannot be used in J"
+            )
+        return result
+
+    def require_ssa_handle(value: Any, value_path: str) -> str:
+        result = _string(value, value_path)
+        if re.fullmatch(r"v[0-9]+", result) is None:
+            raise SchemaError(
+                f"{value_path} must be an SSA v* handle; logical tensor t* "
+                "and physical parameter p* handles are not operation results"
+            )
+        return result
+
+    def require_dimension_handle(value: Any, value_path: str) -> str:
+        result = _string(value, value_path)
+        if re.fullmatch(r"x[0-9]+", result) is None:
+            raise SchemaError(
+                f"{value_path} must be a symbolic dimension x* handle"
+            )
+        return result
 
     def result_names(op: dict[str, Any], op_path: str) -> list[str]:
         result = op.get("result")
         if result is None:
             return []
         if isinstance(result, str):
-            return [_string(result, f"{op_path}.result")]
-        return _string_list(result, f"{op_path}.result", unique=True)
+            return [require_ssa_handle(result, f"{op_path}.result")]
+        values = _string_list(result, f"{op_path}.result", unique=True)
+        return [
+            require_ssa_handle(item, f"{op_path}.result[{index}]")
+            for index, item in enumerate(values)
+        ]
 
-    def validate_loop_type(item: Any, type_path: str) -> tuple[str, list[int | str]]:
+    def validate_value_type(item: Any, type_path: str) -> ValueType:
+        if isinstance(item, dict) and item.get("kind") in {"record", "ragged"}:
+            try:
+                return ValueType.from_json(item, context=type_path)
+            except (TypeError, ValueError) as exc:
+                raise SchemaError(str(exc)) from exc
         value_type = _strict_object(
             item,
             path=type_path,
             allowed={"dtype", "shape"},
             required={"dtype", "shape"},
         )
-        dtype = _string(value_type["dtype"], f"{type_path}.dtype")
+        try:
+            dtype = canonicalize_dtype(
+                value_type["dtype"], context=f"{type_path}.dtype"
+            )
+        except (TypeError, ValueError) as exc:
+            raise SchemaError(str(exc)) from exc
         shape = value_type["shape"]
         if not isinstance(shape, list):
             raise SchemaError(f"{type_path}.shape must be an array")
@@ -465,7 +633,18 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
                 normalized_shape.append(
                     _integer(dim, f"{type_path}.shape[{index}]", minimum=0)
                 )
-        return dtype, normalized_shape
+        return ValueType.tensor(dtype, normalized_shape)
+
+    def validate_record_type(item: Any, type_path: str) -> None:
+        if not isinstance(item, dict) or item.get("kind") != "record":
+            raise SchemaError(f"{type_path} must be a record value type")
+        try:
+            ValueType.from_json(item, context=type_path)
+        except (TypeError, ValueError) as exc:
+            raise SchemaError(str(exc)) from exc
+
+    def validate_loop_type(item: Any, type_path: str) -> ValueType:
+        return validate_value_type(item, type_path)
 
     def validate_sequence(
         items: Any,
@@ -511,12 +690,37 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
         op_name = _string(op["op"], f"{op_path}.op")
         if "id" in op:
             node_id = _string(op["id"], f"{op_path}.id")
+            if re.fullmatch(r"n[0-9]+", node_id) is None:
+                raise SchemaError(
+                    f"{op_path}.id must be a stable J node n* handle"
+                )
             if node_id in declared_node_ids:
                 raise SchemaError(f"{op_path}.id duplicates node id {node_id!r}")
             declared_node_ids.add(node_id)
         produced = result_names(op, op_path)
+
+        def remember_authored_tensor_types() -> None:
+            declared = op.get("type")
+            if not isinstance(declared, dict):
+                return
+            if len(produced) != 1:
+                return
+            value_type = validate_value_type(
+                declared, f"{op_path}.type"
+            )
+            authored_value_types[produced[0]] = value_type
+            if value_type.is_tensor:
+                authored_value_contracts[produced[0]] = (
+                    value_type.dtype,
+                    list(value_type.shape),
+                )
+
         if "operands" in op:
             operands = _string_list(op["operands"], f"{op_path}.operands")
+            for operand_index, operand in enumerate(operands):
+                require_value_handle(
+                    operand, f"{op_path}.operands[{operand_index}]"
+                )
             if strict_operands:
                 unknown_operands = sorted(
                     operand
@@ -531,49 +735,78 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
         for open_key in ("attrs", "type"):
             if open_key in op and op[open_key] is not None:
                 _json_value(op[open_key], f"{op_path}.{open_key}")
+        if (
+            isinstance(op.get("type"), dict)
+            and op["type"].get("kind") in {"record", "ragged"}
+        ):
+            validate_value_type(op["type"], f"{op_path}.type")
 
         if op_name in {"effect_if", "value_if"}:
-            predicate = _string(op["predicate"], f"{op_path}.predicate")
+            predicate = require_value_handle(
+                op["predicate"], f"{op_path}.predicate"
+            )
             if predicate not in visible:
                 raise SchemaError(
                     f"{op_path}.predicate references non-visible value "
                     f"{predicate!r}"
                 )
             arm_definitions: dict[str, set[str]] = {}
-            for polarity in ("positive", "negative"):
-                arm_path = f"{op_path}.{polarity}"
-                arm = _strict_object(
-                    op[polarity],
-                    path=arm_path,
-                    allowed=(
-                        {"scope_id", "body", "yield_value"}
-                        if op_name == "value_if"
-                        else {"scope_id", "body"}
-                    ),
-                    required=(
-                        {"scope_id", "body", "yield_value"}
-                        if op_name == "value_if"
-                        else {"scope_id", "body"}
-                    ),
-                )
-                _string(arm["scope_id"], f"{arm_path}.scope_id")
-                arm_visible_after, definitions = validate_sequence(
-                    arm["body"],
-                    f"{arm_path}.body",
-                    set(visible),
-                    strict_operands=True,
-                )
-                if op_name == "value_if":
-                    yield_value = _string(
-                        arm["yield_value"], f"{arm_path}.yield_value"
+            # Each arm is a sibling lexical region.  Start both arms from the
+            # same parent environment and discard every arm-local type/contract
+            # after validation; otherwise visiting positive first leaks its
+            # temporary producers into negative (and back into the parent), so
+            # type-dependent checks become traversal-order dependent.
+            parent_value_types = dict(authored_value_types)
+            parent_value_contracts = dict(authored_value_contracts)
+            try:
+                for polarity in ("positive", "negative"):
+                    authored_value_types.clear()
+                    authored_value_types.update(parent_value_types)
+                    authored_value_contracts.clear()
+                    authored_value_contracts.update(parent_value_contracts)
+                    arm_path = f"{op_path}.{polarity}"
+                    arm = _strict_object(
+                        op[polarity],
+                        path=arm_path,
+                        allowed=(
+                            {"scope_id", "body", "yield_value"}
+                            if op_name == "value_if"
+                            else {"scope_id", "body"}
+                        ),
+                        required=(
+                            {"scope_id", "body", "yield_value"}
+                            if op_name == "value_if"
+                            else {"scope_id", "body"}
+                        ),
                     )
-                    if yield_value not in arm_visible_after:
-                        raise SchemaError(
-                            f"{arm_path}.yield_value references value outside "
-                            f"the authored arm: {yield_value!r}"
+                    _handle(
+                        arm["scope_id"],
+                        f"{arm_path}.scope_id",
+                        r"q[0-9]+",
+                        "a q* portable-scope handle",
+                    )
+                    arm_visible_after, definitions = validate_sequence(
+                        arm["body"],
+                        f"{arm_path}.body",
+                        set(visible),
+                        strict_operands=True,
+                    )
+                    if op_name == "value_if":
+                        yield_value = require_value_handle(
+                            arm["yield_value"], f"{arm_path}.yield_value"
                         )
-                arm_definitions[polarity] = definitions
-                branch_local_definitions.update(definitions)
+                        if yield_value not in arm_visible_after:
+                            raise SchemaError(
+                                f"{arm_path}.yield_value references value outside "
+                                f"the authored arm: {yield_value!r}"
+                            )
+                    arm_definitions[polarity] = definitions
+                    branch_local_definitions.update(definitions)
+            finally:
+                authored_value_types.clear()
+                authored_value_types.update(parent_value_types)
+                authored_value_contracts.clear()
+                authored_value_contracts.update(parent_value_contracts)
             duplicates = sorted(
                 arm_definitions["positive"] & arm_definitions["negative"]
             )
@@ -585,24 +818,77 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
             # Arm-local SSA is deliberately not added to the parent-visible
             # set.  A value_if exports exactly its enclosing result; effect_if
             # remains resultless.
+            remember_authored_tensor_types()
             return produced if op_name == "value_if" else []
 
         if op_name != "loop":
+            remember_authored_tensor_types()
             return produced
 
-        loop_scope = _string(op["scope_id"], f"{op_path}.scope_id")
-
-        trip = _strict_object(
-            op["trip"],
-            path=f"{op_path}.trip",
-            allowed={"axis"},
-            required={"axis"},
+        loop_scope = _handle(
+            op["scope_id"],
+            f"{op_path}.scope_id",
+            r"q[0-9]+",
+            "a q* portable-scope handle",
         )
-        trip_axis = _string(trip["axis"], f"{op_path}.trip.axis")
-        if semantic_dimensions and trip_axis not in semantic_dimensions:
-            raise SchemaError(
-                f"{op_path}.trip.axis {trip_axis!r} is not a J tensor dimension"
+
+        trip = _object(op["trip"], f"{op_path}.trip")
+        dynamic_trip = "axis" not in trip
+        if not dynamic_trip:
+            trip = _strict_object(
+                trip,
+                path=f"{op_path}.trip",
+                allowed={"axis"},
+                required={"axis"},
             )
+            trip_axis = require_dimension_handle(
+                trip["axis"], f"{op_path}.trip.axis"
+            )
+            if semantic_dimensions and trip_axis not in semantic_dimensions:
+                raise SchemaError(
+                    f"{op_path}.trip.axis {trip_axis!r} is not a J tensor dimension"
+                )
+        else:
+            trip = _strict_object(
+                trip,
+                path=f"{op_path}.trip",
+                allowed={"upper_bound", "index"},
+                required={"upper_bound", "index"},
+            )
+            upper_bound = require_value_handle(
+                trip["upper_bound"], f"{op_path}.trip.upper_bound"
+            )
+            trip_index = require_ssa_handle(
+                trip["index"], f"{op_path}.trip.index"
+            )
+            if upper_bound not in visible:
+                raise SchemaError(
+                    f"{op_path}.trip.upper_bound references non-visible value "
+                    f"{upper_bound!r}"
+                )
+            if trip_index in visible:
+                raise SchemaError(
+                    f"{op_path}.trip.index must be local to the loop scope"
+                )
+            # The dynamic-loop ABI is intentionally narrower than MLIR's
+            # general integer type family: i1/bool is a predicate, not a
+            # meaningful trip or induction carrier.  Check any bound whose
+            # tensor type is already visible here; canonical J elaboration
+            # repeats the same rule after producer inference for derived
+            # values (for example ragged_outer).
+            bound_type = authored_value_types.get(upper_bound)
+            if bound_type is not None:
+                if (
+                    not bound_type.is_tensor
+                    or list(bound_type.shape) != []
+                    or not is_non_boolean_integer_dtype(
+                        _dtype_key(bound_type.dtype or "")
+                    )
+                ):
+                    raise SchemaError(
+                        f"{op_path}.trip.upper_bound must be a rank-0 "
+                        "non-boolean integer tensor"
+                    )
 
         scans = op["scan"]
         if not isinstance(scans, list):
@@ -616,18 +902,23 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
                 allowed={"name", "from", "axis"},
                 required={"name", "from", "axis"},
             )
-            scan_name = _string(scan["name"], f"{scan_path}.name")
-            source = _string(scan["from"], f"{scan_path}.from")
+            scan_name = require_ssa_handle(scan["name"], f"{scan_path}.name")
+            source = require_value_handle(scan["from"], f"{scan_path}.from")
             axis = _integer(scan["axis"], f"{scan_path}.axis", minimum=0)
             if source not in visible:
                 raise SchemaError(f"{scan_path}.from references non-visible value {source!r}")
             if scan_name in visible:
                 raise SchemaError(f"{scan_path}.name shadows outer value {scan_name!r}")
-            if source in tensor_contracts:
-                _dtype, source_shape = tensor_contracts[source]
+            source_type = authored_value_types.get(source)
+            if source_type is not None:
+                if not source_type.is_tensor:
+                    raise SchemaError(
+                        f"{scan_path}.from must reference a tensor value"
+                    )
+                source_shape = list(source_type.shape)
                 if axis >= len(source_shape):
                     raise SchemaError(f"{scan_path}.axis is outside source tensor rank")
-                if source_shape[axis] != trip_axis:
+                if not dynamic_trip and source_shape[axis] != trip_axis:
                     raise SchemaError(
                         f"{scan_path}.axis does not select semantic trip dimension "
                         f"{trip_axis!r}"
@@ -654,12 +945,28 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
                     "result_value", "type",
                 },
             )
-            state_id = _string(carry["state_id"], f"{carry_path}.state_id")
-            body_argument = _string(carry["body_argument"], f"{carry_path}.body_argument")
-            next_value = _string(carry["next_value"], f"{carry_path}.next_value")
-            result_value = _string(carry["result_value"], f"{carry_path}.result_value")
+            state_id = _handle(
+                carry["state_id"],
+                f"{carry_path}.state_id",
+                r"s[0-9]+",
+                "an s* loop-state handle",
+            )
+            body_argument = require_ssa_handle(
+                carry["body_argument"], f"{carry_path}.body_argument"
+            )
+            next_value = require_ssa_handle(
+                carry["next_value"], f"{carry_path}.next_value"
+            )
+            result_value = require_ssa_handle(
+                carry["result_value"], f"{carry_path}.result_value"
+            )
             init_value = _json_value(carry["init_value"], f"{carry_path}.init_value")
-            dtype, shape = validate_loop_type(carry["type"], f"{carry_path}.type")
+            carry_type = validate_loop_type(carry["type"], f"{carry_path}.type")
+            if init_value is None:
+                raise SchemaError(
+                    f"{carry_path}.init_value must be an authored scalar literal "
+                    "or a visible value reference"
+                )
             if not is_literal_reference(init_value):
                 if not isinstance(init_value, str):
                     raise SchemaError(
@@ -671,9 +978,9 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
                         f"{carry_path}.init_value references non-visible "
                         f"value {init_value!r}"
                     )
-            if isinstance(init_value, str) and init_value in tensor_contracts:
-                init_dtype, init_shape = tensor_contracts[init_value]
-                if _dtype_key(dtype) != _dtype_key(init_dtype) or shape != init_shape:
+            if isinstance(init_value, str) and not is_literal_reference(init_value):
+                init_type = authored_value_types.get(init_value)
+                if init_type is not None and init_type != carry_type:
                     raise SchemaError(
                         f"{carry_path}.type must match referenced init_value type"
                     )
@@ -691,8 +998,7 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
                     "body_argument": body_argument,
                     "next_value": next_value,
                     "result_value": result_value,
-                    "dtype": dtype,
-                    "shape": shape,
+                    "type": carry_type,
                 }
             )
 
@@ -700,6 +1006,21 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
             values = [state[key] for state in states]
             if len(values) != len(set(values)):
                 raise SchemaError(f"{op_path}.carry {key} values must be unique")
+
+        role_values = [
+            value
+            for state in states
+            for value in (
+                state["body_argument"],
+                state["next_value"],
+                state["result_value"],
+            )
+        ]
+        if len(role_values) != len(set(role_values)):
+            raise SchemaError(
+                f"{op_path}.carry body_argument/next_value/result_value "
+                "handles must be distinct across all states"
+            )
 
         expected_results = [state["result_value"] for state in states]
         expected_yields = [state["next_value"] for state in states]
@@ -716,59 +1037,146 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
         body_visible = set(visible) | set(scan_names) | {
             state["body_argument"] for state in states
         }
-        _body_visible_after, body_definitions = validate_sequence(
-            op["body"], f"{op_path}.body", body_visible,
-            strict_operands=True,
+        if dynamic_trip:
+            if scan_names:
+                raise SchemaError(
+                    f"{op_path}.scan must be empty for a dynamic value trip"
+                )
+            if trip_index in scan_names or trip_index in {
+                state["body_argument"] for state in states
+            }:
+                raise SchemaError(
+                    f"{op_path}.trip.index must be distinct from scan and carry bindings"
+                )
+            body_visible.add(trip_index)
+
+        local_non_carry_bindings = set(scan_names)
+        if dynamic_trip:
+            local_non_carry_bindings.add(trip_index)
+        role_export_collisions = sorted(
+            {
+                name
+                for state in states
+                for name in (state["next_value"], state["result_value"])
+                if name in local_non_carry_bindings
+            }
         )
+        if role_export_collisions:
+            raise SchemaError(
+                f"{op_path}.carry next_value/result_value must be distinct "
+                "from loop-local scan/induction bindings: "
+                + ", ".join(role_export_collisions)
+            )
+
+        outer_value_types = dict(authored_value_types)
+        outer_value_contracts = dict(authored_value_contracts)
+        for scan_name in scan_names:
+            source = next(
+                scan_item["from"]
+                for scan_item in scans
+                if scan_item["name"] == scan_name
+            )
+            source_type = outer_value_types.get(source)
+            if source_type is not None:
+                authored_value_types[scan_name] = source_type
+                if source_type.is_tensor:
+                    authored_value_contracts[scan_name] = (
+                        source_type.dtype,
+                        list(source_type.shape),
+                    )
+        for state in states:
+            authored_value_types[state["body_argument"]] = state["type"]
+            if state["type"].is_tensor:
+                authored_value_contracts[state["body_argument"]] = (
+                    state["type"].dtype,
+                    list(state["type"].shape),
+                )
+        if dynamic_trip:
+            upper_type = outer_value_types.get(upper_bound)
+            if upper_type is not None:
+                authored_value_types[trip_index] = upper_type
+                if upper_type.is_tensor:
+                    authored_value_contracts[trip_index] = (
+                        upper_type.dtype,
+                        list(upper_type.shape),
+                    )
+        try:
+            _body_visible_after, body_definitions = validate_sequence(
+                op["body"], f"{op_path}.body", body_visible,
+                strict_operands=True,
+            )
+        finally:
+            authored_value_types.clear()
+            authored_value_types.update(outer_value_types)
+            authored_value_contracts.clear()
+            authored_value_contracts.update(outer_value_contracts)
         missing_next = sorted(set(expected_yields) - body_definitions)
         if missing_next:
             raise SchemaError(
                 f"{op_path}.carry next_value must be defined in the loop body: "
                 + ", ".join(missing_next)
             )
+        body_result_collisions = sorted(
+            set(expected_results) & body_definitions
+        )
+        if body_result_collisions:
+            raise SchemaError(
+                f"{op_path}.carry result_value must be owned by the loop, "
+                "not defined by its body: "
+                + ", ".join(body_result_collisions)
+            )
 
-        def produced_type(
-            operations: list[dict[str, Any]], value_name: str,
-        ) -> tuple[str, list[int | str]] | None:
-            for child_index, child in enumerate(operations):
+        def produced_type(value_name: str) -> ValueType | None:
+            """Return only a directly exported loop-body producer type.
+
+            A value created inside a conditional arm is not visible at the
+            loop body boundary.  Searching nested ``body`` arrays here used to
+            turn such a branch-local value into a legal loop yield.
+            """
+
+            for child_index, child in enumerate(op["body"]):
                 child_results = child.get("result")
                 names = (
                     [child_results]
                     if isinstance(child_results, str)
                     else list(child_results or [])
                 )
-                if value_name in names:
-                    if child.get("op") == "loop":
-                        result_index = names.index(value_name)
-                        carry_items = child.get("carry", [])
-                        if result_index < len(carry_items):
-                            return validate_loop_type(
-                                carry_items[result_index].get("type"),
-                                f"{op_path}.body[{child_index}].carry"
-                                f"[{result_index}].type",
-                            )
-                    if "type" not in child or child["type"] is None:
-                        return None
-                    return validate_loop_type(
-                        child["type"], f"{op_path}.body[{child_index}].type"
-                    )
-                nested = child.get("body", [])
-                if isinstance(nested, list):
-                    found = produced_type(nested, value_name)
-                    if found is not None:
-                        return found
+                if value_name not in names:
+                    continue
+                if child.get("op") == "loop":
+                    result_index = names.index(value_name)
+                    carry_items = child.get("carry", [])
+                    if result_index < len(carry_items):
+                        return validate_loop_type(
+                            carry_items[result_index].get("type"),
+                            f"{op_path}.body[{child_index}].carry"
+                            f"[{result_index}].type",
+                        )
+                if "type" not in child or child["type"] is None:
+                    return None
+                return validate_value_type(
+                    child["type"], f"{op_path}.body[{child_index}].type"
+                )
             return None
 
         for state in states:
-            next_type = produced_type(op["body"], state["next_value"])
+            next_type = produced_type(state["next_value"])
             if next_type is None:
                 raise SchemaError(
                     f"{op_path}.carry next_value {state['next_value']!r} "
                     "requires an explicit producer type"
                 )
-            if next_type != (state["dtype"], state["shape"]):
+            if next_type != state["type"]:
                 raise SchemaError(
                     f"{op_path}.carry state type must exactly match next/yield type"
+                )
+        for result_name, state in zip(produced, states, strict=True):
+            state_type = state["type"]
+            authored_value_types[result_name] = state_type
+            if state_type.kind == "tensor":
+                authored_value_contracts[result_name] = (
+                    state_type.dtype,
+                    list(state_type.shape),
                 )
         return produced
 
@@ -783,7 +1191,10 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
         strict_operands=True,
     )
     output_names = [
-        _string(tensor["name"], f"{path}.intent_function.outputs[{index}].name")
+        require_tensor_handle(
+            tensor["name"],
+            f"{path}.intent_function.outputs[{index}].name",
+        )
         for index, tensor in enumerate(fn.get("outputs", []))
     ]
     escaped_outputs = sorted(set(output_names) & branch_local_definitions)
@@ -792,30 +1203,29 @@ def _strict_intent(value: Any, path: str = "SemanticArchive.intent") -> IntentFu
             "conditional arm-local value(s) cannot implicitly define function "
             "outputs: " + ", ".join(escaped_outputs)
         )
-    if "returns" in fn:
-        returns = fn["returns"]
-        if not isinstance(returns, list):
-            raise SchemaError(f"{path}.intent_function.returns must be an array")
-        returned_outputs: list[str] = []
-        for index, item in enumerate(returns):
-            return_path = f"{path}.intent_function.returns[{index}]"
-            binding = _strict_object(
-                item,
-                path=return_path,
-                allowed={"output", "value"},
-                required={"output", "value"},
-            )
-            output = _string(binding["output"], f"{return_path}.output")
-            value = _string(binding["value"], f"{return_path}.value")
-            returned_outputs.append(output)
-            if value not in visible_after:
-                raise SchemaError(
-                    f"{return_path}.value references unknown Layer-A value {value!r}"
-                )
-        if returned_outputs != output_names:
+    returns = fn["returns"]
+    if not isinstance(returns, list):
+        raise SchemaError(f"{path}.intent_function.returns must be an array")
+    returned_outputs: list[str] = []
+    for index, item in enumerate(returns):
+        return_path = f"{path}.intent_function.returns[{index}]"
+        binding = _strict_object(
+            item,
+            path=return_path,
+            allowed={"output", "value"},
+            required={"output", "value"},
+        )
+        output = require_tensor_handle(binding["output"], f"{return_path}.output")
+        value = require_value_handle(binding["value"], f"{return_path}.value")
+        returned_outputs.append(output)
+        if value not in visible_after:
             raise SchemaError(
-                "IntentFunction.returns must cover outputs once and in ABI order"
+                f"{return_path}.value references unknown Layer-A value {value!r}"
             )
+    if returned_outputs != output_names:
+        raise SchemaError(
+            "IntentFunction.returns must cover outputs once and in ABI order"
+        )
 
     normalized = {"intent_function": copy.deepcopy(fn)}
     return IntentFunction.from_json(normalized)
@@ -963,14 +1373,29 @@ class BoundaryAccess(StrictJSONMixin):
     _KEYS: ClassVar[set[str]] = set(BOUNDARY_ACCESS_WIRE_FIELDS)
 
     def __post_init__(self) -> None:
-        self.access_id = _string(self.access_id, "BoundaryAccess.access_id")
+        self.access_id = _handle(
+            self.access_id,
+            "BoundaryAccess.access_id",
+            r"a[0-9]+",
+            "an a* access handle",
+        )
         self.kind = _enum(AccessKind, self.kind, "BoundaryAccess.kind")
-        self.tensor = _string(self.tensor, "BoundaryAccess.tensor")
+        self.tensor = _handle(
+            self.tensor,
+            "BoundaryAccess.tensor",
+            r"t[0-9]+",
+            "a logical tensor t* handle",
+        )
         if self.predicate is not None:
             self.predicate = _string(self.predicate, "BoundaryAccess.predicate")
         self.fill_value = _json_value(self.fill_value, "BoundaryAccess.fill_value")
         if self.node_ref is not None:
-            self.node_ref = _string(self.node_ref, "BoundaryAccess.node_ref")
+            self.node_ref = _handle(
+                self.node_ref,
+                "BoundaryAccess.node_ref",
+                r"n[0-9]+",
+                "an n* node handle",
+            )
         if self.index_expression is not None:
             self.index_expression = _string(
                 self.index_expression, "BoundaryAccess.index_expression"
@@ -1023,8 +1448,18 @@ class BroadcastSpec(StrictJSONMixin):
     axes: list[int | str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.node_ref = _string(self.node_ref, "BroadcastSpec.node_ref")
-        self.operand = _string(self.operand, "BroadcastSpec.operand")
+        self.node_ref = _handle(
+            self.node_ref,
+            "BroadcastSpec.node_ref",
+            r"n[0-9]+",
+            "an n* node handle",
+        )
+        self.operand = _handle(
+            self.operand,
+            "BroadcastSpec.operand",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+        )
         checked: list[int | str] = []
         for index, axis in enumerate(self.axes):
             if isinstance(axis, bool) or not isinstance(axis, (int, str)):
@@ -1056,11 +1491,17 @@ class AccessGuardRelation(StrictJSONMixin):
     polarity: AccessGuardPolarity
 
     def __post_init__(self) -> None:
-        self.access_ref = _string(
-            self.access_ref, "AccessGuardRelation.access_ref"
+        self.access_ref = _handle(
+            self.access_ref,
+            "AccessGuardRelation.access_ref",
+            r"a[0-9]+",
+            "an a* access handle",
         )
-        self.value_ref = _string(
-            self.value_ref, "AccessGuardRelation.value_ref"
+        self.value_ref = _handle(
+            self.value_ref,
+            "AccessGuardRelation.value_ref",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
         )
         if not isinstance(self.axes, list):
             raise SchemaError("AccessGuardRelation.axes must be an array")
@@ -1111,8 +1552,22 @@ class AliasSpec(StrictJSONMixin):
     kind: AliasKind = AliasKind.MAY_ALIAS
 
     def __post_init__(self) -> None:
-        self.left = _string(self.left, "AliasSpec.left")
-        self.right = _string(self.right, "AliasSpec.right")
+        self.left = _handle(
+            self.left,
+            "AliasSpec.left",
+            r"(?:t|v|s)[0-9]+",
+            "a logical value/storage t*/v*/s* handle",
+        )
+        self.right = _handle(
+            self.right,
+            "AliasSpec.right",
+            r"(?:t|v|s)[0-9]+",
+            "a logical value/storage t*/v*/s* handle",
+        )
+        if self.left == self.right:
+            raise SchemaError(
+                "AliasSpec endpoints must name two distinct logical handles"
+            )
         self.kind = _enum(AliasKind, self.kind, "AliasSpec.kind")
 
     @classmethod
@@ -1137,13 +1592,33 @@ class EffectSpec(StrictJSONMixin):
 
     def __post_init__(self) -> None:
         self.kind = _enum(EffectKind, self.kind, "EffectSpec.kind")
-        self.target = _string(self.target, "EffectSpec.target")
+        self.target = _handle(
+            self.target,
+            "EffectSpec.target",
+            r"(?:t|v|s)[0-9]+",
+            "a logical value/storage t*/v*/s* handle",
+        )
         if self.node_ref is not None:
-            self.node_ref = _string(self.node_ref, "EffectSpec.node_ref")
+            self.node_ref = _handle(
+                self.node_ref,
+                "EffectSpec.node_ref",
+                r"n[0-9]+",
+                "an n* node handle",
+            )
         if self.effect_id is not None:
-            self.effect_id = _string(self.effect_id, "EffectSpec.effect_id")
+            self.effect_id = _handle(
+                self.effect_id,
+                "EffectSpec.effect_id",
+                r"e[0-9]+",
+                "an e* effect handle",
+            )
         if self.access_ref is not None:
-            self.access_ref = _string(self.access_ref, "EffectSpec.access_ref")
+            self.access_ref = _handle(
+                self.access_ref,
+                "EffectSpec.access_ref",
+                r"a[0-9]+",
+                "an a* access handle",
+            )
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "EffectSpec":
@@ -1178,10 +1653,25 @@ class OutputMapping(StrictJSONMixin):
     node_ref: str | None = None
 
     def __post_init__(self) -> None:
-        self.output = _string(self.output, "OutputMapping.output")
-        self.value = _string(self.value, "OutputMapping.value")
+        self.output = _handle(
+            self.output,
+            "OutputMapping.output",
+            r"t[0-9]+",
+            "a logical tensor t* handle",
+        )
+        self.value = _handle(
+            self.value,
+            "OutputMapping.value",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+        )
         if self.node_ref is not None:
-            self.node_ref = _string(self.node_ref, "OutputMapping.node_ref")
+            self.node_ref = _handle(
+                self.node_ref,
+                "OutputMapping.node_ref",
+                r"n[0-9]+",
+                "an n* node handle",
+            )
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "OutputMapping":
@@ -1214,7 +1704,12 @@ class ReductionBoundary(StrictJSONMixin):
     masked_contribution: JsonValue = None
 
     def __post_init__(self) -> None:
-        self.node_ref = _string(self.node_ref, "ReductionBoundary.node_ref")
+        self.node_ref = _handle(
+            self.node_ref,
+            "ReductionBoundary.node_ref",
+            r"n[0-9]+",
+            "an n* node handle",
+        )
         if isinstance(self.tile_axis, bool) or not isinstance(self.tile_axis, (int, str)):
             raise SchemaError("ReductionBoundary.tile_axis must be an integer or string")
         if isinstance(self.tile_axis, int) and self.tile_axis < 0:
@@ -1265,7 +1760,13 @@ class TypedOutsideValue(StrictJSONMixin):
     value: JsonValue
 
     def __post_init__(self) -> None:
-        self.dtype = _string(self.dtype, "TypedOutsideValue.dtype")
+        try:
+            self.dtype = canonicalize_dtype(
+                self.dtype,
+                context="TypedOutsideValue.dtype",
+            )
+        except (TypeError, ValueError) as exc:
+            raise SchemaError(str(exc)) from exc
         self.value = _json_value(self.value, "TypedOutsideValue.value")
         if self.value is None or isinstance(self.value, (list, dict)):
             raise SchemaError("TypedOutsideValue.value must be a JSON scalar")
@@ -1301,16 +1802,22 @@ class ConsumerExtension(StrictJSONMixin):
     identity_law: str
 
     def __post_init__(self) -> None:
-        self.consumer_ref = _string(
-            self.consumer_ref, "ConsumerExtension.consumer_ref"
+        self.consumer_ref = _handle(
+            self.consumer_ref,
+            "ConsumerExtension.consumer_ref",
+            r"n[0-9]+",
+            "an n* node handle",
         )
         self.operand_index = _integer(
             self.operand_index,
             "ConsumerExtension.operand_index",
             minimum=0,
         )
-        self.access_ref = _string(
-            self.access_ref, "ConsumerExtension.access_ref"
+        self.access_ref = _handle(
+            self.access_ref,
+            "ConsumerExtension.access_ref",
+            r"a[0-9]+",
+            "an a* access handle",
         )
         self.tile_axis = _integer(
             self.tile_axis, "ConsumerExtension.tile_axis", minimum=0
@@ -1383,9 +1890,24 @@ class IndexBoundsSpec(StrictJSONMixin):
     axis: int
 
     def __post_init__(self) -> None:
-        self.node_ref = _string(self.node_ref, "IndexBoundsSpec.node_ref")
-        self.data = _string(self.data, "IndexBoundsSpec.data")
-        self.indices = _string(self.indices, "IndexBoundsSpec.indices")
+        self.node_ref = _handle(
+            self.node_ref,
+            "IndexBoundsSpec.node_ref",
+            r"n[0-9]+",
+            "an n* node handle",
+        )
+        self.data = _handle(
+            self.data,
+            "IndexBoundsSpec.data",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+        )
+        self.indices = _handle(
+            self.indices,
+            "IndexBoundsSpec.indices",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+        )
         self.axis = _integer(self.axis, "IndexBoundsSpec.axis", minimum=0)
 
     @classmethod
@@ -1409,7 +1931,7 @@ class IndexBoundsSpec(StrictJSONMixin):
 
 @dataclass
 class LogicalUpdateSpec(StrictJSONMixin):
-    """Source-neutral logical update; atomic realization belongs to pi/backend."""
+    """Source-neutral logical update, including complete compare-exchange roles."""
 
     node_ref: str
     base: str
@@ -1419,12 +1941,48 @@ class LogicalUpdateSpec(StrictJSONMixin):
     combiner: UpdateCombiner
     duplicate_policy: DuplicatePolicy
     order: UpdateOrder
+    compare: str | None = None
+    observed: str | None = None
 
     def __post_init__(self) -> None:
-        self.node_ref = _string(self.node_ref, "LogicalUpdateSpec.node_ref")
-        self.base = _string(self.base, "LogicalUpdateSpec.base")
-        self.indices = _string(self.indices, "LogicalUpdateSpec.indices")
-        self.values = _string(self.values, "LogicalUpdateSpec.values")
+        self.node_ref = _handle(
+            self.node_ref,
+            "LogicalUpdateSpec.node_ref",
+            r"n[0-9]+",
+            "an n* node handle",
+        )
+        self.base = _handle(
+            self.base,
+            "LogicalUpdateSpec.base",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+        )
+        self.indices = _handle(
+            self.indices,
+            "LogicalUpdateSpec.indices",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+        )
+        self.values = _handle(
+            self.values,
+            "LogicalUpdateSpec.values",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+        )
+        if self.compare is not None:
+            self.compare = _handle(
+                self.compare,
+                "LogicalUpdateSpec.compare",
+                r"(?:t|v)[0-9]+",
+                "a logical value t*/v* handle",
+            )
+        if self.observed is not None:
+            self.observed = _handle(
+                self.observed,
+                "LogicalUpdateSpec.observed",
+                r"(?:t|v)[0-9]+",
+                "a logical value t*/v* handle",
+            )
         self.axis = _integer(self.axis, "LogicalUpdateSpec.axis", minimum=0)
         self.combiner = _enum(
             UpdateCombiner, self.combiner, "LogicalUpdateSpec.combiner"
@@ -1460,7 +2018,7 @@ class LogicalUpdateSpec(StrictJSONMixin):
             path="LogicalUpdateSpec",
             allowed={
                 "node_ref", "base", "indices", "values", "axis",
-                "combiner", "duplicate_policy", "order",
+                "combiner", "duplicate_policy", "order", "compare", "observed",
             },
             required={
                 "node_ref", "base", "indices", "values", "axis",
@@ -1476,6 +2034,8 @@ class LogicalUpdateSpec(StrictJSONMixin):
             combiner=data["combiner"],
             duplicate_policy=data["duplicate_policy"],
             order=data["order"],
+            compare=data.get("compare"),
+            observed=data.get("observed"),
         )
 
     def to_json(self) -> dict[str, Any]:
@@ -1489,6 +2049,10 @@ class LogicalUpdateSpec(StrictJSONMixin):
             "duplicate_policy": self.duplicate_policy.value,
             "order": self.order.value,
         }
+        if self.compare is not None:
+            result["compare"] = self.compare
+        if self.observed is not None:
+            result["observed"] = self.observed
         return result
 
 
@@ -1506,7 +2070,12 @@ class ResultRelationSpec(StrictJSONMixin):
     update_node_ref: str | None = None
 
     def __post_init__(self) -> None:
-        self.output = _string(self.output, "ResultRelationSpec.output")
+        self.output = _handle(
+            self.output,
+            "ResultRelationSpec.output",
+            r"t[0-9]+",
+            "a logical tensor t* handle",
+        )
         self.kind = _enum(
             ResultRelationKind, self.kind, "ResultRelationSpec.kind"
         )
@@ -1515,8 +2084,11 @@ class ResultRelationSpec(StrictJSONMixin):
                 raise SchemaError(
                     "one_of_updates result relation requires update_node_ref"
                 )
-            self.update_node_ref = _string(
-                self.update_node_ref, "ResultRelationSpec.update_node_ref"
+            self.update_node_ref = _handle(
+                self.update_node_ref,
+                "ResultRelationSpec.update_node_ref",
+                r"n[0-9]+",
+                "an n* node handle",
             )
         else:
             if self.update_node_ref is not None:
@@ -1672,6 +2244,15 @@ class Boundary(StrictJSONMixin):
             item if isinstance(item, AliasSpec) else AliasSpec.from_json(item)
             for item in self.aliases
         ]
+        seen_alias_pairs: set[tuple[str, str]] = set()
+        for item in self.aliases:
+            pair = tuple(sorted((item.left, item.right)))
+            if pair in seen_alias_pairs:
+                raise SchemaError(
+                    "Boundary.aliases may declare each unordered endpoint pair "
+                    "only once"
+                )
+            seen_alias_pairs.add(pair)
         self.effects = [
             item if isinstance(item, EffectSpec) else EffectSpec.from_json(item)
             for item in self.effects
@@ -1729,6 +2310,7 @@ class Boundary(StrictJSONMixin):
         ]
         _unique(self.accesses, "access_id", "Boundary.accesses")
         _unique(self.effects, "effect_id", "Boundary.effects")
+        _unique(self.output_mappings, "output", "Boundary.output_mappings")
         access_ids = {item.access_id for item in self.accesses}
         unknown_effect_accesses = sorted(
             item.access_ref
@@ -1869,20 +2451,40 @@ class PortableScope(StrictJSONMixin):
     effects: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.scope_id = _string(self.scope_id, "PortableScope.scope_id")
+        self.scope_id = _handle(
+            self.scope_id,
+            "PortableScope.scope_id",
+            r"q[0-9]+",
+            "a q* portable-scope handle",
+        )
         self.kind = _enum(ScopeKind, self.kind, "PortableScope.kind")
         if self.parent_scope is not None:
-            self.parent_scope = _string(
-                self.parent_scope, "PortableScope.parent_scope"
+            self.parent_scope = _handle(
+                self.parent_scope,
+                "PortableScope.parent_scope",
+                r"q[0-9]+",
+                "a q* portable-scope handle",
             )
-        self.captures = _string_list(
-            self.captures, "PortableScope.captures", unique=True
+        self.captures = _handle_list(
+            self.captures,
+            "PortableScope.captures",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+            unique=True,
         )
-        self.definitions = _string_list(
-            self.definitions, "PortableScope.definitions", unique=True
+        self.definitions = _handle_list(
+            self.definitions,
+            "PortableScope.definitions",
+            r"(?:t|v)[0-9]+",
+            "a logical value t*/v* handle",
+            unique=True,
         )
-        self.effects = _string_list(
-            self.effects, "PortableScope.effects", unique=True
+        self.effects = _handle_list(
+            self.effects,
+            "PortableScope.effects",
+            r"e[0-9]+",
+            "an e* effect handle",
+            unique=True,
         )
         overlap = sorted(set(self.captures) & set(self.definitions))
         if overlap:
@@ -1940,7 +2542,20 @@ class SemanticEventRef(StrictJSONMixin):
             raise SchemaError(
                 f"SemanticEventRef kind {self.kind.value!r} requires ref"
             )
-        self.ref = _string(self.ref, "SemanticEventRef.ref")
+        patterns = {
+            SemanticEventKind.SCOPE_ENTRY: (
+                r"q[0-9]+", "a q* portable-scope handle"
+            ),
+            SemanticEventKind.SCOPE_EXIT: (
+                r"q[0-9]+", "a q* portable-scope handle"
+            ),
+            SemanticEventKind.NODE: (r"n[0-9]+", "an n* node handle"),
+            SemanticEventKind.ACCESS: (r"a[0-9]+", "an a* access handle"),
+            SemanticEventKind.STATE: (r"s[0-9]+", "an s* loop-state handle"),
+            SemanticEventKind.EFFECT: (r"e[0-9]+", "an e* effect handle"),
+        }
+        pattern, description = patterns[self.kind]
+        self.ref = _handle(self.ref, "SemanticEventRef.ref", pattern, description)
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "SemanticEventRef":
@@ -1970,13 +2585,27 @@ class StorageObject(StrictJSONMixin):
     crosses_iteration: bool
 
     def __post_init__(self) -> None:
-        self.storage_id = _string(self.storage_id, "StorageObject.storage_id")
-        self.members = _string_list(
-            self.members, "StorageObject.members", unique=True
+        self.storage_id = _handle(
+            self.storage_id,
+            "StorageObject.storage_id",
+            r"(?:b|s)[0-9]+",
+            "a b*/s* storage handle",
+        )
+        self.members = _handle_list(
+            self.members,
+            "StorageObject.members",
+            r"(?:t|v|s)[0-9]+",
+            "a logical value/storage t*/v*/s* handle",
+            unique=True,
         )
         if not self.members:
             raise SchemaError("StorageObject.members must not be empty")
-        self.scope_id = _string(self.scope_id, "StorageObject.scope_id")
+        self.scope_id = _handle(
+            self.scope_id,
+            "StorageObject.scope_id",
+            r"q[0-9]+",
+            "a q* portable-scope handle",
+        )
         self.mutability = _enum(
             StorageMutability, self.mutability, "StorageObject.mutability"
         )
@@ -2118,9 +2747,34 @@ def _validate_typed_boundary_relations(archive: "SemanticArchive") -> None:
             raise SchemaError(
                 "LogicalUpdateSpec currently requires scatter mode='along_axis'"
             )
-        if len(op.operands) != 3:
-            raise SchemaError("scatter update requires base, indices, and values")
-        if [item.base, item.indices, item.values] != list(op.operands):
+        is_cas = op.attrs.get("atomic") == "cas"
+        if is_cas:
+            if (
+                len(op.operands) != 4
+                or not isinstance(op.result, list)
+                or len(op.result) != 2
+                or item.compare != op.operands[2]
+                or item.observed != op.result[1]
+            ):
+                raise SchemaError(
+                    "compare-exchange update requires data, indices, compare, "
+                    "replacement, updated, and observed bindings"
+                )
+            expected_operands = [
+                item.base,
+                item.indices,
+                item.compare,
+                item.values,
+            ]
+        else:
+            if item.compare is not None or item.observed is not None:
+                raise SchemaError(
+                    "compare and observed update bindings require atomic='cas'"
+                )
+            if len(op.operands) != 3:
+                raise SchemaError("scatter update requires base, indices, and values")
+            expected_operands = [item.base, item.indices, item.values]
+        if expected_operands != list(op.operands):
             raise SchemaError(
                 "LogicalUpdateSpec operands do not match the target scatter"
             )
@@ -2168,10 +2822,15 @@ def _validate_typed_boundary_relations(archive: "SemanticArchive") -> None:
             "canonical J scatter requires a typed LogicalUpdateSpec"
         )
 
-    outputs = {item.name for item in archive.intent.outputs}
+    output_names = [item.name for item in archive.intent.outputs]
+    outputs = set(output_names)
     return_values = {item.output: item.value for item in archive.intent.returns}
     if len(return_values) != len(archive.intent.returns):
         raise SchemaError("IntentFunction returns contain duplicate outputs")
+    if [item.output for item in archive.intent.returns] != output_names:
+        raise SchemaError(
+            "IntentFunction returns must cover outputs once and in ABI order"
+        )
     unknown_return_outputs = sorted(set(return_values) - outputs)
     if unknown_return_outputs:
         raise SchemaError(
@@ -2181,9 +2840,25 @@ def _validate_typed_boundary_relations(archive: "SemanticArchive") -> None:
     mapping_values = {
         item.output: item.value for item in archive.boundary.output_mappings
     }
+    unknown_mapping_outputs = sorted(set(mapping_values) - outputs)
+    if unknown_mapping_outputs:
+        raise SchemaError(
+            "Boundary.output_mappings reference unknown outputs: "
+            + ", ".join(unknown_mapping_outputs)
+        )
+    conflicting_mappings = sorted(
+        output
+        for output, value in mapping_values.items()
+        if value != return_values[output]
+    )
+    if conflicting_mappings:
+        raise SchemaError(
+            "Boundary.output_mappings must agree with IntentFunction.returns: "
+            + ", ".join(conflicting_mappings)
+        )
     observable_values = {
-        output: mapping_values.get(output, return_values.get(output, output))
-        for output in outputs
+        output: return_values[output]
+        for output in output_names
     }
     relation_by_output = {
         item.output: item for item in archive.boundary.result_relations
@@ -2236,10 +2911,16 @@ def _validate_typed_boundary_relations(archive: "SemanticArchive") -> None:
             )
         for item in archive.boundary.updates:
             op = nodes[item.node_ref]
+            updated_result = (
+                op.result[0]
+                if op.attrs.get("atomic") == "cas"
+                and isinstance(op.result, list)
+                else op.result
+            )
             direct_outputs = {
                 output
                 for output, value in observable_values.items()
-                if value == op.result
+                if value == updated_result
             }
             if item.duplicate_policy is DuplicatePolicy.ONE_OF:
                 matching = [
@@ -2425,6 +3106,9 @@ def _validate_semantic_scopes_and_storage(archive: "SemanticArchive") -> None:
                     local.update(
                         state.body_argument for state in nested.carry
                     )
+                    if nested.trip is not None and nested.trip.is_dynamic:
+                        local.add(nested.trip.index or "")
+                        used.add(nested.trip.upper_bound)
                     used.update(scan.source for scan in nested.scan)
                     used.update(
                         state.init_value
@@ -2441,7 +3125,11 @@ def _validate_semantic_scopes_and_storage(archive: "SemanticArchive") -> None:
     def local_loop_uses(loop: Any) -> set[str]:
         seed = {scan.name for scan in loop.scan}
         seed.update(state.body_argument for state in loop.carry)
+        if loop.trip is not None and loop.trip.is_dynamic:
+            seed.add(loop.trip.index or "")
         outer = local_region_uses(loop.body, local_seed=seed)
+        if loop.trip is not None and loop.trip.is_dynamic:
+            outer.add(loop.trip.upper_bound)
         outer.update(scan.source for scan in loop.scan)
         outer.update(
             state.init_value
@@ -2469,7 +3157,14 @@ def _validate_semantic_scopes_and_storage(archive: "SemanticArchive") -> None:
             valid_values.update(produced)
             required_definitions[owner_scope].update(produced)
             event_ref = (SemanticEventKind.NODE, node_id or path)
-            for value in [*produced, *op.operands]:
+            trip_values = (
+                [op.trip.upper_bound]
+                if op.op == "loop"
+                and op.trip is not None
+                and op.trip.is_dynamic
+                else []
+            )
+            for value in [*produced, *op.operands, *trip_values]:
                 value_events.setdefault(value, set()).add(event_ref)
             if op.op in {"effect_if", "value_if"}:
                 assert op.predicate is not None
@@ -2573,6 +3268,8 @@ def _validate_semantic_scopes_and_storage(archive: "SemanticArchive") -> None:
             event_scope[loop_entry] = loop_scope_id
             loop_definitions = {scan.name for scan in op.scan}
             loop_definitions.update(state.body_argument for state in op.carry)
+            if op.trip is not None and op.trip.is_dynamic:
+                loop_definitions.add(op.trip.index or "")
             valid_values.update(loop_definitions)
             required_definitions[loop_scope_id].update(loop_definitions)
             captures = local_loop_uses(op)
@@ -3025,15 +3722,9 @@ def _validate_semantic_scopes_and_storage(archive: "SemanticArchive") -> None:
 
 
 def _walk_intent_ops(op: Any):
-    yield op
-    for child in op.body:
-        yield from _walk_intent_ops(child)
-    if op.op in {"effect_if", "value_if"}:
-        assert op.positive is not None and op.negative is not None
-        for child in op.positive.body:
-            yield from _walk_intent_ops(child)
-        for child in op.negative.body:
-            yield from _walk_intent_ops(child)
+    """Compatibility wrapper around the canonical Layer-A operation walker."""
+
+    yield from walk_intent_ops((op,))
 
 
 def _looks_like_semantic_literal(value: str) -> bool:
@@ -3069,6 +3760,16 @@ class ValueDimensionRelation(StrictJSONMixin):
         object.__setattr__(
             self, "relation", _string(self.relation, "ValueDimensionRelation.relation")
         )
+        if re.fullmatch(r"t[0-9]+", self.value_ref) is None:
+            raise SchemaError(
+                "ValueDimensionRelation.value_ref must be a logical rank-0 "
+                "tensor t* handle; physical p* and SSA v* handles are invalid"
+            )
+        if re.fullmatch(r"x[0-9]+", self.dimension_ref) is None:
+            raise SchemaError(
+                "ValueDimensionRelation.dimension_ref must be a symbolic "
+                "dimension x* handle"
+            )
         if self.relation != "eq":
             raise SchemaError("ValueDimensionRelation.relation must be 'eq'")
 
@@ -3090,12 +3791,7 @@ class ValueDimensionRelation(StrictJSONMixin):
         }
 
 
-_DIMENSION_RELATION_OPS = frozenset(
-    {
-        "identity", "add_const", "mul_const", "ceil_div_const",
-        "round_up_const", "mul_dims",
-    }
-)
+_DIMENSION_RELATION_OPS = DIMENSION_RELATION_OPS
 
 
 @dataclass(frozen=True)
@@ -3136,9 +3832,10 @@ class DimensionRelationExpr(StrictJSONMixin):
             isinstance(self.value, bool)
             or not isinstance(self.value, int)
             or self.value <= 0
+            or self.value > DIMENSION_INT64_MAX
         ):
             raise SchemaError(
-                f"{self.op} dimension expression requires a positive integer value"
+                f"{self.op} dimension expression requires a positive signed-int64 value"
             )
 
     @classmethod
@@ -3204,24 +3901,13 @@ def _validate_access_guard_reference_closure(
     """
 
     declared_values = {item.name for item in archive.intent.inputs}
-
-    def visit(operations: list[Any]) -> None:
-        for operation in operations:
-            if isinstance(operation.result, str):
-                declared_values.add(operation.result)
-            elif isinstance(operation.result, list):
-                declared_values.update(operation.result)
-            declared_values.update(scan.name for scan in operation.scan)
-            for state in operation.carry:
-                declared_values.add(state.body_argument)
-            visit(operation.body)
-            if operation.op in {"effect_if", "value_if"}:
-                assert operation.positive is not None
-                assert operation.negative is not None
-                visit(operation.positive.body)
-                visit(operation.negative.body)
-
-    visit(archive.intent.body)
+    for operation in walk_intent_ops(archive.intent.body):
+        if isinstance(operation.result, str):
+            declared_values.add(operation.result)
+        elif isinstance(operation.result, list):
+            declared_values.update(operation.result)
+        declared_values.update(scan.name for scan in operation.scan)
+        declared_values.update(state.body_argument for state in operation.carry)
     unknown_values = sorted(
         {
             relation.value_ref
@@ -3273,26 +3959,7 @@ class SemanticArchive(StrictJSONMixin):
             r"^body\[\d+\]"
             r"(?:(?:\.body|\.positive\.body|\.negative\.body)\[\d+\])*$"
         )
-        by_path: dict[str, Any] = {}
-
-        def record_paths(operations: list[Any], prefix: str = "body") -> None:
-            for index, operation in enumerate(operations):
-                path = f"{prefix}[{index}]"
-                by_path[path] = operation
-                record_paths(operation.body, f"{path}.body")
-                if operation.op in {"effect_if", "value_if"}:
-                    assert operation.positive is not None
-                    assert operation.negative is not None
-                    record_paths(
-                        operation.positive.body,
-                        f"{path}.positive.body",
-                    )
-                    record_paths(
-                        operation.negative.body,
-                        f"{path}.negative.body",
-                    )
-
-        record_paths(self.intent.body)
+        by_path = dict(walk_intent_op_paths(self.intent.body))
         for node_id, node_path in self.node_ids.items():
             if canonical_path.fullmatch(node_path) is None:
                 raise SchemaError(
@@ -3356,6 +4023,20 @@ class SemanticArchive(StrictJSONMixin):
             else DimensionRelation.from_json(item)
             for item in self.dimension_relations
         ]
+        # Relation declarations are part of J's closed semantic boundary.  Do
+        # this at construction time as well as in TypeCheck/materialization so
+        # direct model construction cannot carry a dangling x* reference into
+        # a later consumer.
+        try:
+            from intentir.ir.dimension_relation import validate_dimension_relations
+            from intentir.ir.value_dimension import (
+                validate_value_dimension_relations,
+            )
+
+            validate_dimension_relations(self)
+            validate_value_dimension_relations(self)
+        except (TypeError, ValueError) as exc:
+            raise SchemaError(str(exc)) from exc
         _validate_logical_signature(self)
         _validate_typed_boundary_relations(self)
         _validate_access_guard_reference_closure(self)
@@ -3363,6 +4044,15 @@ class SemanticArchive(StrictJSONMixin):
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "SemanticArchive":
+        nested_root_owned = _nested_root_owned_field_paths(
+            value,
+            path="SemanticArchive",
+        )
+        if nested_root_owned:
+            raise SchemaError(
+                f"{nested_root_owned[0]} is a root-owned field nested under J; "
+                "root.c and root.pi must be siblings of root.j"
+            )
         data = _strict_object(
             value,
             path="SemanticArchive",
@@ -3449,6 +4139,28 @@ class SignatureParameter(StrictJSONMixin):
             self.logical_ref = _string(
                 self.logical_ref, "SignatureParameter.logical_ref"
             )
+            if re.fullmatch(r"(?:t|x)[0-9]+", self.logical_ref) is None:
+                raise SchemaError(
+                    "SignatureParameter.logical_ref must be a logical tensor "
+                    "t* or dimension x* handle; physical p* and operation "
+                    "SSA v* handles are not valid signature bindings"
+                )
+        # A signature field without a logical_ref may be a physical source or
+        # Harness constexpr carrier (for example a backend token), so its
+        # spelling is intentionally not forced through the logical dtype set.
+        # Once the parameter is tied to J, however, its dtype is part of the
+        # closed logical ABI and must use the same canonical set as IntentOp
+        # tensors.  Tensor/pointer parameters are always J-owned by contract.
+        if self.dtype is not None and (
+            self.kind in {ParameterKind.TENSOR, ParameterKind.POINTER}
+            or self.logical_ref is not None
+        ):
+            try:
+                self.dtype = canonicalize_dtype(
+                    self.dtype, context="SignatureParameter.dtype"
+                )
+            except (TypeError, ValueError) as exc:
+                raise SchemaError(str(exc)) from exc
         issues: list[_SchemaIssue] = []
         if self.kind is ParameterKind.OPAQUE:
             detail = (
@@ -3499,6 +4211,17 @@ class SignatureParameter(StrictJSONMixin):
                         "explicit rank-0, mode=value, non-alias carrier; a "
                         "constexpr carrier is bound only by the fixed Harness "
                         "specialization and never becomes Layer-A data",
+                    )
+                )
+            elif (
+                isinstance(self.logical_ref, str)
+                and re.fullmatch(r"t[0-9]+", self.logical_ref)
+                and self.rank != 0
+            ):
+                issues.append(
+                    _SchemaIssue(
+                        "SignatureParameter.rank",
+                        "a scalar/constexpr logical t* binding must have rank=0",
                     )
                 )
         if issues:
@@ -3568,6 +4291,16 @@ class LogicalSignature(StrictJSONMixin):
                 "J.signature parameter ids must be declaration-order handles "
                 "p0, p1, ..."
             )
+        self_aliases = sorted(
+            item.name
+            for item in self.parameters
+            if item.alias_of == item.name
+        )
+        if self_aliases:
+            raise SchemaError(
+                "J.signature alias_of cannot self-reference parameter(s): "
+                + ", ".join(self_aliases)
+            )
         unknown_aliases = sorted(
             item.alias_of for item in self.parameters
             if item.alias_of is not None and item.alias_of not in names
@@ -3577,6 +4310,23 @@ class LogicalSignature(StrictJSONMixin):
                 "J.signature alias_of references unknown parameters: "
                 + ", ".join(unknown_aliases)
             )
+        alias_graph = {
+            item.name: item.alias_of
+            for item in self.parameters
+            if item.alias_of is not None
+        }
+        for start in alias_graph:
+            path: list[str] = []
+            current: str | None = start
+            while current is not None and current in alias_graph:
+                if current in path:
+                    cycle = path[path.index(current):] + [current]
+                    raise SchemaError(
+                        "J.signature alias_of contains a cycle: "
+                        + " -> ".join(cycle)
+                    )
+                path.append(current)
+                current = alias_graph[current]
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "LogicalSignature":
@@ -3625,27 +4375,33 @@ def _validate_logical_signature(archive: SemanticArchive) -> None:
         tensor.name: tensor
         for tensor in [*archive.intent.inputs, *archive.intent.outputs]
     }
-    dimensions = {
-        dim
-        for tensor in tensors.values()
-        for dim in tensor.shape
-        if isinstance(dim, str)
-    }
-    dimensions.update(relation.result for relation in archive.dimension_relations)
-    dimensions.update(relation.expr.arg for relation in archive.dimension_relations)
-    dimensions.update(
-        relation.expr.rhs
-        for relation in archive.dimension_relations
-        if relation.expr.rhs is not None
-    )
+    dimensions = declared_dimension_handles(archive)
     input_refs = {tensor.name for tensor in archive.intent.inputs}
     output_refs = {tensor.name for tensor in archive.intent.outputs}
-    seen_logical: set[str] = set()
+    seen_logical: dict[str, str] = {}
+    parameters_by_name = {
+        parameter.name: parameter for parameter in archive.signature.parameters
+    }
+    declared_alias_kinds = {
+        frozenset((alias.left, alias.right)): alias.kind
+        for alias in archive.boundary.aliases
+    }
     issues: list[_SchemaIssue] = []
     for index, parameter in enumerate(archive.signature.parameters):
         base = f"SemanticArchive.signature.parameters[{index}]"
         ref = parameter.logical_ref
         if ref is None:
+            continue
+        if re.fullmatch(r"(?:t|x)[0-9]+", ref) is None:
+            issues.append(
+                _SchemaIssue(
+                    f"{base}.logical_ref",
+                    f"J.signature parameter {parameter.name!r} logical_ref "
+                    f"{ref!r} must be a logical tensor t* or dimension x*; "
+                    "physical p* and operation SSA v* handles are not valid "
+                    "signature bindings",
+                )
+            )
             continue
         if ref not in tensors and ref not in dimensions:
             issues.append(
@@ -3658,6 +4414,43 @@ def _validate_logical_signature(archive: SemanticArchive) -> None:
                 )
             )
             continue
+        previous_parameter = seen_logical.get(ref)
+        if previous_parameter is not None:
+            issues.append(
+                _SchemaIssue(
+                    f"{base}.logical_ref",
+                    f"J logical handle {ref!r} is already bound by signature "
+                    f"parameter {previous_parameter!r}; one logical t*/x* "
+                    "handle must have one physical binding. Use one "
+                    "mode=inout parameter for an input/output identity, and "
+                    "use distinct logical handles plus an explicit Boundary "
+                    "must_alias for physical aliases",
+                )
+            )
+        else:
+            seen_logical[ref] = parameter.name
+        if parameter.alias_of is not None:
+            target = parameters_by_name.get(parameter.alias_of)
+            target_ref = target.logical_ref if target is not None else None
+            logical_pair = (
+                frozenset((ref, target_ref))
+                if target_ref is not None
+                else None
+            )
+            if (
+                logical_pair is None
+                or len(logical_pair) != 2
+                or declared_alias_kinds.get(logical_pair)
+                is not AliasKind.MUST_ALIAS
+            ):
+                issues.append(
+                    _SchemaIssue(
+                        f"{base}.alias_of",
+                        "a physical alias must bind two distinct logical "
+                        "t* handles joined by one Boundary alias with "
+                        "kind='must_alias'",
+                    )
+                )
         if ref in tensors:
             tensor = tensors[ref]
             if parameter.dtype != tensor.dtype:
@@ -3678,6 +4471,34 @@ def _validate_logical_signature(archive: SemanticArchive) -> None:
                         f"rank {len(tensor.shape)!r}",
                     )
                 )
+            if (
+                parameter.kind in {ParameterKind.SCALAR, ParameterKind.CONSTEXPR}
+                and re.fullmatch(r"t[0-9]+", ref)
+            ):
+                if ref not in input_refs:
+                    issues.append(
+                        _SchemaIssue(
+                            f"{base}.logical_ref",
+                            "a scalar/constexpr logical t* binding must name a "
+                            "J input rank-0 value",
+                        )
+                    )
+                if tensor.shape != []:
+                    issues.append(
+                        _SchemaIssue(
+                            f"{base}.logical_ref",
+                            "a scalar/constexpr logical t* binding must name a "
+                            "rank-0 J tensor with shape=[]",
+                        )
+                    )
+                if parameter.rank != 0:
+                    issues.append(
+                        _SchemaIssue(
+                            f"{base}.rank",
+                            "a scalar/constexpr logical t* binding must have "
+                            "rank=0",
+                        )
+                    )
             if parameter.mode is ParameterMode.INPUT:
                 if ref not in input_refs:
                     issues.append(
@@ -3720,7 +4541,6 @@ def _validate_logical_signature(archive: SemanticArchive) -> None:
                         "tensor declared in both J inputs and J outputs",
                     )
                 )
-            seen_logical.add(ref)
         elif parameter.kind not in {
             ParameterKind.SCALAR,
             ParameterKind.CONSTEXPR,
@@ -3732,7 +4552,7 @@ def _validate_logical_signature(archive: SemanticArchive) -> None:
                     "dimension",
                 )
             )
-    missing = sorted((input_refs | output_refs) - seen_logical)
+    missing = sorted((input_refs | output_refs) - set(seen_logical))
     if missing:
         issues.append(
             _SchemaIssue(
@@ -3755,7 +4575,12 @@ class ScheduleSlot(StrictJSONMixin):
     axis_ref: int | str | None = None
 
     def __post_init__(self) -> None:
-        self.name = _string(self.name, "ScheduleSlot.name")
+        self.name = _handle(
+            self.name,
+            "ScheduleSlot.name",
+            r"c[0-9]+",
+            "a C slot c* handle",
+        )
         self.kind = _enum(ScheduleSlotKind, self.kind, "ScheduleSlot.kind")
         self.role = _string(self.role, "ScheduleSlot.role")
         if re.fullmatch(r"[a-z][a-z0-9_]*", self.role) is None:
@@ -3781,14 +4606,21 @@ class ScheduleSlot(StrictJSONMixin):
             raise SchemaError("ScheduleSlot.role must remain pure scheduling metadata")
         self.value_type = _string(self.value_type, "ScheduleSlot.value_type")
         self.required = _boolean(self.required, "ScheduleSlot.required")
+        if self.kind is ScheduleSlotKind.COMPILER and (
+            self.subject_ref is not None or self.axis_ref is not None
+        ):
+            raise SchemaError(
+                "compiler ScheduleSlot declarations are external compiler "
+                "options and must omit subject_ref and axis_ref"
+            )
         if self.subject_ref is not None:
             self.subject_ref = _string(
                 self.subject_ref, "ScheduleSlot.subject_ref"
             )
-            if re.fullmatch(r"[tndaqb][0-9]+", self.subject_ref) is None:
+            if re.fullmatch(r"[tndaequb][0-9]+", self.subject_ref) is None:
                 raise SchemaError(
                     "ScheduleSlot.subject_ref must be a closed J scheduling "
-                    "subject t*/n*/d*/a*/q*/b*"
+                    "subject t*/n*/d*/a*/e*/q*/u*/b*"
                 )
         if self.axis_ref is not None:
             if self.subject_ref is None:
@@ -3822,6 +4654,13 @@ class ScheduleSlot(StrictJSONMixin):
             },
             required={"name", "kind", "role"},
         )
+        if data.get("kind") == ScheduleSlotKind.COMPILER.value and any(
+            key in data for key in ("subject_ref", "axis_ref")
+        ):
+            raise SchemaError(
+                "compiler ScheduleSlot declarations must omit subject_ref "
+                "and axis_ref"
+            )
         return cls(
             name=data["name"],
             kind=data["kind"],
@@ -3845,6 +4684,34 @@ class ScheduleSlot(StrictJSONMixin):
         if self.axis_ref is not None:
             result["axis_ref"] = self.axis_ref
         return result
+
+
+def implementation_value_matches(value_type: str, value: Any) -> bool:
+    """Return whether one C value is a closed scalar of its declared type.
+
+    ``ImplementationConfig`` remains able to decode historical artifacts with
+    optional or absent values.  Active consumers call
+    :meth:`ImplementationConfig.validate_complete_values` so a Replay never
+    turns one of those historical omissions into an invented implementation
+    binding.
+    """
+
+    normalized = value_type.casefold()
+    if normalized in {"bool", "i1"}:
+        return isinstance(value, bool)
+    if normalized in {"int", "integer"} or normalized.startswith(("i", "u")):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if normalized in {"float", "number"} or normalized.startswith("f"):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if normalized in {"str", "string", "layout", "enum"}:
+        # C may select one closed implementation token, but it must not become
+        # a source-code or free-text side channel.  Rich layout expressions
+        # need their own closed schema rather than being smuggled through a
+        # string-valued slot.
+        return isinstance(value, str) and re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_.:+/-]*", value
+        ) is not None
+    return False
 
 
 @dataclass
@@ -3898,13 +4765,69 @@ class ImplementationConfig(StrictJSONMixin):
             "values": copy.deepcopy(self.values),
         }
 
-    def masked_view(self) -> dict[str, Any]:
-        """Return ``MaskC(C)``: slot declarations without concrete values."""
+    def ordered_value_items(self) -> tuple[tuple[str, JsonValue], ...]:
+        """Return bound C values in the declaration order of ``slots``.
 
-        return {"slots": [item.to_json() for item in self.slots]}
+        C slot names are opaque handles.  Their spelling, especially the
+        numeric suffix of ``c*`` handles, is not a serialization order.  All
+        consumers that need a positional C binding must therefore follow the
+        declared slot sequence and never sort the value-object keys.
+        """
+
+        return tuple(
+            (slot.name, self.values[slot.name])
+            for slot in self.slots
+            if slot.name in self.values
+        )
 
     def missing_required_values(self) -> list[str]:
-        return [slot.name for slot in self.slots if slot.required and slot.name not in self.values]
+        """Return legacy-required slots without a value.
+
+        This intentionally preserves historical artifact decoding.  Active
+        Replay uses ``validate_complete_values`` instead: once C is present,
+        every remaining normalized slot is active and must be bound.
+        """
+
+        return [
+            slot.name
+            for slot in self.slots
+            if slot.required and slot.name not in self.values
+        ]
+
+    def missing_values(self) -> list[str]:
+        """Return every declared slot without an actual implementation value."""
+
+        return [slot.name for slot in self.slots if slot.name not in self.values]
+
+    def mistyped_values(self) -> list[str]:
+        """Return bound slots whose values do not match their closed C types."""
+
+        return [
+            slot.name
+            for slot in self.slots
+            if slot.name in self.values
+            and not implementation_value_matches(
+                slot.value_type, self.values[slot.name]
+            )
+        ]
+
+    def validate_complete_values(
+        self, *, path: str = "ImplementationConfig"
+    ) -> None:
+        """Fail closed unless every declared active C slot has a valid value."""
+
+        missing = self.missing_values()
+        if missing:
+            raise SchemaError(
+                f"{path} is missing actual value(s) for declared slot(s): "
+                + ", ".join(missing)
+            )
+        mistyped = self.mistyped_values()
+        if mistyped:
+            raise SchemaError(
+                f"{path} has value(s) that do not match their declared type: "
+                + ", ".join(mistyped)
+            )
 
 
 
@@ -4146,6 +5069,65 @@ class ProvenanceRecord(StrictJSONMixin):
         return result
 
 
+def _canonicalize_retained_loop_capture_operands(value: Any) -> Any:
+    """Remove only historical loop-capture duplication from persisted J.
+
+    The closed current J grammar represents a loop's external values through
+    its body uses, typed scan/carry/trip boundary, and portable scope captures;
+    a second ``loop.operands`` list carries no independent semantic fact.  A
+    few retained Gate artifacts predate that canonical form.  Preserve their
+    evidence readability by accepting only a duplicate-free list of J value-
+    handle spellings and dropping that redundant field before the strict
+    semantic parser runs.  Fresh Lift ingress rejects the field before it
+    reaches this archival compatibility boundary.
+    """
+
+    if not isinstance(value, dict):
+        return value
+    result = copy.deepcopy(value)
+    intent = result.get("intent")
+    function = (
+        intent.get("intent_function")
+        if isinstance(intent, dict)
+        else None
+    )
+    if not isinstance(function, dict):
+        return result
+
+    def normalize_body(body: Any, path: str) -> None:
+        if not isinstance(body, list):
+            return
+        for index, operation in enumerate(body):
+            if not isinstance(operation, dict):
+                continue
+            operation_path = f"{path}[{index}]"
+            if operation.get("op") == "loop" and "operands" in operation:
+                operands = operation["operands"]
+                if (
+                    not isinstance(operands, list)
+                    or any(
+                        not isinstance(item, str)
+                        or re.fullmatch(r"(?:t|v)[0-9]+", item) is None
+                        for item in operands
+                    )
+                    or len(operands) != len(set(operands))
+                ):
+                    raise SchemaError(
+                        f"{operation_path}.operands must be a duplicate-free "
+                        "list of J value handles before archival canonicalization"
+                    )
+                operation.pop("operands")
+            normalize_body(operation.get("body"), f"{operation_path}.body")
+            for arm_name in ("positive", "negative"):
+                arm = operation.get(arm_name)
+                if isinstance(arm, dict):
+                    normalize_body(
+                        arm.get("body"), f"{operation_path}.{arm_name}.body"
+                    )
+
+    normalize_body(function.get("body"), "SemanticArchive.intent.body")
+    return result
+
 
 @dataclass
 class Gate1Artifact(StrictJSONMixin):
@@ -4175,7 +5157,9 @@ class Gate1Artifact(StrictJSONMixin):
 
     def __post_init__(self) -> None:
         if not isinstance(self.j, SemanticArchive):
-            self.j = SemanticArchive.from_json(self.j)
+            self.j = SemanticArchive.from_json(
+                _canonicalize_retained_loop_capture_operands(self.j)
+            )
         if not isinstance(self.c, ImplementationConfig):
             self.c = ImplementationConfig.from_json(self.c)
         if not isinstance(self.pi, RealizationWitness):
@@ -4377,9 +5361,40 @@ class Gate1Artifact(StrictJSONMixin):
                 "SCRC artifact is missing required C value(s): "
                 + ", ".join(missing_values)
             )
+        try:
+            # Keep the compatibility Gate1 wire unchanged, but make its
+            # in-memory Source-C declaration pass through the shared Layer-C
+            # attachment validator before any backend can consume it.  This
+            # closes the definition/use gap for subject_ref and axis_ref while
+            # avoiding a new artifact schema or a second attachment grammar.
+            from intentir.ir.layer_c import source_layer_c_interface
+
+            source_layer_c_interface(self.j, self.c)
+        except (TypeError, ValueError) as exc:
+            raise SchemaError(
+                "Gate1 C declarations are not valid for this J: "
+                f"{exc}"
+            ) from exc
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "Gate1Artifact":
+        # Diagnose the ownership violation before the envelope's required-key
+        # check.  A draft that moves c/pi under j often also omits the root
+        # sibling, so checking required keys first reported only "missing c"
+        # and hid the actual root-envelope nesting error from the relift path.
+        if isinstance(value, dict):
+            j_candidate = value.get("j")
+            if isinstance(j_candidate, dict):
+                nested_root_owned = _nested_root_owned_field_paths(
+                    j_candidate,
+                    path="Gate1Artifact.j",
+                )
+                if nested_root_owned:
+                    raise SchemaError(
+                        f"{nested_root_owned[0]} is a root-owned field nested "
+                        "under J; "
+                        "root.c and root.pi must be siblings of root.j"
+                    )
         data = _strict_object(
             value,
             path="Gate1Artifact",
@@ -4612,7 +5627,9 @@ class Gate1Artifact(StrictJSONMixin):
         except RealizationWitnessError as exc:
             raise SchemaError(str(exc)) from exc
         return cls(
-            j=SemanticArchive.from_json(data["j"]),
+            j=SemanticArchive.from_json(
+                _canonicalize_retained_loop_capture_operands(data["j"])
+            ),
             c=ImplementationConfig.from_json(data["c"]),
             pi=pi,
             wire_schema=data["schema"],
@@ -5042,15 +6059,16 @@ def _opaque_reference_data(
         [*artifact.j.intent.inputs, *artifact.j.intent.outputs]
     ):
         for shape_index, dim in enumerate(tensor.shape):
-            if not isinstance(dim, str) or dim in aliases:
-                continue
-            allocate(
-                dim,
-                f"x{dimension_index}",
-                "j_dimension",
-                f"j.intent.tensor_shapes[{tensor_index}][{shape_index}]",
-            )
-            dimension_index += 1
+            for reference in dimension_expression_references(dim):
+                if reference in aliases or reference == "?":
+                    continue
+                allocate(
+                    reference,
+                    f"x{dimension_index}",
+                    "j_dimension",
+                    f"j.intent.tensor_shapes[{tensor_index}][{shape_index}]",
+                )
+                dimension_index += 1
     for relation_index, relation in enumerate(artifact.j.dimension_relations):
         for field, dim in (
             ("result", relation.result),
@@ -5120,6 +6138,29 @@ def _opaque_json_exact(value: Any, aliases: dict[str, str]) -> Any:
     return copy.deepcopy(value)
 
 
+def _opaque_intent_contract_fields(value: Any, aliases: dict[str, str]) -> Any:
+    """Rewrite expression-bearing shape/extent fields without changing keys."""
+
+    if isinstance(value, list):
+        return [
+            _opaque_intent_contract_fields(item, aliases) for item in value
+        ]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if key in {"shape", "lo", "hi"} and isinstance(item, list):
+            result[key] = [
+                _opaque_expression(element, aliases)
+                if isinstance(element, str) and element != "?"
+                else copy.deepcopy(element)
+                for element in item
+            ]
+        else:
+            result[key] = _opaque_intent_contract_fields(item, aliases)
+    return result
+
+
 def _opaque_intent_op(
     op: dict[str, Any], aliases: dict[str, str]
 ) -> dict[str, Any]:
@@ -5134,6 +6175,7 @@ def _opaque_intent_op(
     for key in ("attrs", "type"):
         if key in result:
             result[key] = _opaque_json_exact(result[key], aliases)
+            result[key] = _opaque_intent_contract_fields(result[key], aliases)
     if result.get("op") == "pad" and isinstance(result.get("attrs"), dict):
         for field in ("lo", "hi"):
             values = result["attrs"].get(field)
@@ -5211,7 +6253,7 @@ def _opaque_storage_json(
 def _opaque_signature_and_c_view(
     artifact: Gate1Artifact, aliases: dict[str, str]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Project J.signature and MaskC(C) without source binding coordinates."""
+    """Project J.signature and complete C without source binding coordinates."""
 
     signature = artifact.j.signature.to_json()
     for parameter in signature["parameters"]:
@@ -5226,7 +6268,7 @@ def _opaque_signature_and_c_view(
                 parameter["alias_of"], aliases
             )
 
-    c_view = artifact.c.masked_view()
+    c_view = artifact.c.to_json()
     for slot in c_view["slots"]:
         slot["name"] = _opaque_reference(slot["name"], aliases)
         if slot.get("subject_ref") is not None:
@@ -5235,7 +6277,196 @@ def _opaque_signature_and_c_view(
             )
         if isinstance(slot.get("axis_ref"), str):
             slot["axis_ref"] = _opaque_reference(slot["axis_ref"], aliases)
+    c_view["values"] = {
+        _opaque_reference(name, aliases): copy.deepcopy(value)
+        for name, value in artifact.c.ordered_value_items()
+    }
     return signature, c_view
+
+
+def opaque_replay_representation(artifact: Gate1Artifact) -> dict[str, Any]:
+    """Project closed Source realization facts to the Replay ABI view.
+
+    Replay must not receive the legacy ``pi`` graph.  A legacy artifact can,
+    however, contain address ownership and physical launch-axis facts that are
+    otherwise impossible to recover from a source-blind J-only packet.  This
+    helper projects only the typed, source-free facts needed by the target
+    callable ABI:
+
+    * a null-logical-ref scalar routed to an address stage becomes a stride
+      binding for one J access/tensor axis;
+    * a direct ``program_axes`` row becomes a domain-to-launch-axis binding;
+    * a compact ``program_bindings`` row projects each of its named J domains
+      to that same explicitly witnessed physical launch axis.
+
+    Route slots 0--3 are the closed legacy address inputs for logical domains
+    and the pointer handle.  Slots 4 onward are the tensor-axis stride inputs,
+    so slot ``4 + axis`` denotes that access's stride for ``axis``.  This
+    projection is deliberately fail-closed: an address carrier with an
+    ambiguous slot or conflicting owner is not guessed or silently omitted.
+    The relation class itself remains a Gate1 normalization witness rather than
+    a target recipe; Replay receives only the already-closed domain-to-axis
+    projection required to select its callable launch coordinates.
+    """
+
+    aliases, _bindings, _order = _opaque_reference_data(artifact)
+    boundary = artifact.j.boundary
+    accesses = {item.access_id: item for item in boundary.accesses}
+    tensors = {
+        tensor.name: tensor
+        for tensor in [*artifact.j.intent.inputs, *artifact.j.intent.outputs]
+    }
+    parameters = {
+        item.name: item for item in artifact.j.signature.parameters
+    }
+    instances = {
+        str(item["id"]): item for item in artifact.pi.instances
+    }
+    address_instance_ids = {
+        instance_id
+        for instance_id, item in instances.items()
+        if item.get("mechanism") in {"address_base", "address_lane"}
+        and item.get("semantic_ref") in accesses
+    }
+
+    address_rows: dict[tuple[str, str, int], dict[str, Any]] = {}
+    access_axes: dict[tuple[str, int], str] = {}
+    for route_index, route in enumerate(artifact.pi.routes):
+        source_id = route.get("source")
+        target_id = route.get("target")
+        source = instances.get(str(source_id))
+        target = instances.get(str(target_id))
+        if source is None or target is None or target_id not in address_instance_ids:
+            continue
+        carrier_name = source.get("semantic_ref")
+        parameter = parameters.get(carrier_name)
+        if (
+            parameter is None
+            or parameter.kind is not ParameterKind.SCALAR
+            or parameter.logical_ref is not None
+        ):
+            continue
+        access_name = target.get("semantic_ref")
+        access = accesses.get(access_name)
+        if access is None:
+            raise SchemaError(
+                f"pi.routes[{route_index}] address target has no J access"
+            )
+        slots = route.get("slots")
+        if not isinstance(slots, list) or len(slots) != 1:
+            raise SchemaError(
+                f"pi.routes[{route_index}] address carrier route must have one slot"
+            )
+        slot = slots[0]
+        if isinstance(slot, bool) or not isinstance(slot, int) or slot < 4:
+            raise SchemaError(
+                f"pi.routes[{route_index}] address carrier slot cannot be projected"
+            )
+        axis = slot - 4
+        tensor = tensors.get(access.tensor)
+        if tensor is None or axis >= len(tensor.shape):
+            raise SchemaError(
+                f"pi.routes[{route_index}] address carrier slot exceeds tensor rank"
+            )
+        owner_key = (access_name, axis)
+        previous = access_axes.get(owner_key)
+        if previous is not None and previous != carrier_name:
+            raise SchemaError(
+                "one J access axis has conflicting Replay stride carriers: "
+                f"{access_name}[{axis}]"
+            )
+        access_axes[owner_key] = str(carrier_name)
+        row_key = (str(carrier_name), str(access_name), axis)
+        address_rows[row_key] = {
+            "carrier": _opaque_reference(str(carrier_name), aliases),
+            "access_ref": _opaque_reference(str(access_name), aliases),
+            "tensor": _opaque_reference(access.tensor, aliases),
+            "axis": axis,
+            "role": "stride",
+        }
+
+    program_rows: dict[str, dict[str, Any]] = {}
+    domain_names = set(boundary.domains)
+    def add_program_row(domain_name: Any, axis: Any, *, path: str) -> None:
+        if domain_name not in domain_names:
+            raise SchemaError(
+                f"{path} references an unknown J domain"
+            )
+        if isinstance(axis, bool) or not isinstance(axis, int) or not 0 <= axis <= 2:
+            raise SchemaError(
+                f"{path} has an invalid launch axis"
+            )
+        existing = program_rows.get(domain_name)
+        if existing is not None:
+            if existing["axis"] != axis:
+                raise SchemaError(
+                    f"{path} maps one J domain to multiple launch axes"
+                )
+            return
+        program_rows[domain_name] = {
+            "domain_ref": _opaque_reference(domain_name, aliases),
+            "axis": axis,
+        }
+
+    if artifact.pi.program_axes and artifact.pi.program_bindings:
+        raise SchemaError(
+            "pi.program_axes and pi.program_bindings cannot both project a "
+            "program-coordinate mapping"
+        )
+    for index, binding in enumerate(artifact.pi.program_axes):
+        add_program_row(
+            binding.get("domain_ref"),
+            binding.get("axis"),
+            path=f"pi.program_axes[{index}]",
+        )
+    for binding_index, binding in enumerate(artifact.pi.program_bindings):
+        binding_path = f"pi.program_bindings[{binding_index}]"
+        axis = binding.get("axis")
+        logical_axes = binding.get("logical_axes")
+        if not isinstance(logical_axes, list) or not logical_axes:
+            raise SchemaError(f"{binding_path}.logical_axes must be non-empty")
+        for logical_axis_index, logical_axis in enumerate(logical_axes):
+            if not isinstance(logical_axis, Mapping):
+                raise SchemaError(
+                    f"{binding_path}.logical_axes[{logical_axis_index}] must be an object"
+                )
+            add_program_row(
+                logical_axis.get("domain_ref"),
+                axis,
+                path=(
+                    f"{binding_path}.logical_axes[{logical_axis_index}].domain_ref"
+                ),
+            )
+
+    if not address_rows and not program_rows:
+        return {}
+
+    return {
+        "address_bindings": [
+            copy.deepcopy(address_rows[key])
+            for key in sorted(
+                address_rows,
+                key=lambda key: (
+                    list(accesses).index(key[1]),
+                    key[2],
+                    (
+                        int(key[0][1:])
+                        if re.fullmatch(r"p[0-9]+", key[0]) is not None
+                        else key[0]
+                    ),
+                ),
+            )
+        ],
+        "program_bindings": sorted(
+            program_rows.values(),
+            key=lambda row: (
+                row["axis"],
+                int(row["domain_ref"][1:])
+                if re.fullmatch(r"d[0-9]+", row["domain_ref"]) is not None
+                else row["domain_ref"],
+            ),
+        ),
+    }
 
 
 def _opaque_normal_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
@@ -5251,7 +6482,9 @@ def _opaque_normal_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
                     "name": _opaque_reference(tensor.name, aliases),
                     "dtype": tensor.dtype,
                     "shape": [
-                        aliases.get(dim, dim) if isinstance(dim, str) else dim
+                        _opaque_expression(dim, aliases)
+                        if isinstance(dim, str) and dim != "?"
+                        else dim
                         for dim in tensor.shape
                     ],
                 }
@@ -5262,11 +6495,20 @@ def _opaque_normal_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
                     "name": _opaque_reference(tensor.name, aliases),
                     "dtype": tensor.dtype,
                     "shape": [
-                        aliases.get(dim, dim) if isinstance(dim, str) else dim
+                        _opaque_expression(dim, aliases)
+                        if isinstance(dim, str) and dim != "?"
+                        else dim
                         for dim in tensor.shape
                     ],
                 }
                 for tensor in artifact.j.intent.outputs
+            ],
+            "returns": [
+                {
+                    "output": _opaque_reference(item.output, aliases),
+                    "value": _opaque_reference(item.value, aliases),
+                }
+                for item in artifact.j.intent.returns
             ],
             "body": [
                 _opaque_intent_op(op, aliases) for op in intent.get("body", [])
@@ -5398,6 +6640,16 @@ def _opaque_normal_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
                 "base": _opaque_reference(item.base, aliases),
                 "indices": _opaque_reference(item.indices, aliases),
                 "values": _opaque_reference(item.values, aliases),
+                **(
+                    {"compare": _opaque_reference(item.compare, aliases)}
+                    if item.compare is not None
+                    else {}
+                ),
+                **(
+                    {"observed": _opaque_reference(item.observed, aliases)}
+                    if item.observed is not None
+                    else {}
+                ),
                 "axis": item.axis,
                 "combiner": item.combiner.value,
                 "duplicate_policy": item.duplicate_policy.value,
@@ -5565,7 +6817,7 @@ def _masked_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
             dimension
             for tensor in [*artifact.j.intent.inputs, *artifact.j.intent.outputs]
             for dimension in tensor.shape
-            if isinstance(dimension, str)
+            if isinstance(dimension, str) and dimension != "?"
         )
     )
     dimension_map = {
@@ -5669,6 +6921,13 @@ def _masked_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
                 }
                 for tensor in artifact.j.intent.outputs
             ],
+            "returns": [
+                {
+                    "output": opaque_reference(item.output),
+                    "value": "<masked>",
+                }
+                for item in artifact.j.intent.returns
+            ],
             "body": mask_ops(artifact.j.intent.body, "body"),
         }
     }
@@ -5763,6 +7022,16 @@ def _masked_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
                 "base": opaque_reference(item.base),
                 "indices": opaque_reference(item.indices),
                 "values": opaque_reference(item.values),
+                **(
+                    {"compare": opaque_reference(item.compare)}
+                    if item.compare is not None
+                    else {}
+                ),
+                **(
+                    {"observed": opaque_reference(item.observed)}
+                    if item.observed is not None
+                    else {}
+                ),
                 "axis": "<masked>",
                 "combiner": "<masked>",
                 "duplicate_policy": "<masked>",
@@ -5824,9 +7093,8 @@ def _masked_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
         ],
     }
 
-    # The anti-leakage arm masks J's semantic declarations.  Its logical
-    # signature and MaskC(C) stay usable without introducing a Harness, pi, or
-    # interface side channel.
+    # The diagnostic arm masks J's semantic declarations while retaining the
+    # same logical signature and complete implementation configuration C.
     normal_aliases, _bindings, _order = _opaque_reference_data(artifact)
     opaque_signature, opaque_c = _opaque_signature_and_c_view(
         artifact, normal_aliases
@@ -5924,6 +7192,7 @@ __all__ = [
     "EffectSpec", "Frontend",
     "GATE1_ARTIFACT_MODEL_FIELDS", "GATE1_ARTIFACT_PRIVATE_FIELDS",
     "Gate1Artifact", "Gate1Status", "ImplementationConfig",
+    "implementation_value_matches",
     "JNecessityStatus", "JsonValue",
     "IndexBoundsSpec", "LocationEntry", "LocationMap", "LogicalSignature",
     "LogicalUpdateSpec", "OutputMapping",
@@ -5936,6 +7205,7 @@ __all__ = [
     "render_gate1_artifact_envelope_grammar", "RuntimeArgument",
     "ScheduleSlot", "ScheduleSlotKind", "SchemaError", "SignatureParameter",
     "ScopeKind", "SEMANTIC_ARCHIVE_LEGACY_WIRE_FIELDS",
+    "opaque_replay_representation",
     "SEMANTIC_ARCHIVE_WIRE_FIELDS", "SemanticArchive", "ValueDimensionRelation",
     "DimensionRelation", "DimensionRelationExpr",
     "SemanticEventKind",

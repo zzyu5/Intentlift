@@ -28,9 +28,16 @@ from intentir.extraction.providers.client import (
     XHIGH_RESPONSES_TIMEOUT_SECONDS,
 )
 from intentir.extraction.providers.provider import ProviderConfig, get_provider
+from intentir.ir.intent_op_contract import RAGGED_OPS
 from intentir.verify.gate1.compiler import KernelSource, TritonCompiler
 from intentir.verify.gate1.ttir import fingerprint_ttir, runtime_argument_names
 
+from .codegen import (
+    TRITON_REPLAY_ABI_CONTRACT,
+    TRITON_REPLAY_API_CONTRACT,
+    TRITON_REPLAY_CONTROL_CONTRACT,
+    TRITON_REPLAY_STRUCTURE_CONTRACT,
+)
 from .model import Frontend, Gate1Artifact
 from .replay_semantic_core import (
     materialize_replay_semantics,
@@ -42,6 +49,7 @@ from .replay import (
     ReplayGeneration,
     ReplayGenerationError,
     _context_receipt,
+    _frontend_replay_guidance,
     build_source_blind_replay_compile_case,
     _replay_input_files,
     _trajectory_bytes,
@@ -54,15 +62,19 @@ CODEX_CLI_REPLAY_BACKEND = "openai.codex-cli.intentir-replay.v67"
 
 _INITIAL_PROMPT = """You are the sole writer for one fresh source-blind IntentIR Replay episode.
 Work only under the isolated /workspace. input/ is immutable; output/, work/, and
-tmp/ are writable. There is no Source, Harness/compiler view, actual C value, Gate
-result, earlier Replay, sibling state, repository, or network.
+tmp/ are writable. There is no Source, Harness/compiler fact beyond optional complete C,
+Gate result, earlier Replay, sibling state, repository, or network.
 
 J is the only semantic authority. Read input/compiler-index.intent and the complete
 read-only input/semantic-program.intent before drafting, then read input/frontend.json
-and input/mask-c.json for the callable ABI. S_J is a deterministic parameterized compiler
-IR derived only from this J, not a target-source skeleton. Use `semantic_query` or
+and optional input/c.json when it exists. If frontend.json contains a
+representation_contract, read its complete address_bindings and program_bindings before
+choosing pointer or launch realization. S_J is a deterministic parameterized compiler
+IR derived only from this J, not a target-source skeleton. Complete C values are exact
+implementation bindings; keep every constexpr c* as a callable placeholder. Use `semantic_query` or
 `packet_query` only to cross-reference one named J/C handle after reading those complete
 small views. Pi, Source realization, Gate observations, and prior Replay are absent.
+""" + TRITON_REPLAY_API_CONTRACT + TRITON_REPLAY_ABI_CONTRACT + TRITON_REPLAY_CONTROL_CONTRACT + TRITON_REPLAY_STRUCTURE_CONTRACT + """
 For Triton Python, annotate only constexpr parameters with `tl.constexpr`; leave runtime
 pointer and scalar parameters unannotated.
 When a runtime scalar has a J logical binding and is used by an authored access index,
@@ -87,7 +99,7 @@ S_J or infer a Source recipe. input/REPLAY_CONTRACT.md defines
 the ownership boundary and input/TOOL.md defines the tools.
 
 `compiler-index.intent` is only a compact cross-reference of facts already present in
-S_J and MaskC. Its dependency subsets are syntactic and neither select nor authorize a
+S_J and optional complete C. Its dependency subsets are syntactic and neither select nor authorize a
 program axis, loop, lane, guard, or target API. Use it to avoid repeated JSON joins,
 then compile `boundary_ownership` as one whole-program contract. Preserve every
 authored access/effect as a distinct logical occurrence and keep logical domain guards
@@ -100,7 +112,7 @@ Ordinary algebraic instruction selection may fold a J `add` whose one operand is
 exact all-zero constant, including when that identity node exists only to express a
 logical broadcasted output shape.  Preserve the other operand, output mapping, access
 shape, predicate and effect, but do not emit target add arithmetic for the identity.
-The declaration order of `boundary_ownership.access_effects` is J/C-owned observable
+The declaration order of `boundary_ownership.access_effects` is J-owned observable
 effect order: emit the corresponding loads, stores, atomics, and updates in that order.
 Do not postpone an earlier authored statistics store until after later parameter loads or
 another output store merely to group computations or outputs.
@@ -140,12 +152,19 @@ read-write effect; do not separately load the base or emit an ordinary store.
 This exception requires that exact closed J dependency shape and additive
 combiner; it does not authorize atomic lowering for an output-only scalar,
 another reducer, or an unattached domain.
+For Ragged operations, preserve the J descriptor as the pair of rank-1 carrier
+tensors `offsets` and `indices`: `ragged_outer` returns the outer-group count,
+and `ragged_member` returns `indices[offsets[i]:offsets[i+1]]` for its scalar
+selector.  The descriptor is a semantic intermediate, not a target ABI object;
+do not pass a tuple descriptor across the target boundary.  A member result has
+a runtime-dependent rank-1 length, so do not treat it as a scalar or assign it a
+static length that is not authored by J.
 Factor the exact J effect axes before choosing a realization: distinguish axes shared across
 affected tensors, tensor-specific alternatives, and axes with anonymous C tile attachments.
 For an authored finite J domain with a C `tile_extent` attachment, you may choose the standard
 source-blind target realization `program_id * tile + arange(0, tile)` to cover that domain,
 provided you retain the J upper-bound predicate at every affected access. This is target
-instruction selection from J plus MaskC(C), not evidence about the Source grid or a pi
+instruction selection from J plus optional C, not evidence about the Source grid or a pi
 instruction. You may instead product-linearize non-tiled shared axes, share one guarded
 program coordinate across mutually exclusive tensor-specific axes, or choose another
 whole-program mapping when it preserves the same J-owned effects. Never derive a guard
@@ -159,7 +178,7 @@ is not a launch domain and MUST NOT receive an independent `program_id`, except 
 the closed singleton additive-scatter update above. Do not merge
 distinct parallel J domains into a product coordinate. Within one multi-axis parallel J
 domain, you may instead use one linear `program_id(0)`, derive the per-axis tile counts,
-and decode it with div/rem. These choices depend only on J domain ownership and MaskC(C),
+and decode it with div/rem. These choices depend only on J domain ownership and optional C,
 never on Source, grid, or pi.
 For an untiled parallel/output domain whose affected J stores are scalar in that domain
 coordinate, use one scalar `program_id` directly. Do not manufacture `arange(0, 1)`, a
@@ -170,7 +189,7 @@ When a rank-2-or-higher dense full-rank tensor has a closed anonymous
 `block_order` attachment for every tensor axis, you MUST realize every access
 to that tensor with `tl.make_block_ptr`, not expanded flat-pointer arithmetic:
 use the
-J-authored shape and stride scalars, the decoded tile offsets, the attached
+J-authored shape/dimension scalars and ABI-owned stride/address carriers, the decoded tile offsets, the attached
 anonymous order slots, and `boundary_check` on the same axes. This is permitted
 only when those access/axis attachments make the grouping unambiguous.
 For this fully attached multi-axis case, compute every `num_tiles[d]` with
@@ -195,7 +214,7 @@ the J-authored accumulator across tiles, form each global contraction coordinate
 loop base plus the local range, retain the authored access predicate, then perform the final
 local reduction and store. Even when the current anonymous tile equals the current extent,
 retain this physical loop form rather than turning the contraction axis into a launch axis.
-This is source-blind target lowering from J plus MaskC(C), not a Source loop claim or a pi
+This is source-blind target lowering from J plus optional C, not a Source loop claim or a pi
 instruction. Do not apply this contraction-loop rule to an ordinary standalone J `reduce`.
 For the closed standalone diagonal-gather reduction case, however, a physical tiled
 accumulator loop is the canonical target realization: J has one scalar reduction whose
@@ -225,7 +244,7 @@ per reduction with its authored identity, load each authored input once per tile
 with its exact predicate/fill, update the corresponding accumulator, and perform
 the authored local reductions only after the loop before evaluating the common
 scalar epilogue. Retain the J-authored read and write order. This is a generic
-multi-reduction lowering from J plus MaskC(C); it does not expose Source or pi.
+multi-reduction lowering from J plus optional C; it does not expose Source or pi.
 For the common rank-2-by-rank-1 contraction `ij,j->i`, keep the output coordinate as
 `[parallel_tile, 1]` and the contracted coordinate as `[1, reduction_tile]` throughout
 addressing and predicates. Compute each upper-bound comparison once at that expanded rank
@@ -268,10 +287,10 @@ predicates. Reuse those same expanded coordinates for address formation. This
 canonical target form follows only from J access rank and predicate sharing; do
 not compare rank-one coordinates and only later expand the boolean results. A
 genuinely rank-one access remains rank-one.
-In the common J-only fill case (no logical inputs, one guarded output, one runtime extent,
-and one anonymous tile), cast `program_id`, `arange`, and the runtime extent
-individually only when the J-selected coordinate dtype requires it. Do not rely
-on implicit promotion of an already-combined coordinate.
+In the common guarded fill case with complete C (no logical inputs, one guarded
+output, one runtime extent, and one C tile attachment), cast `program_id`,
+`arange`, and the runtime extent individually only when the J-selected coordinate
+dtype requires it. Do not rely on implicit promotion of an already-combined coordinate.
 Conversely, do not invent an explicit cast for a scalar operand when J does not
 author one. In particular, an i32 stride multiplied by a J-authored i64 iota is
 written directly as `coordinate * stride`; let the target's public mixed-integer
@@ -362,7 +381,7 @@ current output/replay.source is a compilation cache produced earlier from anothe
 it contains no Source, pi, Gate observation, or Harness fact and is not an authority.
 
 Read the complete new semantic program, the compact compiler index, frontend ABI,
-MaskC, and the current Replay.  Patch or rewrite the Replay so it implements the new
+optional complete C, and the current Replay. Patch or rewrite the Replay so it implements the new
 J.  The supplied change record only locates the edited J field; it does not authorize
 target semantics.  Preserve unchanged J-owned behavior, but never preserve old Replay
 behavior when it conflicts with the new J.
@@ -399,21 +418,29 @@ def _aggregate_usage(turns: list[CodexCLITurn]) -> dict[str, int]:
     return usage
 
 
-def _replay_startup_context(
-    packet: Mapping[str, Any], files: Mapping[str, str]
-) -> dict[str, Any]:
+def _replay_startup_context(files: Mapping[str, str]) -> dict[str, Any]:
     """Return a path-only receipt; Codex reads the exact packet as a local file."""
 
-    encoded = json.dumps(
-        packet,
-        sort_keys=True,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    packet_file = files.get("packet.json")
+    if not isinstance(packet_file, str):
+        raise ValueError("Replay startup context requires packet.json")
+    paths = {
+        "packet": "input/packet.json",
+        "semantic_program": "input/semantic-program.intent",
+        "semantic_program_json": "input/semantic-program.json",
+        "compiler_index": "input/compiler-index.intent",
+        "compiler_index_json": "input/compiler-index.json",
+        "frontend": "input/frontend.json",
+        "public_contract": "input/REPLAY_CONTRACT.md",
+        "tool_contract": "input/TOOL.md",
+        "replay": "output/replay.source",
+        "host_check": "work/host_replay_check.json",
+    }
+    if "c.json" in files:
+        paths["c"] = "input/c.json"
     return {
         "protocol": "intentir.scrc.replay-startup-view.v6",
-        "packet_bytes": len(encoded),
+        "packet_bytes": len(packet_file.encode("utf-8")),
         "semantic_program_text_bytes": len(
             files["semantic-program.intent"].encode("utf-8")
         ),
@@ -426,19 +453,7 @@ def _replay_startup_context(
         "compiler_index_json_bytes": len(
             files["compiler-index.json"].encode("utf-8")
         ),
-        "paths": {
-            "packet": "input/packet.json",
-            "semantic_program": "input/semantic-program.intent",
-            "semantic_program_json": "input/semantic-program.json",
-            "compiler_index": "input/compiler-index.intent",
-            "compiler_index_json": "input/compiler-index.json",
-            "mask_c": "input/mask-c.json",
-            "frontend": "input/frontend.json",
-            "public_contract": "input/REPLAY_CONTRACT.md",
-            "tool_contract": "input/TOOL.md",
-            "replay": "output/replay.source",
-            "host_check": "work/host_replay_check.json",
-        },
+        "paths": paths,
         "authority": (
             "path and byte-count receipt only; exact source-isolated packet bytes "
             "remain in input/packet.json and no code or schedule is generated"
@@ -526,6 +541,7 @@ def _j_contract_summary(semantic_program: Mapping[str, Any]) -> dict[str, Any]:
         "scatter",
         "select",
         "transpose",
+        *RAGGED_OPS,
     }
     typed_obligations: list[dict[str, Any]] = []
     for item in nodes if isinstance(nodes, list) else []:
@@ -781,7 +797,8 @@ class CodexCLIReplayWriter:
     frontend: Frontend = Frontend.TRITON
     model_timeout_seconds: float | None = None
     # Time, not a semantic-attempt count, bounds one fresh Replay episode.  High
-    # gets three full provider windows; xhigh gets two of its longer windows.
+    # High gets three full provider windows; xhigh/max get two of their longer
+    # windows.
     # This prevents a bad direction from cycling for an hour while leaving every
     # useful coding-agent tool action inside those turns unrestricted.
     session_wall_time_limit_seconds: float | None = None
@@ -820,7 +837,7 @@ class CodexCLIReplayWriter:
         if episode_limit is None:
             episode_limit = (
                 2.0 * XHIGH_RESPONSES_TIMEOUT_SECONDS
-                if effective_effort.casefold() == "xhigh"
+                if effective_effort.casefold() in {"xhigh", "max"}
                 else 3.0 * DEFAULT_RESPONSES_TIMEOUT_SECONDS
             )
         if episode_limit <= 0:
@@ -829,7 +846,7 @@ class CodexCLIReplayWriter:
         if turn_limit is None:
             turn_limit = (
                 XHIGH_RESPONSES_TIMEOUT_SECONDS
-                if effective_effort.casefold() == "xhigh"
+                if effective_effort.casefold() in {"xhigh", "max"}
                 else DEFAULT_RESPONSES_TIMEOUT_SECONDS
             )
         files, packet, _instructions = _replay_input_files(
@@ -847,6 +864,10 @@ class CodexCLIReplayWriter:
             indent=2,
         ) + "\n"
         function_name = str(packet["u_f"]["replay_function"])
+        if self.compile_checker is None and self.frontend is not Frontend.TRITON:
+            raise ValueError(
+                "native Codex Replay requires a frontend-specific compile checker"
+            )
 
         try:
             from minisweagent.environments.intentir_replay import (
@@ -881,7 +902,7 @@ class CodexCLIReplayWriter:
         formal_ingress = None
         formal_compile = None
         last_checked_good: str | None = None
-        startup_context = _replay_startup_context(agent_packet, files)
+        startup_context = _replay_startup_context(files)
         synthetic_compiler = (
             None
             if self.compile_checker is not None
@@ -906,6 +927,7 @@ class CodexCLIReplayWriter:
             )
             + "\n</j-change>\n"
         )
+        prompt_body += _frontend_replay_guidance(self.frontend)
         prompt = (
             prompt_body
             + "\n\n<source-blind-startup>\n"
@@ -1477,24 +1499,37 @@ class CodexCLIReplayWriter:
                 own_ir: Mapping[str, Any] | None = None
                 committed = False
                 if accepted:
-                    own_ir = _locked_tool_call(replay_ttir_inspect_tool, ("jc",))
-                    necessary = own_ir.get("j_owned_necessary_diagnostics")
                     try:
                         still_current = workspace.read_replay() == observed_text
                     except Exception:
                         still_current = False
-                    committed = (
-                        still_current
-                        and own_ir.get("status") == "pass"
-                        and not necessary
-                    )
+                    if synthetic_compiler is None:
+                        # Native frontends have no Triton TTIR.  Their
+                        # frontend-specific compile checker is the complete
+                        # source-blind construction checkpoint; Gate1 remains
+                        # the first native structural observer.
+                        committed = still_current
+                    else:
+                        own_ir = _locked_tool_call(
+                            replay_ttir_inspect_tool, ("jc",)
+                        )
+                        necessary = own_ir.get("j_owned_necessary_diagnostics")
+                        committed = (
+                            still_current
+                            and own_ir.get("status") == "pass"
+                            and not necessary
+                        )
                 live_checkpoint_events.append(
                     {
                         "replay_bytes": len(checked_text.encode()) if checked_text else 0,
                         "status": check.get("status", "fail"),
                         "accepted": accepted,
                         "j_owned_necessary": (
-                            own_ir.get("status") if own_ir is not None else "not_run"
+                            own_ir.get("status")
+                            if own_ir is not None
+                            else "not_applicable"
+                            if synthetic_compiler is None
+                            else "not_run"
                         ),
                         "committed": committed,
                     }
@@ -1508,7 +1543,11 @@ class CodexCLIReplayWriter:
                             "replay_bytes": len(checked_text.encode()),
                             "ingress": "pass",
                             "compile": "pass",
-                            "j_owned_necessary": "pass",
+                            "j_owned_necessary": (
+                                "not_applicable"
+                                if synthetic_compiler is None
+                                else "pass"
+                            ),
                             "authority": (
                                 "atomic commit of exact Agent-authored bytes only; "
                                 "fixed code generated and repaired no target source"
@@ -1675,6 +1714,23 @@ class CodexCLIReplayWriter:
                 active_elapsed_ms += turn.elapsed_ms
                 passed, check = evaluate_current(trigger="host_post_turn")
                 if passed and explicit_submission_accepted:
+                    break
+                if passed and synthetic_compiler is None:
+                    last_checked_good = source_text
+                    host_commit_events.append(
+                        {
+                            "trigger": "host_post_turn",
+                            "replay_bytes": len(source_text.encode()),
+                            "ingress": "pass",
+                            "compile": "pass",
+                            "j_owned_necessary": "not_applicable",
+                            "authority": (
+                                "exact Agent-authored native Replay bytes passed the "
+                                "frontend-specific construction checker; formal Gate1 "
+                                "remains external"
+                            ),
+                        }
+                    )
                     break
                 if passed:
                     last_checked_good = source_text

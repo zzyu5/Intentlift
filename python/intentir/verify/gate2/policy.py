@@ -27,6 +27,13 @@ _DTYPE_ALIASES = {
     "int16": "i16",
     "int32": "i32",
     "int64": "i64",
+    "index": "i64",
+    "uint8": "u8",
+    "uint16": "u16",
+    "uint32": "u32",
+    "ui8": "u8",
+    "ui16": "u16",
+    "ui32": "u32",
 }
 
 
@@ -303,6 +310,9 @@ def _operation_dependencies(operation: Mapping[str, Any]) -> tuple[str, ...]:
             if isinstance(arm, Mapping):
                 add(arm.get("yield_value"))
     if operation.get("op") == "loop":
+        trip = operation.get("trip")
+        if isinstance(trip, Mapping) and "upper_bound" in trip:
+            add(trip.get("upper_bound"))
         for item in operation.get("scan", ()):
             if isinstance(item, Mapping):
                 add(item.get("from"))
@@ -403,7 +413,11 @@ def _output_low_precision_compute_dtype(
             continue
         for operand in _operation_dependencies(operation):
             value_type = value_types.get(operand)
-            if value_type is None:
+            if (
+                value_type is None
+                or not value_type.is_tensor
+                or value_type.dtype is None
+            ):
                 continue
             operand_dtype = canonical_dtype(value_type.dtype)
             operand_rank = _FLOAT_PRECISION_RANK.get(operand_dtype)

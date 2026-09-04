@@ -42,6 +42,7 @@ from intentir.backend.roofline import (
     evaluate_logical_roofline,
 )
 from intentir.verify.gate1.compiler import KernelSource
+from intentir.ir.value_dimension import resolve_runtime_output_shapes
 from intentir.verify.gate2.compare import compare_outputs, validate_j_inputs
 from intentir.verify.gate2.model import OutputAgreement, PairwiseAgreement
 from intentir.verify.gate2.policy import ComparisonPolicy, DEFAULT_GATE2_POLICY
@@ -541,19 +542,77 @@ def _one_kernel(
         values=values,
     )
     j_inputs = {item.name: item for item in j.intent.inputs}
+    runtime_input_arrays = [
+        logical_runtime_array(
+            values[entry["input_bindings"][item.name]],
+            rank=len(item.shape),
+            name=item.name,
+        )
+        for item in j.intent.inputs
+    ]
+    runtime_input_arrays_by_name = {
+        item.name: value
+        for item, value in zip(j.intent.inputs, runtime_input_arrays, strict=True)
+    }
+    runtime_output_shapes = resolve_runtime_output_shapes(
+        j.intent,
+        [item.shape for item in j.intent.outputs],
+        runtime_input_arrays,
+        dims=entry["extents"],
+    )
+    specs_by_name = {
+        str(item["name"]): item for item in entry["output_specs"]
+    }
+    runtime_output_specs: list[dict[str, Any]] = []
+    for output, shape in zip(j.intent.outputs, runtime_output_shapes, strict=True):
+        raw_spec = specs_by_name.get(output.name)
+        if raw_spec is None:
+            raise ValueError(f"bundled output {output.name!r} is absent from its ABI")
+        declared_shape = raw_spec.get("shape")
+        if not isinstance(declared_shape, list) or len(declared_shape) != len(shape):
+            raise ValueError(f"bundled output {output.name!r} has an invalid shape")
+        if all(item != "?" for item in declared_shape):
+            try:
+                if tuple(int(item) for item in declared_shape) != shape:
+                    raise ValueError(
+                        f"bundled output {output.name!r} shape differs from the "
+                        f"J-derived runtime shape: {declared_shape} != {list(shape)}"
+                    )
+            except (TypeError, ValueError) as exc:
+                if isinstance(exc, ValueError) and str(exc).startswith("bundled output"):
+                    raise
+                raise ValueError(
+                    f"bundled output {output.name!r} has a non-integer shape"
+                ) from exc
+        runtime_spec = dict(raw_spec)
+        runtime_spec["shape"] = list(shape)
+        runtime_output_specs.append(runtime_spec)
+    entry = {**entry, "output_specs": runtime_output_specs}
+    for output, spec in zip(j.intent.outputs, runtime_output_specs, strict=True):
+        output_key = entry["output_bindings"][output.name]
+        if output_key not in reference:
+            raise ValueError(f"canonical reference omitted output {output.name!r}")
+        actual_shape = tuple(np.asarray(reference[output_key]).shape)
+        if actual_shape != tuple(spec["shape"]):
+            raise ValueError(
+                f"canonical reference output shape for {output.name!r} differs "
+                f"from the J-derived runtime shape: {actual_shape} != {spec['shape']}"
+            )
     inputs = []
     for name in entry["input_order"]:
         if name not in j_inputs:
             raise ValueError(f"bundled runtime input {name!r} is absent from J")
+        try:
+            runtime_array = runtime_input_arrays_by_name[name]
+        except KeyError as exc:
+            raise ValueError(
+                f"bundled runtime input {name!r} lacks its logical value"
+            ) from exc
         logical = j_inputs[name]
         inputs.append(
             torch_tensor_from_numpy(
                 torch,
-                logical_runtime_array(
-                    values[entry["input_bindings"][name]],
-                    rank=len(logical.shape),
-                    name=name,
-                ),
+                runtime_array,
                 dtype=_torch_dtype(torch, logical.dtype),
                 device="cuda",
             )
@@ -614,9 +673,14 @@ def _one_kernel(
     tensors = [*inputs, *outputs]
     workload_cost = entry.get("workload_cost")
     logical_io_bytes = sum(item.numel() * item.element_size() for item in tensors)
+    certified_io_bytes = (
+        workload_cost.get("boundary_io_bytes")
+        if workload_cost is not None
+        else None
+    )
     if (
-        workload_cost is not None
-        and int(workload_cost["boundary_io_bytes"]) != logical_io_bytes
+        certified_io_bytes is not None
+        and int(certified_io_bytes) != logical_io_bytes
     ):
         raise ValueError("CUDA tensors disagree with J workload-cost record")
     floating_point_ops = (

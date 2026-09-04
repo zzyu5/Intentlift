@@ -37,6 +37,9 @@ _DTYPE_ALIASES = {
     "i16": "int16",
     "i32": "int32",
     "i64": "int64",
+    "u8": "uint8",
+    "u16": "uint16",
+    "u32": "uint32",
 }
 
 
@@ -52,7 +55,22 @@ def _runtime_argument(value: Mapping[str, Any]) -> RuntimeArgument:
             isinstance(item, bool) or not isinstance(item, int) for item in shape
         ):
             raise ValueError("anonymous tensor argument requires an integer shape")
-        return RuntimeArgument.tensor(tuple(shape), dtype)
+        strides = value.get("strides")
+        if strides is not None:
+            if not isinstance(strides, list) or len(strides) != len(shape):
+                raise ValueError(
+                    "anonymous tensor argument strides must match its rank"
+                )
+            if any(
+                isinstance(item, bool) or not isinstance(item, int) or item < 0
+                for item in strides
+            ):
+                raise ValueError(
+                    "anonymous tensor argument strides must be non-negative integers"
+                )
+        return RuntimeArgument.tensor(
+            tuple(shape), dtype, strides=tuple(strides) if strides is not None else None
+        )
     if kind == "scalar":
         scalar = value.get("value")
         if isinstance(scalar, bool) or isinstance(scalar, (int, float)):

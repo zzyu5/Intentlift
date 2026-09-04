@@ -16,11 +16,28 @@ from __future__ import annotations
 import ast
 import copy
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Mapping, Sequence, TYPE_CHECKING
 
-from .model import IntentFunction, IntentOp
+from .model import (
+    IntentFunction,
+    IntentOp,
+    ValueType,
+    validate_loop_wiring,
+    validate_ragged_region_boundaries,
+    walk_intent_op_paths,
+    walk_intent_op_scopes,
+    walk_intent_ops,
+)
+from .intent_op_contract import (
+    IntentOpContractError,
+    RAGGED_OPS,
+    is_non_boolean_integer_dtype,
+    is_ragged_carrier_dtype,
+    validate_const_literal,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - imports are only for static checkers
     from intentir.verify.gate1.model import Gate1Artifact, SemanticArchive
@@ -42,6 +59,8 @@ _BINARY_SYMBOLS = {
     "mul": "*",
     "floordiv": "//",
     "mod": "%",
+    "left_shift": "<<",
+    "right_shift": ">>",
 }
 _COMPARE_SYMBOLS = {
     "lt": "<",
@@ -175,6 +194,8 @@ def _contract_expr(node: ast.AST, *, context: str) -> ContractExpr:
             ast.Mult: "mul",
             ast.FloorDiv: "floordiv",
             ast.Mod: "mod",
+            ast.LShift: "left_shift",
+            ast.RShift: "right_shift",
         }.get(type(node.op))
         if opcode is None:
             raise CanonicalJError(
@@ -349,10 +370,111 @@ def parse_index_expression(
 
 @dataclass(frozen=True)
 class CanonicalValueType:
-    dtype: str
+    dtype: str | None
     shape: tuple[Any, ...]
+    kind: str = "tensor"
+    fields: tuple[tuple[str, "CanonicalValueType"], ...] = ()
+
+    def __post_init__(self) -> None:
+        # CanonicalValueType is also a public typed-construction boundary.
+        # Do not let it grow a weaker validation language than ValueType:
+        # callers can construct record/ragged values directly without going
+        # through from_json().  Convert nested canonical fields to the model's
+        # ValueType representation, validate once through the shared model,
+        # then normalize the validated representation back to canonical
+        # fields.  This keeps kind/dtype/shape/field and Ragged-carrier rules
+        # identical for wire and typed callers.
+        def as_value_type(value: "CanonicalValueType") -> ValueType:
+            raw_fields: Any = value.fields
+            if isinstance(raw_fields, (list, tuple)):
+                converted_fields: list[Any] = []
+                for item in raw_fields:
+                    if (
+                        isinstance(item, (list, tuple))
+                        and len(item) == 2
+                        and isinstance(item[1], CanonicalValueType)
+                    ):
+                        converted_fields.append(
+                            (item[0], as_value_type(item[1]))
+                        )
+                    else:
+                        # Preserve malformed entries for ValueType to reject
+                        # with its normal closed-field diagnostics.
+                        converted_fields.append(item)
+                raw_fields = tuple(converted_fields)
+            return ValueType(
+                value.kind,
+                dtype=value.dtype,
+                shape=value.shape,
+                fields=raw_fields,
+            )
+
+        validated = as_value_type(self)
+        object.__setattr__(self, "dtype", validated.dtype)
+        object.__setattr__(self, "shape", tuple(validated.shape))
+        object.__setattr__(
+            self,
+            "fields",
+            tuple(
+                (name, CanonicalValueType.from_value_type(field_type))
+                for name, field_type in validated.fields
+            ),
+        )
+
+    @classmethod
+    def from_json(
+        cls, value: dict[str, Any], *, context: str = "CanonicalValueType"
+    ) -> "CanonicalValueType":
+        parsed = ValueType.from_json(value, context=context)
+        return cls(
+            dtype=parsed.dtype,
+            shape=parsed.shape,
+            kind=parsed.kind,
+            fields=tuple(
+                (name, cls.from_value_type(field_type))
+                for name, field_type in parsed.fields
+            ),
+        )
+
+    @classmethod
+    def from_value_type(cls, value: ValueType) -> "CanonicalValueType":
+        return cls(
+            dtype=value.dtype,
+            shape=value.shape,
+            kind=value.kind,
+            fields=tuple(
+                (name, cls.from_value_type(field_type))
+                for name, field_type in value.fields
+            ),
+        )
+
+    @property
+    def is_tensor(self) -> bool:
+        return self.kind == "tensor"
+
+    @property
+    def is_record(self) -> bool:
+        return self.kind == "record"
+
+    @property
+    def is_ragged(self) -> bool:
+        return self.kind == "ragged"
+
+    def field(self, name: str) -> "CanonicalValueType":
+        for field_name, field_type in self.fields:
+            if field_name == name:
+                return field_type
+        raise KeyError(name)
 
     def to_json(self) -> dict[str, Any]:
+        if self.kind in {"record", "ragged"}:
+            return {
+                "kind": self.kind,
+                "fields": [
+                    {"name": name, "type": field_type.to_json()}
+                    for name, field_type in self.fields
+                ],
+            }
         return {"dtype": self.dtype, "shape": list(self.shape)}
 
 
@@ -430,13 +552,7 @@ def _result_names(op: IntentOp) -> tuple[str, ...]:
 
 
 def _walk_ops(body: Sequence[IntentOp]) -> Iterable[IntentOp]:
-    for op in body:
-        yield op
-        yield from _walk_ops(op.body)
-        if op.op in {"effect_if", "value_if"}:
-            assert op.positive is not None and op.negative is not None
-            yield from _walk_ops(op.positive.body)
-            yield from _walk_ops(op.negative.body)
+    yield from walk_intent_ops(body)
 
 
 def _broadcast_shape(shapes: Sequence[tuple[Any, ...]]) -> tuple[Any, ...] | None:
@@ -483,15 +599,192 @@ def _project_explicit_broadcast_shape(
     return tuple(projected)
 
 
+_DYNAMIC_EXTENT = "?"
+def _is_integer_tensor(value: CanonicalValueType | None, *, rank: int | None = None) -> bool:
+    return bool(
+        value is not None
+        and value.is_tensor
+        and value.dtype is not None
+        and is_non_boolean_integer_dtype(value.dtype)
+        and (rank is None or len(value.shape) == rank)
+    )
+
+
+def _is_ragged_carrier_tensor(
+    value: CanonicalValueType | None, *, rank: int | None = None
+) -> bool:
+    return bool(
+        value is not None
+        and value.is_tensor
+        and is_ragged_carrier_dtype(value.dtype)
+        and (rank is None or len(value.shape) == rank)
+    )
+
+
+def _infer_ragged_type(
+    op: IntentOp,
+    known: Mapping[str, CanonicalValueType],
+) -> CanonicalValueType | None:
+    if op.op == "ragged" and len(op.operands) == 2:
+        offsets = known.get(op.operands[0])
+        indices = known.get(op.operands[1])
+        if _is_ragged_carrier_tensor(offsets, rank=1) and _is_ragged_carrier_tensor(
+            indices, rank=1
+        ):
+            return CanonicalValueType(
+                None,
+                (),
+                kind="ragged",
+                fields=(
+                    ("offsets", offsets),
+                    ("indices", indices),
+                ),
+            )
+    if op.op == "ragged_outer" and len(op.operands) == 1:
+        ragged = known.get(op.operands[0])
+        if ragged is not None and ragged.is_ragged:
+            offsets = ragged.field("offsets")
+            if offsets.dtype is not None:
+                return CanonicalValueType(offsets.dtype, ())
+    if op.op == "ragged_member" and len(op.operands) == 2:
+        ragged = known.get(op.operands[0])
+        index = known.get(op.operands[1])
+        if ragged is not None and ragged.is_ragged and _is_ragged_carrier_tensor(
+            index, rank=0
+        ):
+            indices = ragged.field("indices")
+            if indices.dtype is not None:
+                return CanonicalValueType(indices.dtype, (_DYNAMIC_EXTENT,))
+    return None
+
+
+def _validate_ragged_operation(
+    op: IntentOp,
+    known: Mapping[str, CanonicalValueType],
+    declared: CanonicalValueType | None,
+) -> None:
+    if op.op not in RAGGED_OPS:
+        return
+    if op.attrs:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} {op.op} does not accept attrs"
+        )
+    names = _result_names(op)
+    if len(names) != 1:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} {op.op} requires one result"
+        )
+    if declared is None:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} {op.op} requires an explicit result type"
+        )
+    if op.op == "ragged":
+        if len(op.operands) != 2:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} ragged requires offsets and indices"
+            )
+        offsets = known.get(op.operands[0])
+        indices = known.get(op.operands[1])
+        if offsets is not None and not _is_ragged_carrier_tensor(offsets, rank=1):
+            raise CanonicalJError(
+                "ragged offsets must be a rank-1 tensor with a closed carrier dtype"
+            )
+        if indices is not None and not _is_ragged_carrier_tensor(indices, rank=1):
+            raise CanonicalJError(
+                "ragged indices must be a rank-1 tensor with a closed carrier dtype"
+            )
+        if declared is not None:
+            if not declared.is_ragged:
+                raise CanonicalJError("ragged result must have kind='ragged'")
+            if tuple(name for name, _ in declared.fields) != ("offsets", "indices"):
+                raise CanonicalJError("ragged result fields must be offsets, indices")
+            if offsets is not None and declared.field("offsets") != offsets:
+                raise CanonicalJError("ragged offsets field type differs from operand")
+            if indices is not None and declared.field("indices") != indices:
+                raise CanonicalJError("ragged indices field type differs from operand")
+        return
+    if len(op.operands) != (1 if op.op == "ragged_outer" else 2):
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} {op.op} has invalid operand count"
+        )
+    ragged = known.get(op.operands[0])
+    if ragged is not None and not ragged.is_ragged:
+        raise CanonicalJError(f"{op.op} requires a ragged descriptor operand")
+    if op.op == "ragged_member":
+        index = known.get(op.operands[1])
+        if index is not None and not _is_ragged_carrier_tensor(index, rank=0):
+            raise CanonicalJError(
+                "ragged_member outer index must be a rank-0 closed carrier"
+            )
+    if declared is not None:
+        if not declared.is_tensor or not _is_ragged_carrier_tensor(declared):
+            raise CanonicalJError(
+                f"{op.op} result must use a closed Ragged carrier dtype"
+            )
+        expected_rank = 0 if op.op == "ragged_outer" else 1
+        if len(declared.shape) != expected_rank:
+            raise CanonicalJError(
+                f"{op.op} result must have rank {expected_rank}"
+            )
+        if op.op == "ragged_member" and declared.shape != (_DYNAMIC_EXTENT,):
+            raise CanonicalJError(
+                "ragged_member result shape must be the dynamic rank-1 shape ['?']"
+            )
+        expected_field = "offsets" if op.op == "ragged_outer" else "indices"
+        if ragged is not None and declared.dtype != ragged.field(expected_field).dtype:
+            raise CanonicalJError(
+                f"{op.op} result dtype must equal descriptor {expected_field} dtype"
+            )
+
+
 def _infer_shape(
     op: IntentOp,
     known: Mapping[str, CanonicalValueType],
     broadcast_axes: Mapping[str, Mapping[str, tuple[int, ...]]] | None = None,
     unit_dimensions: frozenset[str] = frozenset(),
 ) -> tuple[Any, ...] | None:
+    if op.op == "ragged_outer":
+        return ()
+    if op.op == "ragged_member":
+        return (_DYNAMIC_EXTENT,)
+    if op.op == "ragged":
+        return None
+    if op.op == "record_get" and op.operands:
+        record = known.get(op.operands[0])
+        field = op.attrs.get("field")
+        if record is not None and record.is_record and isinstance(field, str):
+            return record.field(field).shape
     operand_shapes = [known[name].shape for name in op.operands if name in known]
     if op.op in {"map_unary", "cast", "scan", "flip"} and operand_shapes:
         return operand_shapes[0]
+    if op.op == "scatter" and operand_shapes:
+        return operand_shapes[0]
+    if op.op == "nonzero" and operand_shapes:
+        return (_DYNAMIC_EXTENT, len(operand_shapes[0]))
+    if op.op == "masked_select" and operand_shapes:
+        return (_DYNAMIC_EXTENT,)
+    if op.op == "masked_scatter" and operand_shapes:
+        return operand_shapes[0]
+    if op.op == "reshape" and operand_shapes:
+        shape = op.attrs.get("shape")
+        if not isinstance(shape, list):
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} reshape requires attrs.shape"
+            )
+        if any(
+            not (
+                isinstance(dimension, str)
+                or isinstance(dimension, int)
+                and not isinstance(dimension, bool)
+                and dimension >= 0
+            )
+            for dimension in shape
+        ):
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} reshape shape must contain "
+                "non-negative integers or symbolic dimensions"
+            )
+        return tuple(shape)
     if op.op in {"map_binary", "select"} and len(operand_shapes) == len(op.operands):
         explicit = (
             broadcast_axes.get(op.result, {})
@@ -598,7 +891,18 @@ def _infer_shape(
         if width is not None and shape:
             shape[-1] = width
         return tuple(shape)
-    if op.op in {"const", "rand"}:
+    if op.op == "const":
+        result_type = op.type if isinstance(op.type, dict) else None
+        try:
+            literal = validate_const_literal(
+                op.attrs,
+                result_type=result_type,
+                context=f"IntentOp {op.node_id or op.op}",
+            )
+        except IntentOpContractError as exc:
+            raise CanonicalJError(str(exc)) from exc
+        return tuple(literal.shape)
+    if op.op == "rand":
         shape = op.attrs.get("shape", [])
         if isinstance(shape, list):
             return tuple(shape)
@@ -611,10 +915,31 @@ def _infer_dtypes(
     op: IntentOp,
     known: Mapping[str, CanonicalValueType],
 ) -> dict[str, str]:
+    if op.op in RAGGED_OPS:
+        inferred = _infer_ragged_type(op, known)
+        if inferred is not None and inferred.is_tensor and inferred.dtype is not None:
+            names = _result_names(op)
+            return {names[0]: inferred.dtype} if len(names) == 1 else {}
+        return {}
+    if op.op == "record_get" and isinstance(op.result, str) and op.operands:
+        record = known.get(op.operands[0])
+        field = op.attrs.get("field")
+        if record is not None and record.is_record and isinstance(field, str):
+            try:
+                field_type = record.field(field)
+            except KeyError:
+                return {}
+            if field_type.is_tensor and field_type.dtype is not None:
+                return {op.result: field_type.dtype}
+        return {}
     # Keep one source of truth with the MLIR emitter's closed operation table.
     from intentir.frontend.emit_mlir import _infer_op_dtypes
 
-    dtypes = {name: value.dtype for name, value in known.items()}
+    dtypes = {
+        name: value.dtype
+        for name, value in known.items()
+        if value.is_tensor and value.dtype is not None
+    }
     return _infer_op_dtypes(op, dtypes)
 
 
@@ -637,11 +962,250 @@ def _merge_type(
     return False
 
 
+def _validate_record_operation(
+    op: IntentOp,
+    known: Mapping[str, CanonicalValueType],
+    declared: CanonicalValueType | None,
+) -> None:
+    """Validate named record construction/extraction without flattening it."""
+
+    if op.op == "record":
+        if not isinstance(op.result, str) or declared is None or not declared.is_record:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} requires one record result type"
+            )
+        fields = op.attrs.get("fields")
+        names = [name for name, _field_type in declared.fields]
+        if not isinstance(fields, list) or fields != names or len(op.operands) != len(names):
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} fields must match its "
+                "record type and operand order"
+            )
+        for name, operand in zip(names, op.operands, strict=True):
+            operand_type = known.get(operand)
+            if operand_type is None:
+                continue
+            if operand_type != declared.field(name):
+                raise CanonicalJError(
+                    f"IntentOp {op.node_id or op.op!r} field {name!r} type "
+                    f"does not match operand {operand!r}"
+                )
+        return
+    if op.op == "record_get":
+        if not isinstance(op.result, str) or len(op.operands) != 1:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} record_get requires one "
+                "record operand and one result"
+            )
+        field = op.attrs.get("field")
+        record = known.get(op.operands[0])
+        if not isinstance(field, str) or record is None or not record.is_record:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} record_get requires a "
+                "known record operand and field"
+            )
+        try:
+            field_type = record.field(field)
+        except KeyError as exc:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} references unknown record "
+                f"field {field!r}"
+            ) from exc
+        if declared is not None and declared != field_type:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} result type differs from "
+                f"record field {field!r}"
+            )
+
+
+def _validate_gather_operation(
+    op: IntentOp,
+    known: Mapping[str, CanonicalValueType],
+    declared: CanonicalValueType | None,
+) -> None:
+    """Validate the shared J-level gather shape contract.
+
+    ``along_axis`` has two source-level spellings: an equal-rank index, or a
+    compressed index with the selected axis omitted.  The latter is legalized
+    to equal rank before the Intent MLIR op is emitted.  Keeping this rule in
+    canonical J makes TypeCheck, the CPU reference, and the MLIR projection
+    consume one semantic contract instead of allowing only one of them to
+    accept the compressed form.
+    """
+
+    if op.op != "gather":
+        return
+    if len(op.operands) != 2:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} gather requires data and index"
+        )
+    mode = op.attrs.get("mode")
+    if mode not in {"along_axis", "take"}:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} gather mode must be "
+            "'along_axis' or 'take'"
+        )
+    axis = op.attrs.get("axis")
+    if isinstance(axis, bool) or not isinstance(axis, int):
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} gather axis must be an integer"
+        )
+    data = known.get(op.operands[0])
+    index = known.get(op.operands[1])
+    if data is None or index is None:
+        return
+    if not data.is_tensor or not index.is_tensor:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} gather requires tensor data "
+            "and index values"
+        )
+    if not is_non_boolean_integer_dtype(index.dtype):
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} gather index must use a "
+            "closed non-boolean integer dtype"
+        )
+    rank = len(data.shape)
+    normalized_axis = axis + rank if axis < 0 else axis
+    if normalized_axis < 0 or normalized_axis >= rank:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} gather axis {axis} is outside "
+            f"data rank {rank}"
+        )
+
+    if mode == "along_axis":
+        equal_rank = len(index.shape) == rank
+        compressed_rank = len(index.shape) == rank - 1 and len(index.shape) > 0
+        if not (equal_rank or compressed_rank):
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} along_axis gather index "
+                "rank must equal data rank or data rank minus one"
+            )
+        expected_index_shape = (
+            data.shape
+            if equal_rank
+            else data.shape[:normalized_axis] + data.shape[normalized_axis + 1 :]
+        )
+        if index.shape != expected_index_shape:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} along_axis gather index "
+                f"shape {index.shape!r} must match non-axis data shape "
+                f"{expected_index_shape!r}"
+            )
+        expected_shape = index.shape
+    else:
+        expected_shape = (
+            data.shape[:normalized_axis]
+            + index.shape
+            + data.shape[normalized_axis + 1 :]
+        )
+
+    if declared is not None:
+        if not declared.is_tensor:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} gather result must be a tensor"
+            )
+        if declared.dtype != data.dtype:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} gather result dtype must "
+                "equal data dtype"
+            )
+        if declared.shape != expected_shape:
+            raise CanonicalJError(
+                f"IntentOp {op.node_id or op.op!r} gather result shape "
+                f"{declared.shape!r} must be {expected_shape!r}"
+            )
+
+
+def _validate_reshape_operation(
+    op: IntentOp,
+    known: Mapping[str, CanonicalValueType],
+    declared: CanonicalValueType | None,
+) -> None:
+    if op.op != "reshape":
+        return
+    if len(op.operands) != 1:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} reshape requires one operand"
+        )
+    shape = op.attrs.get("shape")
+    if not isinstance(shape, list) or any(
+        not (
+            isinstance(item, str)
+            or isinstance(item, int)
+            and not isinstance(item, bool)
+            and item >= 0
+        )
+        for item in shape
+    ):
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} reshape requires a closed "
+            "shape list"
+        )
+    if declared is not None and tuple(shape) != declared.shape:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} attrs.shape differs from its "
+            "declared result shape"
+        )
+    source = known.get(op.operands[0])
+    if source is not None and declared is not None:
+        if source.is_tensor != declared.is_tensor:
+            raise CanonicalJError("reshape cannot change tensor/record kind")
+        if source.is_tensor and source.dtype != declared.dtype:
+            raise CanonicalJError("reshape must preserve the element dtype")
+        if source.is_tensor and all(
+            isinstance(item, int) and not isinstance(item, bool)
+            for item in [*source.shape, *declared.shape]
+        ):
+            source_elements = 1
+            result_elements = 1
+            for item in source.shape:
+                source_elements *= item
+            for item in declared.shape:
+                result_elements *= item
+            if source_elements != result_elements:
+                raise CanonicalJError(
+                    f"IntentOp {op.node_id or op.op!r} changes the number of "
+                    "elements"
+                )
+
+
+def _validate_const_operation(
+    op: IntentOp,
+    known: Mapping[str, CanonicalValueType],
+    declared: CanonicalValueType | None,
+) -> None:
+    if op.op != "const":
+        return
+    names = _result_names(op)
+    if len(op.operands) != 0:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} const requires zero operands"
+        )
+    if len(names) != 1:
+        raise CanonicalJError(
+            f"IntentOp {op.node_id or op.op!r} const requires one result"
+        )
+    result_type = declared or known.get(names[0])
+    result_json = result_type.to_json() if result_type is not None else None
+    try:
+        validate_const_literal(
+            op.attrs,
+            result_type=result_json,
+            context=f"IntentOp {op.node_id or op.op}",
+        )
+    except IntentOpContractError as exc:
+        raise CanonicalJError(str(exc)) from exc
+
+
 def _elaborate_function_types(
     fn: IntentFunction,
     broadcast_axes: Mapping[str, Mapping[str, tuple[int, ...]]] | None = None,
     unit_dimensions: frozenset[str] = frozenset(),
 ) -> dict[str, CanonicalValueType]:
+    try:
+        validate_ragged_region_boundaries(fn.body)
+    except ValueError as exc:
+        raise CanonicalJError(str(exc)) from exc
     known: dict[str, CanonicalValueType] = {
         tensor.name: CanonicalValueType(tensor.dtype, tuple(tensor.shape))
         for tensor in [*fn.inputs, *fn.outputs]
@@ -663,11 +1227,30 @@ def _elaborate_function_types(
             context="IntentFunction return",
         )
 
-    operations = tuple(_walk_ops(fn.body))
+    scoped_operations = tuple(
+        walk_intent_op_scopes(
+            fn.body,
+            visible=(tensor.name for tensor in fn.inputs),
+        )
+    )
+    operations = tuple(item[1] for item in scoped_operations)
+    visible_names = {
+        id(operation): frozenset(bindings)
+        for _path, operation, bindings in scoped_operations
+    }
     for _ in range(len(operations) + 3):
         changed = False
         for op in operations:
+            operation_known = {
+                name: known[name]
+                for name in visible_names.get(id(op), ())
+                if name in known
+            }
             if op.op == "loop":
+                try:
+                    validate_loop_wiring(op, context="canonical J loop")
+                except ValueError as exc:
+                    raise CanonicalJError(str(exc)) from exc
                 # Structured-loop binders are ordinary typed J values.  A scan
                 # name denotes the complete logical source tensor (physical
                 # tiling belongs to C/pi), while every carry role has exactly
@@ -675,7 +1258,7 @@ def _elaborate_function_types(
                 # the loop body so an explicit body type cannot hide a shape
                 # contradiction at the region boundary.
                 for scan in op.scan:
-                    source_type = known.get(scan.source)
+                    source_type = operation_known.get(scan.source)
                     if source_type is None:
                         continue
                     if scan.axis < 0 or scan.axis >= len(source_type.shape):
@@ -690,11 +1273,25 @@ def _elaborate_function_types(
                         source_type,
                         context=f"IntentOp {op.node_id or op.op} scan",
                     )
+                if op.trip is not None and op.trip.is_dynamic:
+                    upper_type = operation_known.get(op.trip.upper_bound or "")
+                    if upper_type is not None:
+                        if not _is_integer_tensor(upper_type, rank=0):
+                            raise CanonicalJError(
+                                f"IntentOp {op.node_id or op.op} dynamic trip upper_bound "
+                                "must be a rank-0 integer tensor"
+                            )
+                        changed |= _merge_type(
+                            known,
+                            op.trip.index or "",
+                            CanonicalValueType(upper_type.dtype, ()),
+                            context=f"IntentOp {op.node_id or op.op} trip.index",
+                        )
                 for state in op.carry:
                     if state.type is None:
                         continue
-                    carry_type = CanonicalValueType(
-                        state.type.dtype, tuple(state.type.shape)
+                    carry_type = CanonicalValueType.from_value_type(
+                        state.type.as_value_type()
                     )
                     for role, name in (
                         ("body_argument", state.body_argument),
@@ -711,29 +1308,68 @@ def _elaborate_function_types(
                         )
                     if (
                         isinstance(state.init_value, str)
-                        and state.init_value in known
-                        and known[state.init_value] != carry_type
+                        and state.init_value in operation_known
+                        and operation_known[state.init_value] != carry_type
                     ):
                         raise CanonicalJError(
                             f"IntentOp {op.node_id or op.op!r} carry initializer "
                             f"{state.init_value!r} has type "
-                            f"{known[state.init_value].to_json()} but the carry "
+                            f"{operation_known[state.init_value].to_json()} but the carry "
                             f"declares {carry_type.to_json()}"
                         )
+                # A loop carry is the only Layer-A consumer that can constrain
+                # an otherwise untyped literal before its producer is visited.
+                # Reuse the emitter's closed dtype table so canonical J and
+                # MLIR emission normalize the same loop dataflow.
+                from intentir.frontend.emit_mlir import (
+                    _align_loop_body_literal_dtypes,
+                )
+
+                _align_loop_body_literal_dtypes(
+                    op,
+                    {
+                        name: value.dtype
+                        for name, value in known.items()
+                        if value.is_tensor and value.dtype is not None
+                    },
+                )
             names = _result_names(op)
             declared: CanonicalValueType | None = None
             if op.type is not None:
-                if (
-                    not isinstance(op.type, dict)
-                    or not isinstance(op.type.get("dtype"), str)
-                    or not isinstance(op.type.get("shape"), list)
-                ):
+                if not isinstance(op.type, dict):
                     raise CanonicalJError(
                         f"IntentOp {op.node_id or op.op!r} has a partial result type"
                     )
-                declared = CanonicalValueType(
-                    op.type["dtype"], tuple(op.type["shape"])
-                )
+                if op.type.get("kind") in {"record", "ragged"}:
+                    try:
+                        declared = CanonicalValueType.from_json(
+                            op.type,
+                            context=f"IntentOp {op.node_id or op.op}.type",
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise CanonicalJError(str(exc)) from exc
+                elif (
+                    not isinstance(op.type.get("dtype"), str)
+                    or not isinstance(op.type.get("shape"), list)
+                ):
+                    # Preserve the historical tensor-type validation and error
+                    # path for every pre-record operation.
+                    raise CanonicalJError(
+                        f"IntentOp {op.node_id or op.op!r} has a partial result type"
+                    )
+                else:
+                    try:
+                        declared = CanonicalValueType.from_json(
+                            op.type,
+                            context=f"IntentOp {op.node_id or op.op}.type",
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise CanonicalJError(str(exc)) from exc
+                if len(names) != 1 and declared.is_record:
+                    raise CanonicalJError(
+                        f"IntentOp {op.node_id or op.op!r} record type requires "
+                        "one result binding"
+                    )
                 if len(names) == 1:
                     changed |= _merge_type(
                         known,
@@ -741,16 +1377,33 @@ def _elaborate_function_types(
                         declared,
                         context=f"IntentOp {op.node_id or op.op}",
                     )
+                    operation_known[names[0]] = known[names[0]]
 
-            inferred_dtypes = _infer_dtypes(op, known)
+            _validate_const_operation(op, operation_known, declared)
+            if op.op in {"record", "record_get"}:
+                _validate_record_operation(op, operation_known, declared)
+            _validate_gather_operation(op, operation_known, declared)
+            _validate_ragged_operation(op, operation_known, declared)
+            _validate_reshape_operation(op, operation_known, declared)
+
+            inferred_value_type = _infer_ragged_type(op, operation_known)
+            if inferred_value_type is not None and len(names) == 1:
+                changed |= _merge_type(
+                    known,
+                    names[0],
+                    inferred_value_type,
+                    context=f"IntentOp {op.node_id or op.op}",
+                )
+
+            inferred_dtypes = _infer_dtypes(op, operation_known)
             inferred_shape = _infer_shape(
                 op,
-                known,
+                operation_known,
                 broadcast_axes,
                 unit_dimensions,
             )
             for name in names:
-                previous = known.get(name)
+                previous = operation_known.get(name)
                 dtype = inferred_dtypes.get(name) or (
                     previous.dtype if previous is not None else None
                 )
@@ -783,19 +1436,10 @@ def _elaborate_function_types(
 
 
 def _node_results(j: Any) -> dict[str, tuple[str, ...]]:
-    by_path: dict[str, tuple[str, ...]] = {}
-
-    def visit(body: Sequence[IntentOp], prefix: str = "body") -> None:
-        for index, op in enumerate(body):
-            path = f"{prefix}[{index}]"
-            by_path[path] = _result_names(op)
-            visit(op.body, f"{path}.body")
-            if op.op in {"effect_if", "value_if"}:
-                assert op.positive is not None and op.negative is not None
-                visit(op.positive.body, f"{path}.positive.body")
-                visit(op.negative.body, f"{path}.negative.body")
-
-    visit(j.intent.body)
+    by_path = {
+        path: _result_names(operation)
+        for path, operation in walk_intent_op_paths(j.intent.body)
+    }
     result = dict(by_path)
     for node_id, path in j.node_ids.items():
         if path in by_path:
@@ -813,26 +1457,7 @@ def _declared_broadcast_axes(
     second ``boundary.broadcasts`` declaration.
     """
 
-    by_path: dict[str, IntentOp] = {}
-
-    def visit(body: Sequence[IntentOp], prefix: str = "body") -> None:
-        for index, operation in enumerate(body):
-            path = f"{prefix}[{index}]"
-            by_path[path] = operation
-            visit(operation.body, f"{path}.body")
-            if operation.op in {"effect_if", "value_if"}:
-                assert operation.positive is not None
-                assert operation.negative is not None
-                visit(
-                    operation.positive.body,
-                    f"{path}.positive.body",
-                )
-                visit(
-                    operation.negative.body,
-                    f"{path}.negative.body",
-                )
-
-    visit(j.intent.body)
+    by_path = dict(walk_intent_op_paths(j.intent.body))
     nodes = dict(by_path)
     for node_id, path in j.node_ids.items():
         operation = by_path.get(path)
@@ -1117,18 +1742,22 @@ def _build_output_bindings(j: Any) -> tuple[CanonicalOutputBinding, ...]:
     bindings: list[CanonicalOutputBinding] = []
     for output in j.intent.outputs:
         mapping = mappings.get(output.name)
-        returned = returns.get(output.name)
-        if mapping is not None and returned is not None and mapping.value != returned:
+        try:
+            returned = returns[output.name]
+        except KeyError as exc:
+            raise CanonicalJError(
+                f"output {output.name!r} has no complete IntentFunction return"
+            ) from exc
+        if mapping is not None and mapping.value != returned:
             raise CanonicalJError(
                 f"output {output.name!r} has conflicting return and boundary mapping"
             )
-        value = mapping.value if mapping is not None else (returned or output.name)
         node_ref = mapping.node_ref if mapping is not None else None
         if node_ref is None:
-            candidates = sorted(set(result_nodes.get(value, [])))
+            candidates = sorted(set(result_nodes.get(returned, [])))
             if len(candidates) == 1:
                 node_ref = candidates[0]
-        bindings.append(CanonicalOutputBinding(output.name, value, node_ref))
+        bindings.append(CanonicalOutputBinding(output.name, returned, node_ref))
     return tuple(bindings)
 
 
@@ -1157,7 +1786,10 @@ def _elaborate_j(j: "SemanticArchive") -> tuple["SemanticArchive", JElaboration]
         return source_cached[1], source_cached[2]
 
     payload = copy.deepcopy(source_payload)
-    function = IntentFunction.from_json(payload["intent"])
+    # ``j`` has already crossed the strict Gate1 decoder.  Reusing the accepted
+    # object avoids reopening a permissive IntentFunction parser in the middle
+    # of canonicalization and keeps returns/type ownership on that one object.
+    function = copy.deepcopy(j.intent)
     _elaborate_function_types(
         function,
         _declared_broadcast_axes(j),
@@ -1226,7 +1858,7 @@ def _elaborate_j(j: "SemanticArchive") -> tuple["SemanticArchive", JElaboration]
         )
         for access in canonical_archive.boundary.accesses
     )
-    typed_function = IntentFunction.from_json(canonical_archive.intent.to_json())
+    typed_function = copy.deepcopy(canonical_archive.intent)
     value_types = tuple(
         sorted(
             _elaborate_function_types(
