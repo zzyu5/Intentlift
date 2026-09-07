@@ -3876,7 +3876,13 @@ def _require_compact_lift_pi(payload: Mapping[str, Any]) -> None:
 
 
 def _require_fresh_lift_j_surface(payload: Mapping[str, Any]) -> None:
-    """Reject redundant J loop capture lists at both fresh Lift ingress paths."""
+    """Keep fresh Lift on the complete current J surface at both ingress paths.
+
+    Retained historical Gate evidence may be normalized from a proven
+    direct-output/no-returns spelling by the archival parser.  A new provider
+    reply is not evidence: it must author its ordered return ABI explicitly,
+    so it cannot enter through that compatibility path.
+    """
 
     raw_j = payload.get("j")
     intent = raw_j.get("intent") if isinstance(raw_j, Mapping) else None
@@ -3885,6 +3891,11 @@ def _require_fresh_lift_j_surface(payload: Mapping[str, Any]) -> None:
     )
     if not isinstance(function, Mapping):
         return
+    if "returns" not in function:
+        raise ValueError(
+            "fresh J requires intent_function.returns; retained direct-output "
+            "compatibility is not accepted from Lift"
+        )
 
     def visit(body: Any, path: str) -> None:
         if not isinstance(body, list):

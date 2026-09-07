@@ -5069,8 +5069,8 @@ class ProvenanceRecord(StrictJSONMixin):
         return result
 
 
-def _canonicalize_retained_loop_capture_operands(value: Any) -> Any:
-    """Remove only historical loop-capture duplication from persisted J.
+def _canonicalize_retained_j_surface(value: Any) -> Any:
+    """Normalize only redundant historical J surface forms before parsing.
 
     The closed current J grammar represents a loop's external values through
     its body uses, typed scan/carry/trip boundary, and portable scope captures;
@@ -5080,6 +5080,17 @@ def _canonicalize_retained_loop_capture_operands(value: Any) -> Any:
     handle spellings and dropping that redundant field before the strict
     semantic parser runs.  Fresh Lift ingress rejects the field before it
     reaches this archival compatibility boundary.
+
+    The same retained evidence can use the earlier direct-output convention:
+    an operation writes a declared output ``t*`` directly and the function has
+    no explicit ``returns`` list.  That convention contains one determinable
+    fact only when every such direct output has exactly one producer, is not
+    consumed as an SSA value elsewhere in the body, and is either an output
+    producer or an inout passthrough.  In that narrow case this function turns
+    the direct result into a fresh ``v*`` and records the equivalent ordered
+    return binding.  It never guesses a result value, rewrites a logical tensor
+    use, or accepts a partial return ABI.  Thus current fresh Lift stays
+    strict while old immutable Gate evidence remains readable.
     """
 
     if not isinstance(value, dict):
@@ -5093,6 +5104,223 @@ def _canonicalize_retained_loop_capture_operands(value: Any) -> Any:
     )
     if not isinstance(function, dict):
         return result
+
+    def normalize_legacy_direct_outputs() -> None:
+        """Convert the only lossless no-``returns`` historical surface."""
+
+        if "returns" in function:
+            return
+        raw_inputs = function.get("inputs")
+        raw_outputs = function.get("outputs")
+        raw_body = function.get("body")
+        if not isinstance(raw_inputs, list) or not isinstance(raw_outputs, list):
+            # Leave ordinary strict-parser diagnostics intact for malformed J.
+            return
+        if not isinstance(raw_body, list):
+            return
+
+        def tensor_names(items: list[Any], *, path: str) -> list[str]:
+            names: list[str] = []
+            for index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    return []
+                name = item.get("name")
+                if not isinstance(name, str) or re.fullmatch(r"t[0-9]+", name) is None:
+                    return []
+                names.append(name)
+            if len(names) != len(set(names)):
+                raise SchemaError(f"{path} has duplicate logical tensor handles")
+            return names
+
+        input_names = tensor_names(raw_inputs, path="retained J inputs")
+        output_names = tensor_names(raw_outputs, path="retained J outputs")
+        if len(output_names) != len(raw_outputs):
+            return
+        output_set = set(output_names)
+        direct_producers: dict[str, tuple[dict[str, Any], int | None]] = {}
+        existing_v_indices: set[int] = set()
+
+        def collect_value_handles(item: Any) -> None:
+            if isinstance(item, str):
+                match = re.fullmatch(r"v([0-9]+)", item)
+                if match is not None:
+                    existing_v_indices.add(int(match.group(1)))
+                return
+            if isinstance(item, list):
+                for child in item:
+                    collect_value_handles(child)
+                return
+            if isinstance(item, dict):
+                for child in item.values():
+                    collect_value_handles(child)
+
+        collect_value_handles(raw_body)
+
+        def visit_body(body: Any, path: str) -> None:
+            if not isinstance(body, list):
+                return
+            for index, operation in enumerate(body):
+                operation_path = f"{path}[{index}]"
+                if not isinstance(operation, dict):
+                    continue
+                raw_result = operation.get("result")
+                result_names: list[tuple[str, int | None]] = []
+                if isinstance(raw_result, str):
+                    result_names.append((raw_result, None))
+                elif isinstance(raw_result, list):
+                    for result_index, item in enumerate(raw_result):
+                        if isinstance(item, str):
+                            result_names.append((item, result_index))
+                for result_name, result_index in result_names:
+                    if re.fullmatch(r"v[0-9]+", result_name) is not None:
+                        existing_v_indices.add(int(result_name[1:]))
+                        continue
+                    if re.fullmatch(r"t[0-9]+", result_name) is None:
+                        continue
+                    if result_name not in output_set:
+                        raise SchemaError(
+                            f"{operation_path}.result uses retained direct logical "
+                            f"value {result_name!r} that is not a declared output"
+                        )
+                    if result_name in direct_producers:
+                        raise SchemaError(
+                            "retained direct-output J has multiple producers for "
+                            f"{result_name!r}"
+                        )
+                    direct_producers[result_name] = (operation, result_index)
+                visit_body(operation.get("body"), f"{operation_path}.body")
+                for arm_name in ("positive", "negative"):
+                    arm = operation.get(arm_name)
+                    if isinstance(arm, dict):
+                        visit_body(arm.get("body"), f"{operation_path}.{arm_name}.body")
+
+        visit_body(raw_body, "SemanticArchive.intent.body")
+        if not direct_producers and output_names:
+            # An old no-return artifact can still be a pure inout pass-through;
+            # that is handled below.  Do not infer output-only results.
+            if any(name not in input_names for name in output_names):
+                raise SchemaError(
+                    "retained J without returns has no direct producer for an "
+                    "output-only tensor"
+                )
+
+        def reject_direct_output_uses(body: Any, path: str) -> None:
+            if not isinstance(body, list):
+                return
+            for index, operation in enumerate(body):
+                operation_path = f"{path}[{index}]"
+                if not isinstance(operation, dict):
+                    continue
+                for key, item in operation.items():
+                    if key in {"result", "body", "positive", "negative"}:
+                        continue
+
+                    def contains_direct_output(candidate: Any) -> str | None:
+                        if isinstance(candidate, str):
+                            return candidate if candidate in direct_producers else None
+                        if isinstance(candidate, list):
+                            for child in candidate:
+                                found = contains_direct_output(child)
+                                if found is not None:
+                                    return found
+                        if isinstance(candidate, dict):
+                            for child in candidate.values():
+                                found = contains_direct_output(child)
+                                if found is not None:
+                                    return found
+                        return None
+
+                    found = contains_direct_output(item)
+                    if found is not None:
+                        raise SchemaError(
+                            f"{operation_path}.{key} consumes retained direct output "
+                            f"{found!r}; archival normalization cannot guess whether it "
+                            "is a logical tensor or an SSA value"
+                        )
+                reject_direct_output_uses(
+                    operation.get("body"), f"{operation_path}.body"
+                )
+                for arm_name in ("positive", "negative"):
+                    arm = operation.get(arm_name)
+                    if isinstance(arm, dict):
+                        reject_direct_output_uses(
+                            arm.get("body"), f"{operation_path}.{arm_name}.body"
+                        )
+
+        reject_direct_output_uses(raw_body, "SemanticArchive.intent.body")
+
+        next_v_index = max(existing_v_indices, default=-1) + 1
+        value_by_output: dict[str, str] = {}
+        for output in output_names:
+            producer = direct_producers.get(output)
+            if producer is None:
+                if output not in input_names:
+                    raise SchemaError(
+                        "retained J without returns cannot prove the value for "
+                        f"output-only tensor {output!r}"
+                    )
+                value_by_output[output] = output
+                continue
+            value = f"v{next_v_index}"
+            next_v_index += 1
+            operation, result_index = producer
+            if result_index is None:
+                operation["result"] = value
+            else:
+                raw_result = operation["result"]
+                assert isinstance(raw_result, list)
+                raw_result[result_index] = value
+            value_by_output[output] = value
+
+        boundary = result.get("boundary")
+        if isinstance(boundary, dict):
+            mappings = boundary.get("output_mappings", [])
+            if not isinstance(mappings, list):
+                raise SchemaError(
+                    "retained J boundary.output_mappings must be an array"
+                )
+            for index, mapping in enumerate(mappings):
+                if not isinstance(mapping, dict):
+                    raise SchemaError(
+                        f"retained J boundary.output_mappings[{index}] must be an object"
+                    )
+                output = mapping.get("output")
+                value = mapping.get("value")
+                if output in direct_producers:
+                    if value != output:
+                        raise SchemaError(
+                            "retained direct-output boundary mapping disagrees "
+                            f"with the sole producer for {output!r}"
+                        )
+                    mapping["value"] = value_by_output[str(output)]
+
+        # Portable scopes name semantic values, rather than caller-owned
+        # output destinations.  A retained direct-output result therefore has
+        # to follow its generated SSA value in both definitions and captures;
+        # leaving the old t* spelling would make scope ownership disagree with
+        # the body that was just normalized above.
+        scopes = result.get("scopes")
+        if isinstance(scopes, list):
+            for scope in scopes:
+                if not isinstance(scope, dict):
+                    continue
+                for field in ("captures", "definitions"):
+                    values = scope.get(field)
+                    if not isinstance(values, list):
+                        continue
+                    scope[field] = [
+                        value_by_output[item]
+                        if isinstance(item, str) and item in direct_producers
+                        else item
+                        for item in values
+                    ]
+
+        function["returns"] = [
+            {"output": output, "value": value_by_output[output]}
+            for output in output_names
+        ]
+
+    normalize_legacy_direct_outputs()
 
     def normalize_body(body: Any, path: str) -> None:
         if not isinstance(body, list):
@@ -5158,7 +5386,7 @@ class Gate1Artifact(StrictJSONMixin):
     def __post_init__(self) -> None:
         if not isinstance(self.j, SemanticArchive):
             self.j = SemanticArchive.from_json(
-                _canonicalize_retained_loop_capture_operands(self.j)
+                _canonicalize_retained_j_surface(self.j)
             )
         if not isinstance(self.c, ImplementationConfig):
             self.c = ImplementationConfig.from_json(self.c)
@@ -5628,7 +5856,7 @@ class Gate1Artifact(StrictJSONMixin):
             raise SchemaError(str(exc)) from exc
         return cls(
             j=SemanticArchive.from_json(
-                _canonicalize_retained_loop_capture_operands(data["j"])
+                _canonicalize_retained_j_surface(data["j"])
             ),
             c=ImplementationConfig.from_json(data["c"]),
             pi=pi,
