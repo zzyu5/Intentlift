@@ -30,7 +30,7 @@ class LitellmModelConfig(BaseModel):
     model_kwargs: dict[str, Any] = {}
     """Additional arguments passed to the API."""
     litellm_model_registry: Path | str | None = os.getenv("LITELLM_MODEL_REGISTRY_PATH")
-    """Model registry for cost tracking and model metadata. See the local model guide (https://mini-swe-agent.com/latest/models/local_models/) for more details."""
+    """Optional LiteLLM registry for cost tracking and model metadata."""
     set_cache_control: Literal["default_end"] | None = None
     """Set explicit cache control markers, for example for Anthropic models"""
     cost_tracking: Literal["default", "ignore_errors"] = os.getenv("MSWEA_COST_TRACKING", "default")
@@ -76,7 +76,7 @@ class LitellmModel:
                 **(self.config.model_kwargs | kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:
-            e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
+            e.message += " Configure credentials through the IntentIR provider settings."
             raise e
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
@@ -130,9 +130,8 @@ class LitellmModel:
                     f"Error calculating cost for model {self.config.model_name}: {e}, perhaps it's not registered? "
                     "You can ignore this issue from your config file with cost_tracking: 'ignore_errors' or "
                     "globally with export MSWEA_COST_TRACKING='ignore_errors'. "
-                    "Alternatively check the 'Cost tracking' section in the documentation at "
-                    "https://klieret.short.gy/mini-local-models. "
-                    " Still stuck? Please open a github issue at https://github.com/SWE-agent/mini-swe-agent/issues/new/choose!"
+                    "Otherwise add the selected model to the LiteLLM registry used "
+                    "by the IntentIR provider."
                 )
                 logger.critical(msg)
                 raise RuntimeError(msg) from e

@@ -59,7 +59,7 @@ GATE1_ARTIFACT_MODEL_FIELDS = (
     "pi",
 )
 GATE1_ARTIFACT_PRIVATE_FIELDS: tuple[str, ...] = ()
-SEMANTIC_ARCHIVE_LEGACY_WIRE_FIELDS = (
+SEMANTIC_ARCHIVE_WIRE_FIELDS = (
     "kernel_id",
     "intent",
     "node_ids",
@@ -67,14 +67,11 @@ SEMANTIC_ARCHIVE_LEGACY_WIRE_FIELDS = (
     "signature",
     "scopes",
     "storage",
-)
-SEMANTIC_ARCHIVE_WIRE_FIELDS = (
-    *SEMANTIC_ARCHIVE_LEGACY_WIRE_FIELDS,
     "dimension_constraints",
     "value_dimension_relations",
     "dimension_relations",
 )
-BOUNDARY_LEGACY_WIRE_FIELDS = (
+BOUNDARY_WIRE_FIELDS = (
     "domains",
     "accesses",
     "broadcasts",
@@ -86,13 +83,7 @@ BOUNDARY_LEGACY_WIRE_FIELDS = (
     "updates",
     "result_relations",
     "realization_authorizations",
-)
-BOUNDARY_V4_WIRE_FIELDS = (
-    *BOUNDARY_LEGACY_WIRE_FIELDS,
     "consumer_extensions",
-)
-BOUNDARY_WIRE_FIELDS = (
-    *BOUNDARY_V4_WIRE_FIELDS,
     "access_guard_relations",
 )
 BOUNDARY_ACCESS_WIRE_FIELDS = (
@@ -152,15 +143,15 @@ def render_boundary_access_wire_grammar() -> str:
         "broadcast_in_dim or another operation. "
         "For a predicated pure-functional boundary, the observable store "
         "producer carries an explicit result type equal to the J output. A "
-        "direct same-handle output needs no output_mapping. Prefer a complete "
+        "same-handle inout return needs no output_mapping. Prefer a complete "
         "returns list in output ABI order; output_mappings is sparse and may "
         "also name an output only when its value exactly agrees with returns. "
         "Do not omit a returns entry merely because an output_mapping exists. "
-        "consumer_extensions is the sole artifact.v4+ authority for a physical "
+        "consumer_extensions is the sole authority for a physical "
         "outside-domain contribution to one sum/max/min reduce or scan operand. "
         "It references the predicate-bearing access instead of copying or "
         "promoting that predicate into Layer-A SSA. access_guard_relations is "
-        "the artifact.v5 J-owned relation between one boundary access and one "
+        "the J-owned relation between one boundary access and one "
         "explicit Layer-A guard value; Lift must author every field and fixed "
         "code never infers or inserts the relation."
     )
@@ -1690,18 +1681,11 @@ class OutputMapping(StrictJSONMixin):
 
 @dataclass
 class ReductionBoundary(StrictJSONMixin):
-    """Algebra/local-axis boundary contract for a reduce or inclusive scan.
-
-    The wire name is retained for compatibility.  ``identity`` records the
-    algebraic identity used to pad the frontend-local tile;
-    ``masked_contribution`` records the effective contribution when the
-    frontend expresses masking after loading.  At least one must be explicit.
-    """
+    """Algebra/local-axis boundary contract for a reduce or inclusive scan."""
 
     node_ref: str
     tile_axis: int | str
-    identity: JsonValue = None
-    masked_contribution: JsonValue = None
+    identity: JsonValue
 
     def __post_init__(self) -> None:
         self.node_ref = _handle(
@@ -1710,46 +1694,40 @@ class ReductionBoundary(StrictJSONMixin):
             r"n[0-9]+",
             "an n* node handle",
         )
-        if isinstance(self.tile_axis, bool) or not isinstance(self.tile_axis, (int, str)):
-            raise SchemaError("ReductionBoundary.tile_axis must be an integer or string")
+        if isinstance(self.tile_axis, bool) or not isinstance(
+            self.tile_axis, (int, str)
+        ):
+            raise SchemaError(
+                "ReductionBoundary.tile_axis must be an integer or string"
+            )
         if isinstance(self.tile_axis, int) and self.tile_axis < 0:
             raise SchemaError("ReductionBoundary.tile_axis must be non-negative")
         if isinstance(self.tile_axis, str):
             self.tile_axis = _string(self.tile_axis, "ReductionBoundary.tile_axis")
         self.identity = _json_value(self.identity, "ReductionBoundary.identity")
-        self.masked_contribution = _json_value(
-            self.masked_contribution, "ReductionBoundary.masked_contribution"
-        )
-        if self.identity is None and self.masked_contribution is None:
-            raise SchemaError(
-                "ReductionBoundary requires identity or masked_contribution"
-            )
+        if self.identity is None:
+            raise SchemaError("ReductionBoundary.identity must be explicit")
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "ReductionBoundary":
         data = _strict_object(
             value,
             path="ReductionBoundary",
-            allowed={"node_ref", "tile_axis", "identity", "masked_contribution"},
-            required={"node_ref", "tile_axis"},
+            allowed={"node_ref", "tile_axis", "identity"},
+            required={"node_ref", "tile_axis", "identity"},
         )
         return cls(
             node_ref=data["node_ref"],
             tile_axis=data["tile_axis"],
-            identity=data.get("identity"),
-            masked_contribution=data.get("masked_contribution"),
+            identity=data["identity"],
         )
 
     def to_json(self) -> dict[str, Any]:
-        result: dict[str, Any] = {
+        return {
             "node_ref": self.node_ref,
             "tile_axis": self.tile_axis,
+            "identity": copy.deepcopy(self.identity),
         }
-        if self.identity is not None:
-            result["identity"] = copy.deepcopy(self.identity)
-        if self.masked_contribution is not None:
-            result["masked_contribution"] = copy.deepcopy(self.masked_contribution)
-        return result
 
 
 @dataclass
@@ -2377,36 +2355,36 @@ class Boundary(StrictJSONMixin):
             value,
             path="Boundary",
             allowed=cls._KEYS,
-            required=set(BOUNDARY_LEGACY_WIRE_FIELDS),
+            required=set(BOUNDARY_WIRE_FIELDS),
         )
         for key in cls._KEYS - {"domains"}:
-            if key in data and not isinstance(data[key], list):
+            if not isinstance(data[key], list):
                 raise SchemaError(f"Boundary.{key} must be an array")
-        domains = data.get("domains", {})
+        domains = data["domains"]
         if not isinstance(domains, dict):
             raise SchemaError("Boundary.domains must be an object")
         return cls(
             domains=dict(domains),
-            accesses=[BoundaryAccess.from_json(item) for item in data.get("accesses", [])],
-            broadcasts=[BroadcastSpec.from_json(item) for item in data.get("broadcasts", [])],
-            aliases=[AliasSpec.from_json(item) for item in data.get("aliases", [])],
-            effects=[EffectSpec.from_json(item) for item in data.get("effects", [])],
-            output_mappings=[OutputMapping.from_json(item) for item in data.get("output_mappings", [])],
-            reductions=[ReductionBoundary.from_json(item) for item in data.get("reductions", [])],
-            index_bounds=[IndexBoundsSpec.from_json(item) for item in data.get("index_bounds", [])],
-            updates=[LogicalUpdateSpec.from_json(item) for item in data.get("updates", [])],
-            result_relations=[ResultRelationSpec.from_json(item) for item in data.get("result_relations", [])],
+            accesses=[BoundaryAccess.from_json(item) for item in data["accesses"]],
+            broadcasts=[BroadcastSpec.from_json(item) for item in data["broadcasts"]],
+            aliases=[AliasSpec.from_json(item) for item in data["aliases"]],
+            effects=[EffectSpec.from_json(item) for item in data["effects"]],
+            output_mappings=[OutputMapping.from_json(item) for item in data["output_mappings"]],
+            reductions=[ReductionBoundary.from_json(item) for item in data["reductions"]],
+            index_bounds=[IndexBoundsSpec.from_json(item) for item in data["index_bounds"]],
+            updates=[LogicalUpdateSpec.from_json(item) for item in data["updates"]],
+            result_relations=[ResultRelationSpec.from_json(item) for item in data["result_relations"]],
             realization_authorizations=[
                 RealizationAuthorization.from_json(item)
-                for item in data.get("realization_authorizations", [])
+                for item in data["realization_authorizations"]
             ],
             consumer_extensions=[
                 ConsumerExtension.from_json(item)
-                for item in data.get("consumer_extensions", [])
+                for item in data["consumer_extensions"]
             ],
             access_guard_relations=[
                 AccessGuardRelation.from_json(item)
-                for item in data.get("access_guard_relations", [])
+                for item in data["access_guard_relations"]
             ],
         )
 
@@ -2949,31 +2927,10 @@ def _validate_typed_boundary_relations(archive: "SemanticArchive") -> None:
 def _validate_semantic_scopes_and_storage(archive: "SemanticArchive") -> None:
     """Cross-check explicit portable scopes and semantic storage against J."""
 
-    loop_ops = [
-        op
-        for top in archive.intent.body
-        for op in _walk_intent_ops(top)
-        if op.op == "loop"
-    ]
-    conditional_ops = [
-        op
-        for top in archive.intent.body
-        for op in _walk_intent_ops(top)
-        if op.op in {"effect_if", "value_if"}
-    ]
     if not archive.scopes:
-        if loop_ops or conditional_ops:
-            raise SchemaError(
-                "SemanticArchive.scopes is required when J contains a semantic region"
-            )
-        if archive.storage:
-            raise SchemaError(
-                "SemanticArchive.storage requires an explicit portable scope tree"
-            )
-        # Migration path for legacy straight-line artifacts.  New Lift wire
-        # schema always emits scopes/storage, but old cached artifacts remain
-        # readable until the protocol switch in P5.
-        return
+        raise SchemaError(
+            "SemanticArchive.scopes must contain the function scope"
+        )
 
     scope_by_id = {scope.scope_id: scope for scope in archive.scopes}
     _unique(archive.scopes, "scope_id", "SemanticArchive.scopes")
@@ -3945,7 +3902,7 @@ class SemanticArchive(StrictJSONMixin):
             self.intent = _strict_intent(self.intent)
         else:
             # Reparse to enforce the closed persisted representation even for a
-            # directly constructed legacy IntentFunction.
+            # directly constructed IntentFunction.
             self.intent = _strict_intent(self.intent.to_json())
         if not isinstance(self.node_ids, dict):
             raise SchemaError("SemanticArchive.node_ids must be an object")
@@ -4057,11 +4014,11 @@ class SemanticArchive(StrictJSONMixin):
             value,
             path="SemanticArchive",
             allowed=set(SEMANTIC_ARCHIVE_WIRE_FIELDS),
-            required=set(SEMANTIC_ARCHIVE_LEGACY_WIRE_FIELDS),
+            required=set(SEMANTIC_ARCHIVE_WIRE_FIELDS),
         )
         node_ids = _object(data["node_ids"], "SemanticArchive.node_ids")
-        scopes = data.get("scopes", [])
-        storage = data.get("storage", [])
+        scopes = data["scopes"]
+        storage = data["storage"]
         if not isinstance(scopes, list):
             raise SchemaError("SemanticArchive.scopes must be an array")
         if not isinstance(storage, list):
@@ -4074,14 +4031,14 @@ class SemanticArchive(StrictJSONMixin):
             signature=LogicalSignature.from_json(data["signature"]),
             scopes=[PortableScope.from_json(item) for item in scopes],
             storage=[StorageObject.from_json(item) for item in storage],
-            dimension_constraints=data.get("dimension_constraints", []),
+            dimension_constraints=data["dimension_constraints"],
             value_dimension_relations=[
                 ValueDimensionRelation.from_json(item)
-                for item in data.get("value_dimension_relations", [])
+                for item in data["value_dimension_relations"]
             ],
             dimension_relations=[
                 DimensionRelation.from_json(item)
-                for item in data.get("dimension_relations", [])
+                for item in data["dimension_relations"]
             ],
         )
 
@@ -4687,14 +4644,7 @@ class ScheduleSlot(StrictJSONMixin):
 
 
 def implementation_value_matches(value_type: str, value: Any) -> bool:
-    """Return whether one C value is a closed scalar of its declared type.
-
-    ``ImplementationConfig`` remains able to decode historical artifacts with
-    optional or absent values.  Active consumers call
-    :meth:`ImplementationConfig.validate_complete_values` so a Replay never
-    turns one of those historical omissions into an invented implementation
-    binding.
-    """
+    """Return whether one C value is a closed scalar of its declared type."""
 
     normalized = value_type.casefold()
     if normalized in {"bool", "i1"}:
@@ -4781,12 +4731,7 @@ class ImplementationConfig(StrictJSONMixin):
         )
 
     def missing_required_values(self) -> list[str]:
-        """Return legacy-required slots without a value.
-
-        This intentionally preserves historical artifact decoding.  Active
-        Replay uses ``validate_complete_values`` instead: once C is present,
-        every remaining normalized slot is active and must be bound.
-        """
+        """Return required C slots that do not have a bound value."""
 
         return [
             slot.name
@@ -5069,314 +5014,11 @@ class ProvenanceRecord(StrictJSONMixin):
         return result
 
 
-def _canonicalize_retained_j_surface(value: Any) -> Any:
-    """Normalize only redundant historical J surface forms before parsing.
-
-    The closed current J grammar represents a loop's external values through
-    its body uses, typed scan/carry/trip boundary, and portable scope captures;
-    a second ``loop.operands`` list carries no independent semantic fact.  A
-    few retained Gate artifacts predate that canonical form.  Preserve their
-    evidence readability by accepting only a duplicate-free list of J value-
-    handle spellings and dropping that redundant field before the strict
-    semantic parser runs.  Fresh Lift ingress rejects the field before it
-    reaches this archival compatibility boundary.
-
-    The same retained evidence can use the earlier direct-output convention:
-    an operation writes a declared output ``t*`` directly and the function has
-    no explicit ``returns`` list.  That convention contains one determinable
-    fact only when every such direct output has exactly one producer, is not
-    consumed as an SSA value elsewhere in the body, and is either an output
-    producer or an inout passthrough.  In that narrow case this function turns
-    the direct result into a fresh ``v*`` and records the equivalent ordered
-    return binding.  It never guesses a result value, rewrites a logical tensor
-    use, or accepts a partial return ABI.  Thus current fresh Lift stays
-    strict while old immutable Gate evidence remains readable.
-    """
-
-    if not isinstance(value, dict):
-        return value
-    result = copy.deepcopy(value)
-    intent = result.get("intent")
-    function = (
-        intent.get("intent_function")
-        if isinstance(intent, dict)
-        else None
-    )
-    if not isinstance(function, dict):
-        return result
-
-    def normalize_legacy_direct_outputs() -> None:
-        """Convert the only lossless no-``returns`` historical surface."""
-
-        if "returns" in function:
-            return
-        raw_inputs = function.get("inputs")
-        raw_outputs = function.get("outputs")
-        raw_body = function.get("body")
-        if not isinstance(raw_inputs, list) or not isinstance(raw_outputs, list):
-            # Leave ordinary strict-parser diagnostics intact for malformed J.
-            return
-        if not isinstance(raw_body, list):
-            return
-
-        def tensor_names(items: list[Any], *, path: str) -> list[str]:
-            names: list[str] = []
-            for index, item in enumerate(items):
-                if not isinstance(item, dict):
-                    return []
-                name = item.get("name")
-                if not isinstance(name, str) or re.fullmatch(r"t[0-9]+", name) is None:
-                    return []
-                names.append(name)
-            if len(names) != len(set(names)):
-                raise SchemaError(f"{path} has duplicate logical tensor handles")
-            return names
-
-        input_names = tensor_names(raw_inputs, path="retained J inputs")
-        output_names = tensor_names(raw_outputs, path="retained J outputs")
-        if len(output_names) != len(raw_outputs):
-            return
-        output_set = set(output_names)
-        direct_producers: dict[str, tuple[dict[str, Any], int | None]] = {}
-        existing_v_indices: set[int] = set()
-
-        def collect_value_handles(item: Any) -> None:
-            if isinstance(item, str):
-                match = re.fullmatch(r"v([0-9]+)", item)
-                if match is not None:
-                    existing_v_indices.add(int(match.group(1)))
-                return
-            if isinstance(item, list):
-                for child in item:
-                    collect_value_handles(child)
-                return
-            if isinstance(item, dict):
-                for child in item.values():
-                    collect_value_handles(child)
-
-        collect_value_handles(raw_body)
-
-        def visit_body(body: Any, path: str) -> None:
-            if not isinstance(body, list):
-                return
-            for index, operation in enumerate(body):
-                operation_path = f"{path}[{index}]"
-                if not isinstance(operation, dict):
-                    continue
-                raw_result = operation.get("result")
-                result_names: list[tuple[str, int | None]] = []
-                if isinstance(raw_result, str):
-                    result_names.append((raw_result, None))
-                elif isinstance(raw_result, list):
-                    for result_index, item in enumerate(raw_result):
-                        if isinstance(item, str):
-                            result_names.append((item, result_index))
-                for result_name, result_index in result_names:
-                    if re.fullmatch(r"v[0-9]+", result_name) is not None:
-                        existing_v_indices.add(int(result_name[1:]))
-                        continue
-                    if re.fullmatch(r"t[0-9]+", result_name) is None:
-                        continue
-                    if result_name not in output_set:
-                        raise SchemaError(
-                            f"{operation_path}.result uses retained direct logical "
-                            f"value {result_name!r} that is not a declared output"
-                        )
-                    if result_name in direct_producers:
-                        raise SchemaError(
-                            "retained direct-output J has multiple producers for "
-                            f"{result_name!r}"
-                        )
-                    direct_producers[result_name] = (operation, result_index)
-                visit_body(operation.get("body"), f"{operation_path}.body")
-                for arm_name in ("positive", "negative"):
-                    arm = operation.get(arm_name)
-                    if isinstance(arm, dict):
-                        visit_body(arm.get("body"), f"{operation_path}.{arm_name}.body")
-
-        visit_body(raw_body, "SemanticArchive.intent.body")
-        if not direct_producers and output_names:
-            # An old no-return artifact can still be a pure inout pass-through;
-            # that is handled below.  Do not infer output-only results.
-            if any(name not in input_names for name in output_names):
-                raise SchemaError(
-                    "retained J without returns has no direct producer for an "
-                    "output-only tensor"
-                )
-
-        def reject_direct_output_uses(body: Any, path: str) -> None:
-            if not isinstance(body, list):
-                return
-            for index, operation in enumerate(body):
-                operation_path = f"{path}[{index}]"
-                if not isinstance(operation, dict):
-                    continue
-                for key, item in operation.items():
-                    if key in {"result", "body", "positive", "negative"}:
-                        continue
-
-                    def contains_direct_output(candidate: Any) -> str | None:
-                        if isinstance(candidate, str):
-                            return candidate if candidate in direct_producers else None
-                        if isinstance(candidate, list):
-                            for child in candidate:
-                                found = contains_direct_output(child)
-                                if found is not None:
-                                    return found
-                        if isinstance(candidate, dict):
-                            for child in candidate.values():
-                                found = contains_direct_output(child)
-                                if found is not None:
-                                    return found
-                        return None
-
-                    found = contains_direct_output(item)
-                    if found is not None:
-                        raise SchemaError(
-                            f"{operation_path}.{key} consumes retained direct output "
-                            f"{found!r}; archival normalization cannot guess whether it "
-                            "is a logical tensor or an SSA value"
-                        )
-                reject_direct_output_uses(
-                    operation.get("body"), f"{operation_path}.body"
-                )
-                for arm_name in ("positive", "negative"):
-                    arm = operation.get(arm_name)
-                    if isinstance(arm, dict):
-                        reject_direct_output_uses(
-                            arm.get("body"), f"{operation_path}.{arm_name}.body"
-                        )
-
-        reject_direct_output_uses(raw_body, "SemanticArchive.intent.body")
-
-        next_v_index = max(existing_v_indices, default=-1) + 1
-        value_by_output: dict[str, str] = {}
-        for output in output_names:
-            producer = direct_producers.get(output)
-            if producer is None:
-                if output not in input_names:
-                    raise SchemaError(
-                        "retained J without returns cannot prove the value for "
-                        f"output-only tensor {output!r}"
-                    )
-                value_by_output[output] = output
-                continue
-            value = f"v{next_v_index}"
-            next_v_index += 1
-            operation, result_index = producer
-            if result_index is None:
-                operation["result"] = value
-            else:
-                raw_result = operation["result"]
-                assert isinstance(raw_result, list)
-                raw_result[result_index] = value
-            value_by_output[output] = value
-
-        boundary = result.get("boundary")
-        if isinstance(boundary, dict):
-            mappings = boundary.get("output_mappings", [])
-            if not isinstance(mappings, list):
-                raise SchemaError(
-                    "retained J boundary.output_mappings must be an array"
-                )
-            for index, mapping in enumerate(mappings):
-                if not isinstance(mapping, dict):
-                    raise SchemaError(
-                        f"retained J boundary.output_mappings[{index}] must be an object"
-                    )
-                output = mapping.get("output")
-                value = mapping.get("value")
-                if output in direct_producers:
-                    if value != output:
-                        raise SchemaError(
-                            "retained direct-output boundary mapping disagrees "
-                            f"with the sole producer for {output!r}"
-                        )
-                    mapping["value"] = value_by_output[str(output)]
-
-        # Portable scopes name semantic values, rather than caller-owned
-        # output destinations.  A retained direct-output result therefore has
-        # to follow its generated SSA value in both definitions and captures;
-        # leaving the old t* spelling would make scope ownership disagree with
-        # the body that was just normalized above.
-        scopes = result.get("scopes")
-        if isinstance(scopes, list):
-            for scope in scopes:
-                if not isinstance(scope, dict):
-                    continue
-                for field in ("captures", "definitions"):
-                    values = scope.get(field)
-                    if not isinstance(values, list):
-                        continue
-                    scope[field] = [
-                        value_by_output[item]
-                        if isinstance(item, str) and item in direct_producers
-                        else item
-                        for item in values
-                    ]
-
-        function["returns"] = [
-            {"output": output, "value": value_by_output[output]}
-            for output in output_names
-        ]
-
-    normalize_legacy_direct_outputs()
-
-    def normalize_body(body: Any, path: str) -> None:
-        if not isinstance(body, list):
-            return
-        for index, operation in enumerate(body):
-            if not isinstance(operation, dict):
-                continue
-            operation_path = f"{path}[{index}]"
-            if operation.get("op") == "loop" and "operands" in operation:
-                operands = operation["operands"]
-                if (
-                    not isinstance(operands, list)
-                    or any(
-                        not isinstance(item, str)
-                        or re.fullmatch(r"(?:t|v)[0-9]+", item) is None
-                        for item in operands
-                    )
-                    or len(operands) != len(set(operands))
-                ):
-                    raise SchemaError(
-                        f"{operation_path}.operands must be a duplicate-free "
-                        "list of J value handles before archival canonicalization"
-                    )
-                operation.pop("operands")
-            normalize_body(operation.get("body"), f"{operation_path}.body")
-            for arm_name in ("positive", "negative"):
-                arm = operation.get(arm_name)
-                if isinstance(arm, dict):
-                    normalize_body(
-                        arm.get("body"), f"{operation_path}.{arm_name}.body"
-                    )
-
-    normalize_body(function.get("body"), "SemanticArchive.intent.body")
-    return result
-
-
 @dataclass
 class Gate1Artifact(StrictJSONMixin):
-    """The complete proof-relevant Lift result: exactly ``(J, C, pi)``."""
+    """The complete proof-relevant Lift result: exactly (J, C, pi)."""
 
     SCHEMA: ClassVar[str] = "intentir.scrc.artifact.v12"
-    LEGACY_SCHEMAS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-            "intentir.scrc.artifact.v4",
-            "intentir.scrc.artifact.v5",
-            "intentir.scrc.artifact.v6",
-            "intentir.scrc.artifact.v7",
-            "intentir.scrc.artifact.v8",
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-        }
-    )
 
     j: SemanticArchive
     c: ImplementationConfig
@@ -5384,10 +5026,13 @@ class Gate1Artifact(StrictJSONMixin):
     wire_schema: str = field(default=SCHEMA, repr=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.j, SemanticArchive):
-            self.j = SemanticArchive.from_json(
-                _canonicalize_retained_j_surface(self.j)
+        if self.wire_schema != self.SCHEMA:
+            raise SchemaError(
+                f"unsupported Gate1 artifact schema {self.wire_schema!r}; "
+                f"expected the current schema {self.SCHEMA!r}"
             )
+        if not isinstance(self.j, SemanticArchive):
+            self.j = SemanticArchive.from_json(self.j)
         if not isinstance(self.c, ImplementationConfig):
             self.c = ImplementationConfig.from_json(self.c)
         if not isinstance(self.pi, RealizationWitness):
@@ -5395,171 +5040,6 @@ class Gate1Artifact(StrictJSONMixin):
                 self.pi = RealizationWitness.from_json(self.pi)
             except RealizationWitnessError as exc:
                 raise SchemaError(str(exc)) from exc
-        if self.wire_schema not in {self.SCHEMA, *self.LEGACY_SCHEMAS}:
-            raise SchemaError(
-                f"unsupported Gate1 artifact schema {self.wire_schema!r}"
-            )
-        if self.wire_schema == "intentir.scrc.artifact.v1" and any(
-            slot.subject_ref is not None or slot.axis_ref is not None
-            for slot in self.c.slots
-        ):
-            raise SchemaError(
-                "legacy Gate1 artifact schemas do not contain C attachments"
-            )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-        } and self.pi.iterations:
-            raise SchemaError(
-                "Gate1 artifact v1/v2 do not contain pi iterations"
-            )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-        } and self.pi.loop_carriers:
-            raise SchemaError(
-                "Gate1 artifact v1-v3 do not contain pi loop_carriers"
-            )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-        } and self.j.boundary.consumer_extensions:
-            raise SchemaError(
-                "Gate1 artifact v1-v3 do not contain J consumer_extensions"
-            )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-        } and self.j.dimension_constraints:
-            raise SchemaError(
-                "Gate1 artifact v1-v3 do not contain J dimension_constraints"
-            )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-        } and self.j.value_dimension_relations:
-            raise SchemaError(
-                "Gate1 artifact v1-v3 do not contain J value_dimension_relations"
-            )
-        if self.wire_schema not in {
-            "intentir.scrc.artifact.v11",
-            self.SCHEMA,
-        } and self.j.dimension_relations:
-            raise SchemaError(
-                "Gate1 artifact v1-v10 do not contain J dimension_relations"
-            )
-        if self.wire_schema != self.SCHEMA and self.pi.program_axes:
-            raise SchemaError(
-                "Gate1 artifact v1-v11 do not contain pi program_axes"
-            )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v4",
-            "intentir.scrc.artifact.v5",
-            "intentir.scrc.artifact.v6",
-            "intentir.scrc.artifact.v7",
-            "intentir.scrc.artifact.v8",
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            self.SCHEMA,
-        } and any(
-            item.masked_contribution is not None
-            for item in self.j.boundary.reductions
-        ):
-            raise SchemaError(
-                "artifact.v4+ uses consumer_extensions as the unique physical "
-                "outside-domain authority; ReductionBoundary must omit "
-                "masked_contribution"
-            )
-        if (
-            self.wire_schema in {
-                "intentir.scrc.artifact.v1",
-                "intentir.scrc.artifact.v2",
-                "intentir.scrc.artifact.v3",
-                "intentir.scrc.artifact.v4",
-            }
-            and self.j.boundary.access_guard_relations
-        ):
-            raise SchemaError(
-                "Gate1 artifact v1-v4 do not contain J access_guard_relations"
-            )
-        has_effect_if = any(
-            op.op == "effect_if"
-            for top in self.j.intent.body
-            for op in _walk_intent_ops(top)
-        )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-            "intentir.scrc.artifact.v4",
-            "intentir.scrc.artifact.v5",
-        } and has_effect_if:
-            raise SchemaError(
-                "Gate1 artifact v1-v5 do not contain J effect_if regions"
-            )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-            "intentir.scrc.artifact.v4",
-            "intentir.scrc.artifact.v5",
-        } and any(
-            item.get("induction_basis") == "rounded_extent_step"
-            for item in self.pi.iterations
-        ):
-            raise SchemaError(
-                "Gate1 artifact v1-v5 do not contain rounded_extent_step"
-            )
-        has_value_if = any(
-            op.op == "value_if"
-            for top in self.j.intent.body
-            for op in _walk_intent_ops(top)
-        )
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-            "intentir.scrc.artifact.v4",
-            "intentir.scrc.artifact.v5",
-            "intentir.scrc.artifact.v6",
-        } and has_value_if:
-            raise SchemaError(
-                "Gate1 artifact v1-v6 do not contain J value_if regions"
-            )
-        if self.wire_schema not in {
-            "intentir.scrc.artifact.v8",
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            self.SCHEMA,
-        } and (
-            self.pi.physical_iterations or self.pi.physical_loop_carriers
-        ):
-            raise SchemaError(
-                "Gate1 artifact v1-v7 do not contain pi physical time relations"
-            )
-        if self.wire_schema not in {
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            self.SCHEMA,
-        } and self.pi.terminal_controls:
-            raise SchemaError(
-                "Gate1 artifact v1-v8 do not contain pi terminal_controls"
-            )
-        if self.wire_schema not in {
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            self.SCHEMA,
-        } and self.pi.route_extent_transforms:
-            raise SchemaError(
-                "Gate1 artifact v1-v9 do not contain pi route_extent_transforms"
-            )
 
         node_refs = set(self.j.node_ids) | set(self.j.node_ids.values())
         boundary_node_refs = {
@@ -5590,11 +5070,6 @@ class Gate1Artifact(StrictJSONMixin):
                 + ", ".join(missing_values)
             )
         try:
-            # Keep the compatibility Gate1 wire unchanged, but make its
-            # in-memory Source-C declaration pass through the shared Layer-C
-            # attachment validator before any backend can consume it.  This
-            # closes the definition/use gap for subject_ref and axis_ref while
-            # avoiding a new artifact schema or a second attachment grammar.
             from intentir.ir.layer_c import source_layer_c_interface
 
             source_layer_c_interface(self.j, self.c)
@@ -5606,10 +5081,8 @@ class Gate1Artifact(StrictJSONMixin):
 
     @classmethod
     def from_json(cls, value: dict[str, Any]) -> "Gate1Artifact":
-        # Diagnose the ownership violation before the envelope's required-key
-        # check.  A draft that moves c/pi under j often also omits the root
-        # sibling, so checking required keys first reported only "missing c"
-        # and hid the actual root-envelope nesting error from the relift path.
+        # Diagnose root ownership before the required-key check, so a draft
+        # nesting c/pi under J reports the actual structural violation.
         if isinstance(value, dict):
             j_candidate = value.get("j")
             if isinstance(j_candidate, dict):
@@ -5620,8 +5093,7 @@ class Gate1Artifact(StrictJSONMixin):
                 if nested_root_owned:
                     raise SchemaError(
                         f"{nested_root_owned[0]} is a root-owned field nested "
-                        "under J; "
-                        "root.c and root.pi must be siblings of root.j"
+                        "under J; root.c and root.pi must be siblings of root.j"
                     )
         data = _strict_object(
             value,
@@ -5629,316 +5101,52 @@ class Gate1Artifact(StrictJSONMixin):
             allowed=set(GATE1_ARTIFACT_MODEL_FIELDS),
             required=set(GATE1_ARTIFACT_MODEL_FIELDS),
         )
-        if data["schema"] not in {cls.SCHEMA, *cls.LEGACY_SCHEMAS}:
+        if data["schema"] != cls.SCHEMA:
             raise SchemaError(
                 f"unsupported Gate1 artifact schema {data['schema']!r}; "
-                f"expected {cls.SCHEMA!r} or a supported legacy schema"
+                f"expected the current schema {cls.SCHEMA!r}"
             )
-        schema = data["schema"]
         pi_value = data["pi"] if isinstance(data["pi"], dict) else None
         compact_pi = (
             pi_value is not None
             and pi_value.get("schema") == NORMALIZATION_WITNESS_SCHEMA
         )
-        if compact_pi and schema != cls.SCHEMA:
-            raise SchemaError("compact pi is supported only by the current artifact schema")
-        if (
-            pi_value is not None
-            and not compact_pi
-            and "refinements" not in pi_value
-        ):
-            raise SchemaError(
-                "Gate1Artifact.pi is missing required field: refinements"
+        if pi_value is not None and not compact_pi:
+            required_pi_fields = (
+                "refinements",
+                "iterations",
+                "loop_carriers",
+                "physical_iterations",
+                "physical_loop_carriers",
+                "terminal_controls",
+                "route_extent_transforms",
+                "program_axes",
             )
-        boundary_value = (
-            data["j"].get("boundary")
-            if isinstance(data["j"], dict)
-            and isinstance(data["j"].get("boundary"), dict)
-            else None
-        )
-        j_value = data["j"] if isinstance(data["j"], dict) else None
-        if schema in {
-            "intentir.scrc.artifact.v3",
-            "intentir.scrc.artifact.v4",
-            "intentir.scrc.artifact.v5",
-            "intentir.scrc.artifact.v6",
-            "intentir.scrc.artifact.v7",
-            "intentir.scrc.artifact.v8",
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            cls.SCHEMA,
-        } and not compact_pi and (
-            pi_value is not None and "iterations" not in pi_value
-        ):
-            raise SchemaError(
-                "Gate1Artifact.pi is missing required field: iterations"
-            )
-        if schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-        } and pi_value is not None and "iterations" in pi_value:
-            raise SchemaError(
-                "Gate1 artifact v1/v2 do not contain pi iterations"
-            )
-        if schema in {
-            "intentir.scrc.artifact.v4",
-            "intentir.scrc.artifact.v5",
-            "intentir.scrc.artifact.v6",
-            "intentir.scrc.artifact.v7",
-            "intentir.scrc.artifact.v8",
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            cls.SCHEMA,
-        }:
-            if j_value is not None and "dimension_constraints" not in j_value:
+            missing_pi_fields = [
+                name for name in required_pi_fields if name not in pi_value
+            ]
+            if missing_pi_fields:
                 raise SchemaError(
-                    "Gate1Artifact.j is missing required field: "
-                    "dimension_constraints"
+                    "Gate1Artifact.pi is missing required field(s): "
+                    + ", ".join(missing_pi_fields)
                 )
-            if j_value is not None and "value_dimension_relations" not in j_value:
-                raise SchemaError(
-                    "Gate1Artifact.j is missing required field: "
-                    "value_dimension_relations"
-                )
-            if (
-                pi_value is not None
-                and not compact_pi
-                and "loop_carriers" not in pi_value
-            ):
-                raise SchemaError(
-                    "Gate1Artifact.pi is missing required field: loop_carriers"
-                )
-            if (
-                boundary_value is not None
-                and "consumer_extensions" not in boundary_value
-            ):
-                raise SchemaError(
-                    "Gate1Artifact.j.boundary is missing required field: "
-                    "consumer_extensions"
-                )
-        else:
-            if j_value is not None and "dimension_constraints" in j_value:
-                raise SchemaError(
-                    "Gate1 artifact v1-v3 do not contain J "
-                    "dimension_constraints"
-                )
-            if j_value is not None and "value_dimension_relations" in j_value:
-                raise SchemaError(
-                    "Gate1 artifact v1-v3 do not contain J "
-                    "value_dimension_relations"
-                )
-            if pi_value is not None and "loop_carriers" in pi_value:
-                raise SchemaError(
-                    "Gate1 artifact v1-v3 do not contain pi loop_carriers"
-                )
-            if (
-                boundary_value is not None
-                and "consumer_extensions" in boundary_value
-            ):
-                raise SchemaError(
-                    "Gate1 artifact v1-v3 do not contain J consumer_extensions"
-                )
-        if schema in {"intentir.scrc.artifact.v11", cls.SCHEMA}:
-            if j_value is not None and "dimension_relations" not in j_value:
-                raise SchemaError(
-                    "Gate1Artifact.j is missing required field: dimension_relations"
-                )
-        elif j_value is not None and "dimension_relations" in j_value:
-            raise SchemaError(
-                "Gate1 artifact v1-v10 do not contain J dimension_relations"
-            )
-        if schema in {
-            "intentir.scrc.artifact.v8",
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            cls.SCHEMA,
-        }:
-            if (
-                pi_value is not None
-                and not compact_pi
-                and "physical_iterations" not in pi_value
-            ):
-                raise SchemaError(
-                    "Gate1Artifact.pi is missing required field: physical_iterations"
-                )
-            if (
-                pi_value is not None
-                and not compact_pi
-                and "physical_loop_carriers" not in pi_value
-            ):
-                raise SchemaError(
-                    "Gate1Artifact.pi is missing required field: "
-                    "physical_loop_carriers"
-                )
-        elif pi_value is not None and (
-            "physical_iterations" in pi_value
-            or "physical_loop_carriers" in pi_value
-        ):
-            raise SchemaError(
-                "Gate1 artifact v1-v7 do not contain pi physical time relations"
-            )
-        if schema in {
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            cls.SCHEMA,
-        }:
-            if (
-                pi_value is not None
-                and not compact_pi
-                and "terminal_controls" not in pi_value
-            ):
-                raise SchemaError(
-                    "Gate1Artifact.pi is missing required field: terminal_controls"
-                )
-        elif pi_value is not None and "terminal_controls" in pi_value:
-            raise SchemaError(
-                "Gate1 artifact v1-v8 do not contain pi terminal_controls"
-            )
-        if schema in {
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            cls.SCHEMA,
-        }:
-            if (
-                pi_value is not None
-                and not compact_pi
-                and "route_extent_transforms" not in pi_value
-            ):
-                raise SchemaError(
-                    "Gate1Artifact.pi is missing required field: "
-                    "route_extent_transforms"
-                )
-        elif pi_value is not None and "route_extent_transforms" in pi_value:
-            raise SchemaError(
-                "Gate1 artifact v1-v9 do not contain pi route_extent_transforms"
-            )
-        if schema == cls.SCHEMA:
-            if pi_value is not None and "program_axes" not in pi_value:
-                raise SchemaError(
-                    "Gate1Artifact.pi is missing required field: program_axes"
-                )
-        elif pi_value is not None and "program_axes" in pi_value:
-            raise SchemaError(
-                "Gate1 artifact v1-v11 do not contain pi program_axes"
-            )
-        if schema in {
-            "intentir.scrc.artifact.v5",
-            "intentir.scrc.artifact.v6",
-            "intentir.scrc.artifact.v7",
-            "intentir.scrc.artifact.v8",
-            "intentir.scrc.artifact.v9",
-            "intentir.scrc.artifact.v10",
-            "intentir.scrc.artifact.v11",
-            cls.SCHEMA,
-        }:
-            if (
-                boundary_value is not None
-                and "access_guard_relations" not in boundary_value
-            ):
-                raise SchemaError(
-                    "Gate1Artifact.j.boundary is missing required field: "
-                    "access_guard_relations"
-                )
-        elif (
-            boundary_value is not None
-            and "access_guard_relations" in boundary_value
-        ):
-            raise SchemaError(
-                "Gate1 artifact v1-v4 do not contain J access_guard_relations"
-            )
         try:
             pi = RealizationWitness.from_json(data["pi"])
         except RealizationWitnessError as exc:
             raise SchemaError(str(exc)) from exc
         return cls(
-            j=SemanticArchive.from_json(
-                _canonicalize_retained_j_surface(data["j"])
-            ),
+            j=SemanticArchive.from_json(data["j"]),
             c=ImplementationConfig.from_json(data["c"]),
             pi=pi,
             wire_schema=data["schema"],
         )
 
     def to_json(self) -> dict[str, Any]:
-        j_value = self.j.to_json()
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-        }:
-            j_value["boundary"].pop("consumer_extensions", None)
-            j_value.pop("dimension_constraints", None)
-            j_value.pop("value_dimension_relations", None)
-        if self.wire_schema not in {
-            "intentir.scrc.artifact.v11",
-            self.SCHEMA,
-        }:
-            j_value.pop("dimension_relations", None)
-        if self.wire_schema in {
-            "intentir.scrc.artifact.v1",
-            "intentir.scrc.artifact.v2",
-            "intentir.scrc.artifact.v3",
-            "intentir.scrc.artifact.v4",
-        }:
-            j_value["boundary"].pop("access_guard_relations", None)
         return {
-            "schema": self.wire_schema,
-            "j": j_value,
+            "schema": self.SCHEMA,
+            "j": self.j.to_json(),
             "c": self.c.to_json(),
-            "pi": self.pi.to_json(
-                include_iterations=self.wire_schema
-                in {
-                    "intentir.scrc.artifact.v3",
-                    "intentir.scrc.artifact.v4",
-                    "intentir.scrc.artifact.v5",
-                    "intentir.scrc.artifact.v6",
-                    "intentir.scrc.artifact.v7",
-                    "intentir.scrc.artifact.v8",
-                    "intentir.scrc.artifact.v9",
-                    "intentir.scrc.artifact.v10",
-                    "intentir.scrc.artifact.v11",
-                    self.SCHEMA,
-                },
-                include_loop_carriers=self.wire_schema
-                in {
-                    "intentir.scrc.artifact.v4",
-                    "intentir.scrc.artifact.v5",
-                    "intentir.scrc.artifact.v6",
-                    "intentir.scrc.artifact.v7",
-                    "intentir.scrc.artifact.v8",
-                    "intentir.scrc.artifact.v9",
-                    "intentir.scrc.artifact.v10",
-                    "intentir.scrc.artifact.v11",
-                    self.SCHEMA,
-                },
-                include_physical_time=self.wire_schema
-                in {
-                    "intentir.scrc.artifact.v8",
-                    "intentir.scrc.artifact.v9",
-                    "intentir.scrc.artifact.v10",
-                    "intentir.scrc.artifact.v11",
-                    self.SCHEMA,
-                },
-                include_terminal_controls=self.wire_schema
-                in {
-                    "intentir.scrc.artifact.v9",
-                    "intentir.scrc.artifact.v10",
-                    "intentir.scrc.artifact.v11",
-                    self.SCHEMA,
-                },
-                include_route_extent_transforms=self.wire_schema
-                in {
-                    "intentir.scrc.artifact.v10",
-                    "intentir.scrc.artifact.v11",
-                    self.SCHEMA,
-                },
-                include_program_axes=self.wire_schema == self.SCHEMA,
-                include_program_coordinate_maps=self.wire_schema == self.SCHEMA,
-            ),
+            "pi": self.pi.to_json(),
         }
 
     def rewriter_view(self, *, masked: bool = False) -> dict[str, Any]:
@@ -6515,11 +5723,9 @@ def _opaque_signature_and_c_view(
 def opaque_replay_representation(artifact: Gate1Artifact) -> dict[str, Any]:
     """Project closed Source realization facts to the Replay ABI view.
 
-    Replay must not receive the legacy ``pi`` graph.  A legacy artifact can,
-    however, contain address ownership and physical launch-axis facts that are
-    otherwise impossible to recover from a source-blind J-only packet.  This
-    helper projects only the typed, source-free facts needed by the target
-    callable ABI:
+    Replay must not receive the full materialized ``pi`` graph.  This helper
+    projects only the typed, source-free facts needed by the target callable
+    ABI:
 
     * a null-logical-ref scalar routed to an address stage becomes a stride
       binding for one J access/tensor axis;
@@ -6527,7 +5733,7 @@ def opaque_replay_representation(artifact: Gate1Artifact) -> dict[str, Any]:
     * a compact ``program_bindings`` row projects each of its named J domains
       to that same explicitly witnessed physical launch axis.
 
-    Route slots 0--3 are the closed legacy address inputs for logical domains
+    Route slots 0--3 are the closed address inputs for logical domains
     and the pointer handle.  Slots 4 onward are the tensor-axis stride inputs,
     so slot ``4 + axis`` denotes that access's stride for ``axis``.  This
     projection is deliberately fail-closed: an address carrier with an
@@ -6839,15 +6045,6 @@ def _opaque_normal_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
                 **(
                     {"identity": copy.deepcopy(item.identity)}
                     if item.identity is not None
-                    else {}
-                ),
-                **(
-                    {
-                        "masked_contribution": copy.deepcopy(
-                            item.masked_contribution
-                        )
-                    }
-                    if item.masked_contribution is not None
                     else {}
                 ),
             }
@@ -7228,10 +6425,6 @@ def _masked_rewriter_view(artifact: Gate1Artifact) -> dict[str, Any]:
                 "node_ref": opaque_reference(item.node_ref),
                 "tile_axis": "<masked>",
                 **({"identity": "<masked>"} if item.identity is not None else {}),
-                **(
-                    {"masked_contribution": "<masked>"}
-                    if item.masked_contribution is not None else {}
-                ),
             }
             for item in artifact.j.boundary.reductions
         ],
@@ -7413,7 +6606,6 @@ __all__ = [
     "AccessGuardPolarity", "AccessGuardRelation", "AccessKind",
     "AliasKind", "AliasSpec",
     "BOUNDARY_ACCESS_REQUIRED_FIELDS", "BOUNDARY_ACCESS_WIRE_FIELDS",
-    "BOUNDARY_LEGACY_WIRE_FIELDS", "BOUNDARY_V4_WIRE_FIELDS",
     "BOUNDARY_WIRE_FIELDS", "Boundary",
     "BoundaryAccess", "BroadcastSpec", "CompileCase", "ConsumerExtension",
     "DuplicatePolicy", "EffectKind",
@@ -7432,7 +6624,7 @@ __all__ = [
     "render_boundary_access_wire_grammar",
     "render_gate1_artifact_envelope_grammar", "RuntimeArgument",
     "ScheduleSlot", "ScheduleSlotKind", "SchemaError", "SignatureParameter",
-    "ScopeKind", "SEMANTIC_ARCHIVE_LEGACY_WIRE_FIELDS",
+    "ScopeKind",
     "opaque_replay_representation",
     "SEMANTIC_ARCHIVE_WIRE_FIELDS", "SemanticArchive", "ValueDimensionRelation",
     "DimensionRelation", "DimensionRelationExpr",

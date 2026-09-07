@@ -159,25 +159,7 @@ CUDA 内部候选负责 NVIDIA memory/layout、thread/block/warp、pipeline 和 
 
 `ProductionSnapshot` 的持久化字段 `c` 仍是 `ImplementationConfig`，只供现有 benchmark/export 工具通过 `attach_c()` 作为可擦除的 Source/search-order prior。它不是 `C_target`，不能进入 `LoweringRequest`。新 production Lower 的公共边界只接受 `TargetLayerCPlugin | None`；工具迁移完成前，文档和报告必须明确标注这条 legacy prior 路径。
 
-## 7. 精确 artifact 的零模型能力复核
-
-`scrc_gate2_recheck.py` 复用 parent 中已经接受的 artifact 与精确 Replay，不调用新的 Lift/Replay 模型。它先让历史字节经过当前 packet-aware Replay ingress 和 Gate1；只有当前 Gate1 闭合时才继续 Gate2：
-
-```bash
-PYTHONPATH=python python tools/scrc_gate2_recheck.py \
-  --case '<registered-case-id>' \
-  --artifact '/path/to/parent/attempt-N/artifact.json' \
-  --parent-evidence '/path/to/parent/attempt-N' \
-  --dataset-root '/path/to/Dataset' \
-  --run-root '/path/to/evidence/recheck' \
-  --json
-```
-
-Parent 必须包含 `gate1.json`、`replay.py` 与 `replay_receipt.json`；其本身或祖先运行目录还必须包含精确 `request.json`、`source_projection.json` 和 `source.py`。lineage 不一致时失败关闭。
-
-该流程只是历史 exact-byte capability diagnostic。即便当前 Gate1/Gate2 通过，也只能记录非认证性的 `capability_execution_pass`；它不证明 fresh Replay agent 消费了当前 9/10 文件 episode，不改变 parent verdict，也不单独增加闭包计数。未通过当前 ingress 的旧字节记录为 `gate1_no_closure`。`scrc_gate1_recheck.py` 会创建新 Replay 并调用模型，但仍是诊断工具，不进入 Gate2，也不改变 parent verdict。
-
-## 8. 多前端、证据与文档
+## 7. 多前端、证据与文档
 
 统一入口 `tools/scrc_frontend.py` 根据登记项选择 Triton、TileLang 或 CUDA 路径。前端只负责真实 Source/Harness/compiler-view 投影、LiftSemantic 和 `C_source`；J 的所有权、Replay 可见性、Gate 顺序和 Gate2 三边规则不随前端变化。
 

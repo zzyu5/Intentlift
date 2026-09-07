@@ -1,26 +1,18 @@
 """
-IntentIR's in-repository mini-swe-agent module.
+IntentIR's in-repository agent support module.
 
-The module keeps the upstream protocols and agent machinery, but importing it
-is deliberately side-effect free: library use must not create user files,
-print startup banners, or load provider credentials from a global dotenv file.
+Importing this module is deliberately side-effect free: library use must not
+create user files, print startup banners, or load provider credentials.
 """
 
 __version__ = "2.4.5"
 
-import os
 from pathlib import Path
 from typing import Any, Protocol
 
 from minisweagent.utils.log import logger
 
 package_dir = Path(__file__).resolve().parent
-
-
-global_config_dir = Path(
-    os.getenv("MSWEA_GLOBAL_CONFIG_DIR", Path.home() / ".config" / "mini-swe-agent")
-)
-global_config_file = global_config_dir / ".env"
 
 
 # === Protocols ===
@@ -73,7 +65,5 @@ __all__ = [
     "Environment",
     "package_dir",
     "__version__",
-    "global_config_file",
-    "global_config_dir",
     "logger",
 ]

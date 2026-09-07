@@ -739,7 +739,7 @@ class LitellmResponseModel(LitellmModel):
                 **model_kwargs,
             )
         except litellm.exceptions.AuthenticationError as e:
-            e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
+            e.message += " Configure credentials through the IntentIR provider settings."
             raise e
 
     def query(self, messages: list[dict[str, str]], **kwargs) -> dict:

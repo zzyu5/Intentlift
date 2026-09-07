@@ -4082,16 +4082,10 @@ def _reduction_padding_analysis(
                     ambiguous[0],
                 )
             )
-        legacy = any(
-            contract.node_ref == node_ref
-            and contract.masked_contribution is not None
-            for contract in j.boundary.reductions
-        )
         if (
             consumed_accesses
             and node_ref is not None
             and op.attrs.get("fn") in _CONSUMER_EXTENSION_FNS
-            and not legacy
         ):
             requirements.update(
                 ConsumerExtensionRequirement(node_ref, 0, access_ref)
@@ -4560,10 +4554,9 @@ def _project_consumer_extensions(
     j: Any,
     requirements: Sequence[ConsumerExtensionRequirement],
 ) -> tuple[ConsumerOutsideProjection, ...]:
-    """Consume v4's unique per-consumer outside-domain authority.
+    """Consume the unique per-consumer outside-domain authority.
 
-    Legacy v1-v3 reductions that carry ``masked_contribution`` retain their
-    exact historical behavior.  A v4 relation is never synthesized from a
+    The relation is never synthesized from a
     fill value, a reducer kind, Source, C, or pi.
     """
 
@@ -4574,11 +4567,6 @@ def _project_consumer_extensions(
         ref: nodes[ref]
         for ref in j.node_ids
         if ref in nodes
-    }
-    legacy_masked_reductions = {
-        item.node_ref
-        for item in j.boundary.reductions
-        if item.masked_contribution is not None
     }
     declared = {
         (item.consumer_ref, item.operand_index, item.access_ref): item
@@ -4648,10 +4636,6 @@ def _project_consumer_extensions(
             outside_value=extension.outside.value,
             outside_dtype=extension.outside.dtype,
         )
-        if extension.consumer_ref in legacy_masked_reductions:
-            raise ValueError(
-                "masked_contribution and consumer extension are duplicate authorities"
-            )
         projected.append(
             ConsumerOutsideProjection(
                 extension.consumer_ref,
@@ -4693,8 +4677,7 @@ def _validate_reduction_padding_closure(
     """Consume reduction B facts without constraining the Layer-A graph shape.
 
     A predicated physical realization may disappear from logical-tensor
-    RefEval only through an explicit J-owned per-consumer relation.  The old
-    reduction-wide masked contribution remains accepted only for legacy J.
+    RefEval only through an explicit J-owned per-consumer relation.
     """
 
     if has_physical_padding:
@@ -4750,21 +4733,6 @@ def _validate_reduction_padding_closure(
         ):
             raise NotImplementedError(
                 f"functional projection requires neutral {fn!r} identity"
-            )
-        if has_physical_padding:
-            if contract.masked_contribution is not None:
-                if not _is_reduction_neutral(fn, contract.masked_contribution):
-                    raise NotImplementedError(
-                        f"functional projection requires neutral {fn!r} "
-                        "masked_contribution"
-                    )
-        elif (
-            contract.masked_contribution is not None
-            and not _is_reduction_neutral(fn, contract.masked_contribution)
-        ):
-            raise NotImplementedError(
-                f"functional projection requires neutral {fn!r} "
-                "masked_contribution"
             )
 
 

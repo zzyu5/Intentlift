@@ -26,9 +26,6 @@ from .model import (
 
 
 REPLAY_PACKET_SCHEMA = "intentir.scrc.replay-input.v3"
-LEGACY_REPLAY_PACKET_SCHEMAS = frozenset(
-    {"intentir.scrc.replay-input.v1", "intentir.scrc.replay-input.v2"}
-)
 PUBLIC_FRONTEND_CONTEXT = {
     "triton": {
         "retrieval_scope": "public Triton documentation and public examples",
@@ -125,31 +122,6 @@ _REPLAY_COMPONENT_KEYS = {
     ),
     "c": frozenset({"slots", "values"}),
 }
-_LEGACY_PI_KEYS = frozenset(
-    {
-        "regions",
-        "instances",
-        "routes",
-        "program_axes",
-        "program_linearizations",
-        "route_extent_transforms",
-        "order",
-        "sharing",
-        "refinements",
-        "iterations",
-        "loop_carriers",
-        "physical_iterations",
-        "physical_loop_carriers",
-        "terminal_controls",
-    }
-)
-_HISTORICAL_J_KEY_SETS = frozenset(
-    {
-        _REPLAY_COMPONENT_KEYS["j"] - {"dimension_relations"},
-        _REPLAY_COMPONENT_KEYS["j"]
-        - {"dimension_relations", "value_dimension_relations"},
-    }
-)
 _U_F_KEYS = frozenset(
     {
         "protocol",
@@ -354,23 +326,14 @@ def _walk(value: Any, path: str = "$" ):
 
 def _validate_source_isolated_payload(
     payload: Mapping[str, Any],
-    *,
-    require_active_context: bool,
 ) -> None:
+    """Validate the single current source-isolated Replay packet format."""
+
     if not isinstance(payload, Mapping):
         raise SchemaError("Replay payload must be an object")
     root = set(payload)
     active_roots = ({"j", "u_f"}, {"j", "c", "u_f"})
-    historical_root = {"j", "c", "pi", "u_f"}
-    u_f = payload.get("u_f")
-    protocol = u_f.get("protocol") if isinstance(u_f, Mapping) else None
-    c = payload.get("c")
-    historical = (
-        not require_active_context
-        and protocol in LEGACY_REPLAY_PACKET_SCHEMAS
-    )
-    expected_roots = (historical_root,) if historical else active_roots
-    if root not in expected_roots:
+    if root not in active_roots:
         raise SchemaError(
             "Replay payload root must contain j and u_f, with c only when "
             "implementation parameters are present"
@@ -393,24 +356,13 @@ def _validate_source_isolated_payload(
             raise SchemaError(f"Replay payload is missing {component}")
         value = payload[component]
         actual = set(value) if isinstance(value, Mapping) else set()
-        historical_j = (
-            historical
-            and component == "j"
-            and frozenset(actual) in _HISTORICAL_J_KEY_SETS
-        )
-        historical_c = (
-            historical
-            and component == "c"
-            and actual == {"slots"}
-        )
-        if not isinstance(value, Mapping) or (
-            actual != expected and not historical_j and not historical_c
-        ):
+        if not isinstance(value, Mapping) or actual != expected:
             raise SchemaError(
                 f"Replay payload {component} must contain exactly "
                 + ", ".join(sorted(expected))
             )
-    if not historical and c is not None:
+    c = payload.get("c")
+    if c is not None:
         assert isinstance(c, Mapping)
         try:
             config = ImplementationConfig.from_json(dict(c))
@@ -426,16 +378,6 @@ def _validate_source_isolated_payload(
                 "Replay payload c slots must use declaration-order handles c0, c1, ..."
             )
         config.validate_complete_values(path="Replay payload c")
-    if "pi" in payload:
-        pi = payload["pi"]
-        actual_pi = set(pi) if isinstance(pi, Mapping) else set()
-        historical_pi_sets = {
-            _LEGACY_PI_KEYS,
-            _LEGACY_PI_KEYS - {"program_linearizations"},
-            _LEGACY_PI_KEYS - {"program_axes", "program_linearizations"},
-        }
-        if not isinstance(pi, Mapping) or frozenset(actual_pi) not in historical_pi_sets:
-            raise SchemaError("historical Replay payload pi has an invalid closed root")
     u_f = payload["u_f"]
     if not isinstance(u_f, Mapping):
         raise SchemaError("Replay payload u_f must be an object")
@@ -456,7 +398,7 @@ def _validate_source_isolated_payload(
         raise SchemaError(
             f"Replay payload u_f is missing field(s): {missing_u_f}"
         )
-    if u_f["protocol"] != REPLAY_PACKET_SCHEMA and not historical:
+    if u_f["protocol"] != REPLAY_PACKET_SCHEMA:
         raise SchemaError("Replay payload u_f uses an unsupported protocol")
     try:
         frontend = Frontend(u_f["frontend"])
@@ -464,34 +406,25 @@ def _validate_source_isolated_payload(
         raise SchemaError("Replay payload u_f has an unsupported frontend") from exc
     if u_f["replay_function"] != "scrc_k0":
         raise SchemaError("Replay payload u_f must use canonical replay_function")
-    if require_active_context:
-        fixed_context = PUBLIC_FRONTEND_CONTEXT.get(frontend.value, {})
-        missing_context = sorted(set(fixed_context) - set(u_f))
-        if missing_context:
-            raise SchemaError(
-                "Replay payload u_f is missing fixed context field(s): "
-                f"{missing_context}"
-            )
-        modified_context = sorted(
-            key for key, value in fixed_context.items() if u_f.get(key) != value
+    fixed_context = PUBLIC_FRONTEND_CONTEXT.get(frontend.value, {})
+    missing_context = sorted(set(fixed_context) - set(u_f))
+    if missing_context:
+        raise SchemaError(
+            "Replay payload u_f is missing fixed context field(s): "
+            f"{missing_context}"
         )
-        if modified_context:
-            raise SchemaError(
-                "Replay payload u_f does not match the fixed public frontend "
-                f"context field(s): {modified_context}"
-            )
+    modified_context = sorted(
+        key for key, value in fixed_context.items() if u_f.get(key) != value
+    )
+    if modified_context:
+        raise SchemaError(
+            "Replay payload u_f does not match the fixed public frontend "
+            f"context field(s): {modified_context}"
+        )
     for path, value in _walk(dict(payload)):
         if isinstance(value, dict):
             forbidden = sorted(set(value) & _FORBIDDEN_KEYS)
-            legacy_pi_source = (
-                not require_active_context
-                and (
-                    path.startswith("$.pi.routes[")
-                    or path.startswith("$.pi.route_extent_transforms[")
-                    or path.startswith("$.pi.sharing[")
-                )
-            )
-            if "source" in value and not legacy_pi_source:
+            if "source" in value:
                 forbidden.append("source")
             if forbidden:
                 raise SchemaError(
@@ -509,9 +442,9 @@ def _validate_source_isolated_payload(
 
 
 def assert_source_isolated_payload(payload: Mapping[str, Any]) -> None:
-    """Fail closed if a fresh Replay packet is not source-isolated and current."""
+    """Fail closed unless a Replay packet uses the current source-isolated form."""
 
-    _validate_source_isolated_payload(payload, require_active_context=True)
+    _validate_source_isolated_payload(payload)
 
 
 @dataclass(frozen=True)
@@ -558,7 +491,7 @@ def build_rewriter_packet(
         artifact.j,
         artifact.c,
         artifact.pi,
-        require_program_axes=artifact.wire_schema == artifact.SCHEMA,
+        require_program_axes=True,
     )
     if not report.passed:
         summary = ", ".join(

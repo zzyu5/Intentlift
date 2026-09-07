@@ -1,9 +1,9 @@
-"""Typed Gate1 normalization witness with legacy pi compatibility.
+"""Typed realization witness for the current J workflow.
 
-The active subwire is a small algebra of direct J/C-bound realization
-relations.  It contains neither source/replay operation identities nor a graph
-that can encode a target recipe.  The older realization graph remains parseable
-for historical evidence, but is not exposed to fresh Lift or Replay.
+Fresh Lift candidates author a compact algebra of direct J/C-bound realization
+relations.  BindSource then materializes the complete realization graph that
+Replay and Gate consume.  Neither form contains source/replay operation
+identities or a target recipe.
 """
 
 from __future__ import annotations
@@ -1013,12 +1013,10 @@ def _require_acyclic(
 
 @dataclass
 class RealizationWitness:
-    """Typed Gate1 normalization witness with legacy artifact compatibility.
+    """Typed compact-or-materialized realization witness.
 
-    New Lift episodes author only the compact ``normalization-witness.v1``
-    subwire.  The older realization graph remains readable so already closed
-    artifacts can still be audited; it is no longer part of the active Lift
-    contract.
+    Lift authors the compact normalization subwire.  BindSource owns the
+    subsequent materialization into the full graph required by Replay and Gate.
     """
 
     wire_schema: str | None = None
@@ -1062,7 +1060,7 @@ class RealizationWitness:
                 f"unsupported pi subwire schema {self.wire_schema!r}"
             )
         if self.wire_schema == NORMALIZATION_WITNESS_SCHEMA:
-            legacy_fields = {
+            full_graph_fields = {
                 "program_linearizations": self.program_linearizations,
                 "regions": self.regions,
                 "instances": self.instances,
@@ -1077,11 +1075,13 @@ class RealizationWitness:
                 "physical_loop_carriers": self.physical_loop_carriers,
                 "terminal_controls": self.terminal_controls,
             }
-            present = sorted(name for name, rows in legacy_fields.items() if rows)
+            present = sorted(
+                name for name, rows in full_graph_fields.items() if rows
+            )
             if present:
                 raise RealizationWitnessError(
-                    "normalization-witness pi may not contain the legacy "
-                    "realization graph; "
+                    "normalization-witness pi may not contain the full "
+                    "materialized realization graph; "
                     f"found unsupported fields {present}"
                 )
             self._check_normalization_bindings()

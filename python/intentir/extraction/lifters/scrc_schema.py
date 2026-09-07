@@ -26,16 +26,10 @@ from intentir.verify.gate1.model import (
 from intentir.verify.gate1.pi import (
     ACCESS_REPRESENTATION_BINDING_RELATIONS,
     CONTROL_BINDING_RELATIONS,
-    ITERATION_BASES,
     ITERATION_BINDING_RELATIONS,
     MATERIALIZATION_BINDING_RELATIONS,
     NORMALIZATION_WITNESS_SCHEMA,
-    PHYSICAL_ITERATION_DIRECTIONS,
     PROGRAM_BINDING_RELATIONS,
-    REALIZATION_MECHANISMS,
-    REPRESENTATION_REFINEMENTS,
-    render_realization_mechanism_grammar,
-    render_realization_witness_wire_grammar,
 )
 
 
@@ -439,7 +433,7 @@ def _boundary_schema() -> dict[str, Any]:
             "output-ABI list; if this output is also listed there, both entries "
             "must use exactly the same value. Never use output_mappings to "
             "replace a missing returns entry or to override it with a different "
-            "value. When an op directly produces the same output handle and no "
+            "value. When an inout output returns the same logical handle and no "
             "boundary store/post-state anchor is needed, leave "
             "output_mappings empty."
         ),
@@ -448,14 +442,13 @@ def _boundary_schema() -> dict[str, Any]:
         {
             "node_ref": _STRING,
             "tile_axis": _INT_OR_STRING,
-            "identity": {},
+            "identity": {"not": {"type": "null"}},
         },
         ("node_ref", "tile_axis", "identity"),
         description=(
             "Reduce or inclusive-scan algebra and frontend-local tile-axis "
-            "metadata. artifact.v4+ forbids the historical "
-            "masked_contribution field: consumer_extensions is the unique "
-            "authority for physical outside-domain contributions."
+            "metadata. consumer_extensions is the unique authority for "
+            "physical outside-domain contributions."
         ),
     )
     typed_outside = _closed_object(
@@ -496,7 +489,8 @@ def _boundary_schema() -> dict[str, Any]:
             "One LLM-authored Layer-B relation from a predicate-bearing load "
             "access to one reduce/scan operand. The referenced BoundaryAccess "
             "continues to own the predicate; no predicate is promoted to "
-            "Layer-A SSA. v4 closes only two-sided sum/max/min identities."
+            "Layer-A SSA. The relation supports only two-sided sum/max/min "
+            "identities."
         ),
     )
     index_bounds = _closed_object(
@@ -843,406 +837,13 @@ def _c_schema() -> dict[str, Any]:
     )
 
 
-def _legacy_pi_schema() -> dict[str, Any]:
-    opaque_ref = {
-        "type": "string",
-        "pattern": "^(t|n|a|d|e|q|b|s|v|p|c|x)[0-9]+$",
-    }
-    region = _closed_object(
-        {
-            "id": {"type": "string", "pattern": "^r[0-9]+$"},
-            "parent": _nullable({"type": "string", "pattern": "^r[0-9]+$"}),
-            "placement": {
-                "type": "string", "enum": ["root", "program", "loop", "branch"],
-            },
-        },
-        ("id", "parent", "placement"),
-    )
-    instance = _closed_object(
-        {
-            "id": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": (
-                    "Declaration-order pi graph-node ID. This is the only ID "
-                    "namespace allowed at route/order/sharing endpoints."
-                ),
-            },
-            "semantic_ref": {
-                **opaque_ref,
-                "description": (
-                    "Anchor into a declared anonymous J/C handle. "
-                    "It is not a pi graph-node ID and never appears directly "
-                    "at route/order/sharing endpoints."
-                ),
-            },
-            "region": {"type": "string", "pattern": "^r[0-9]+$"},
-            "mechanism": {
-                "type": "string",
-                "enum": list(REALIZATION_MECHANISMS),
-                "description": render_realization_mechanism_grammar(),
-            },
-        },
-        ("id", "semantic_ref", "region", "mechanism"),
-    )
-    route = _closed_object(
-        {
-            "source": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": "A previously declared pi instance ID, never a raw anchor handle.",
-            },
-            "target": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": "A previously declared pi instance ID, never a raw anchor handle.",
-            },
-            "slots": {
-                "type": "array",
-                "items": {"type": "integer", "minimum": 0},
-                "uniqueItems": True,
-            },
-        },
-        ("source", "target", "slots"),
-    )
-    program_axis = _closed_object(
-        {
-            "domain_ref": {
-                "type": "string",
-                "pattern": "^d[0-9]+$",
-                "description": (
-                    "J boundary domain anchoring one compiler-visible program "
-                    "coordinate."
-                ),
-            },
-            "axis": {
-                "type": "integer",
-                "minimum": 0,
-                "maximum": 2,
-                "description": (
-                    "Exact physical launch-axis identity; never inferred from "
-                    "grid extent, declaration order, C, or instance multiplicity."
-                ),
-            },
-        },
-        ("domain_ref", "axis"),
-        description=(
-            "A closed pi-owned binding from one J domain program-coordinate "
-            "identity to physical launch axis 0, 1, or 2. It carries no grid "
-            "extent, Source spelling, frontend API, or logical J semantics."
-        ),
-    )
-    program_linearization = _closed_object(
-        {
-            "domain_ref": {
-                "type": "string",
-                "pattern": "^d[0-9]+$",
-                "description": "The J domain whose bound physical program coordinate is decoded.",
-            },
-            "dimension_refs": {
-                "type": "array",
-                "items": {"type": "string", "pattern": "^x[0-9]+$"},
-                "minItems": 1,
-                "uniqueItems": True,
-                "description": (
-                    "Outer-to-inner J dimension handles for the fixed row-major "
-                    "mixed-radix quotient/remainder projection."
-                ),
-            },
-        },
-        ("domain_ref", "dimension_refs"),
-        description=(
-            "A source-neutral mixed-radix realization of one bound program "
-            "coordinate. It contains no formula, value, predicate, Source spelling, "
-            "frontend API, or target recipe."
-        ),
-    )
-    route_extent_transform = _closed_object(
-        {
-            "source": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": (
-                    "Instance anchored to one required positive-integer C extent slot."
-                ),
-            },
-            "target": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": (
-                    "Instance anchored to the C-attached J domain realization."
-                ),
-            },
-            "slot": {"type": "integer", "minimum": 0},
-            "divisor": {"type": "integer", "minimum": 2},
-            "rounding": {"type": "string", "enum": ["floor", "ceil"]},
-        },
-        ("source", "target", "slot", "divisor", "rounding"),
-        description=(
-            "A closed representation-only extent partition on one existing pi "
-            "route slot. It does not create J shape/domain/predicate semantics and "
-            "contains no Source spelling or frontend API."
-        ),
-    )
-    order = _closed_object(
-        {
-            "before": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": "A declared pi instance ID.",
-            },
-            "after": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": "A declared pi instance ID.",
-            },
-        },
-        ("before", "after"),
-    )
-    sharing = _closed_object(
-        {
-            "source": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": "The declared pi instance reused by all consumers.",
-            },
-            "consumers": {
-                "type": "array",
-                "items": {
-                    "type": "string",
-                    "pattern": "^i[0-9]+$",
-                    "description": "A declared pi consumer instance ID.",
-                },
-                "minItems": 1,
-                "uniqueItems": True,
-            },
-        },
-        ("source", "consumers"),
-    )
-    refinement = _closed_object(
-        {
-            "instance": {"type": "string", "pattern": "^i[0-9]+$"},
-            "kind": {
-                "type": "string",
-                "enum": list(REPRESENTATION_REFINEMENTS),
-            },
-            "auth_ref": _nullable(
-                {"type": "string", "pattern": "^u[0-9]+$"}
-            ),
-        },
-        ("instance", "kind", "auth_ref"),
-        description=(
-            "A representation refinement. Sensitive kinds cite one J/B-owned "
-            "authorization; identity materialization uses the verifier's closed "
-            "global-safe rule."
-        ),
-    )
-    iteration = _closed_object(
-        {
-            "region": {"type": "string", "pattern": "^r[0-9]+$"},
-            "loop_instance": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": (
-                    "Instance anchored to the J structured loop realized by "
-                    "this physical loop region."
-                ),
-            },
-            "tile_instance": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": (
-                    "Instance anchored to the matching integer C tile slot."
-                ),
-            },
-            "induction_basis": {
-                "type": "string",
-                "enum": list(ITERATION_BASES),
-            },
-        },
-        ("region", "loop_instance", "tile_instance", "induction_basis"),
-        description=(
-            "A source-neutral physical induction-space relation. It contains "
-            "no bound expression, numeric value, operator, source text, or "
-            "frontend API."
-        ),
-    )
-    loop_carrier = _closed_object(
-        {
-            "region": {"type": "string", "pattern": "^r[0-9]+$"},
-            "loop_instance": {"type": "string", "pattern": "^i[0-9]+$"},
-            "init": {"type": "string", "pattern": "^i[0-9]+$"},
-            "state": {"type": "string", "pattern": "^i[0-9]+$"},
-            "next": {"type": "string", "pattern": "^i[0-9]+$"},
-            "result": {"type": "string", "pattern": "^i[0-9]+$"},
-        },
-        ("region", "loop_instance", "init", "state", "next", "result"),
-        description=(
-            "One declaration-ordered physical loop-carrier slot. Its temporal "
-            "denotation is state[0]=init, state[k+1]=next[k], and "
-            "result=state[T], including T=0. state and next are distinct physical "
-            "occurrences joined by an ordinary route; next-to-state temporal and "
-            "loop-exit result edges are implicit in this relation."
-        ),
-    )
-    physical_iteration = _closed_object(
-        {
-            "region": {"type": "string", "pattern": "^r[0-9]+$"},
-            "body_instance": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": (
-                    "Instance anchored to one existing non-loop J "
-                    "reduce/contraction or boundary access/domain realized by "
-                    "this physical-only loop region."
-                ),
-            },
-            "tile_instance": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-                "description": (
-                    "Instance anchored to the required positive integer C tile "
-                    "attached to the same J node and axis."
-                ),
-            },
-            "induction_basis": {
-                "type": "string",
-                "enum": list(ITERATION_BASES),
-            },
-            "direction": {
-                "type": "string",
-                "enum": list(PHYSICAL_ITERATION_DIRECTIONS),
-            },
-        },
-        (
-            "region",
-            "body_instance",
-            "tile_instance",
-            "induction_basis",
-            "direction",
-        ),
-        description=(
-            "A physical iteration shell for an existing logical operation or "
-            "boundary traversal with a closed dependent axis. It adds no J loop, "
-            "bound formula, numeric value, operator, source text, or frontend API."
-        ),
-    )
-    physical_loop_carrier = _closed_object(
-        {
-            "region": {"type": "string", "pattern": "^r[0-9]+$"},
-            "init": {"type": "string", "pattern": "^i[0-9]+$"},
-            "state": {"type": "string", "pattern": "^i[0-9]+$"},
-            "next": {"type": "string", "pattern": "^i[0-9]+$"},
-            "result": {"type": "string", "pattern": "^i[0-9]+$"},
-        },
-        ("region", "init", "state", "next", "result"),
-        description=(
-            "One typed physical carrier in a physical_iterations region. "
-            "init/state/next/result are distinct temporal occurrences; init -> state "
-            "and state -> next are ordinary pi routes, while next-to-state temporal "
-            "and loop-exit result edges are implicit. Roles may anchor the same J "
-            "semantic value and carry no update formula or frontend spelling."
-        ),
-    )
-    effect_terminal_control = _closed_object(
-        {
-            "terminal_instance": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-            },
-            "continuation_instance": {
-                "type": "string",
-                "pattern": "^i[0-9]+$",
-            },
-        },
-        ("terminal_instance", "continuation_instance"),
-        description=(
-            "One source-neutral terminal-control topology relation. The two "
-            "instances must anchor distinct sibling effect_if arm scopes; the "
-            "terminal arm ends the current kernel invocation and the continuation "
-            "arm carries the remaining lexical computation. No predicate, "
-            "polarity, return value, source spelling, or frontend API is present."
-        ),
-    )
-    domain_terminal_control = _closed_object(
-        {
-            "domain_ref": {
-                "type": "string",
-                "pattern": "^d[0-9]+$",
-            },
-            "continuation_region": {
-                "type": "string",
-                "pattern": "^r[0-9]+$",
-            },
-        },
-        ("domain_ref", "continuation_region"),
-        description=(
-            "One source-neutral program-domain terminal relation. The named "
-            "placement=branch continuation region must already be controlled by "
-            "an empty-slot route from the same J domain realization. Coordinates "
-            "outside that J domain terminate the current invocation. The relation "
-            "contains no predicate, polarity, return value, source spelling, or "
-            "frontend API."
-        ),
-    )
-    terminal_control = {
-        "oneOf": [effect_terminal_control, domain_terminal_control],
-        "description": (
-            "Either terminal-versus-continuation topology for an authored J "
-            "effect_if, or the terminal complement of an existing J-domain-owned "
-            "continuation region. Both forms depend on J and carry no condition."
-        ),
-    }
-    return _closed_object(
-        {
-            "regions": _array(region),
-            "instances": _array(instance),
-            "routes": _array(route),
-            "program_axes": _array(program_axis),
-            "program_linearizations": _array(program_linearization),
-            "route_extent_transforms": _array(route_extent_transform),
-            "order": _array(order),
-            "sharing": _array(sharing),
-            "refinements": _array(refinement),
-            "iterations": _array(iteration),
-            "loop_carriers": _array(loop_carrier),
-            "physical_iterations": _array(physical_iteration),
-            "physical_loop_carriers": _array(physical_loop_carrier),
-            "terminal_controls": _array(terminal_control),
-        },
-        (
-            "regions",
-            "instances",
-            "routes",
-            "program_axes",
-            "route_extent_transforms",
-            "order",
-            "sharing",
-            "refinements",
-            "iterations",
-            "loop_carriers",
-            "physical_iterations",
-            "physical_loop_carriers",
-            "terminal_controls",
-        ),
-        description=(
-            render_realization_witness_wire_grammar()
-            + " "
-            + render_realization_mechanism_grammar()
-            + " Preserve route/order/share/region multiplicity. Apart from the "
-            "closed route-extent divisor/rounding, no operator or value; never a "
-            "predicate, dtype, frontend API, rule identity or source text."
-        ),
-    )
-
-
 def _pi_schema() -> dict[str, Any]:
     """Active, certification-only pi subwire offered to Lift.
 
     Every accepted field has a closed typed meaning and binds directly to J/C.
-    The legacy realization graph is intentionally absent: new Lift candidates do
-    not serialize regions, instances, routes, carriers, source nodes, or target
-    recipes.
+    The full post-BindSource realization graph is intentionally absent: new Lift
+    candidates do not serialize regions, instances, routes, carriers, source
+    nodes, or target recipes.
     """
 
     program_axis = _closed_object(

@@ -360,7 +360,7 @@ def analyze_j_for_cuda(
             consumed.append(reduction_ref)
             continue
         fn = op.attrs.get("fn")
-        declared = item.identity if item.identity is not None else item.masked_contribution
+        declared = item.identity
         neutral = {
             "sum": {0, "ZERO"},
             "mean": {0, "ZERO"},

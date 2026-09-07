@@ -3584,7 +3584,6 @@ def _decode_scrc_lift_artifact_core(
 
     payload = _json_object(response_text)
     _require_compact_lift_pi(payload)
-    _require_fresh_lift_j_surface(payload)
     bound_payload = _bind_source_artifact_payload(
         payload, anonymous_compiler_view
     )
@@ -3611,7 +3610,7 @@ def _decode_scrc_lift_artifact_core(
         artifact.j,
         artifact.c,
         artifact.pi,
-        require_program_axes=artifact.wire_schema == artifact.SCHEMA,
+        require_program_axes=True,
     )
     if not bound_report.passed:
         raise ValueError(
@@ -3779,7 +3778,6 @@ def _decode_value_free_lift_candidate(
 
     payload = _json_object(response_text)
     _require_compact_lift_pi(payload)
-    _require_fresh_lift_j_surface(payload)
     raw_c = payload.get("c")
     if not isinstance(raw_c, Mapping):
         raise TypeError("Lift artifact c must be an object")
@@ -3856,13 +3854,9 @@ def _decode_value_free_lift_candidate(
 def _require_compact_lift_pi(payload: Mapping[str, Any]) -> None:
     """Require the one pi subwire accepted at fresh Lift ingress.
 
-    ``Gate1Artifact.from_json`` also reads retained historical Gate evidence,
-    including complete legacy realization graphs.  That compatibility is
-    deliberately broader than the fresh provider contract: accepting one of
-    those graphs from a new Lift reply would make final Decode disagree with
-    CandidateCheck's closed response schema.  Keep the archival parser broad,
-    but make both fresh ingress paths require the same explicit compact
-    normalization witness before Source binding or sentinel construction.
+    CandidateCheck runs before Source binding and therefore accepts only the
+    compact normalization witness.  BindSource later materializes the complete
+    realization graph required by Replay and Gate execution.
     """
 
     pi = payload.get("pi")
@@ -3873,49 +3867,6 @@ def _require_compact_lift_pi(payload: Mapping[str, Any]) -> None:
             "Lift artifact pi must use the compact normalization witness "
             "required by CandidateCheck"
         )
-
-
-def _require_fresh_lift_j_surface(payload: Mapping[str, Any]) -> None:
-    """Keep fresh Lift on the complete current J surface at both ingress paths.
-
-    Retained historical Gate evidence may be normalized from a proven
-    direct-output/no-returns spelling by the archival parser.  A new provider
-    reply is not evidence: it must author its ordered return ABI explicitly,
-    so it cannot enter through that compatibility path.
-    """
-
-    raw_j = payload.get("j")
-    intent = raw_j.get("intent") if isinstance(raw_j, Mapping) else None
-    function = (
-        intent.get("intent_function") if isinstance(intent, Mapping) else None
-    )
-    if not isinstance(function, Mapping):
-        return
-    if "returns" not in function:
-        raise ValueError(
-            "fresh J requires intent_function.returns; retained direct-output "
-            "compatibility is not accepted from Lift"
-        )
-
-    def visit(body: Any, path: str) -> None:
-        if not isinstance(body, list):
-            return
-        for index, operation in enumerate(body):
-            if not isinstance(operation, Mapping):
-                continue
-            operation_path = f"{path}[{index}]"
-            if operation.get("op") == "loop" and "operands" in operation:
-                raise ValueError(
-                    f"{operation_path}.operands duplicates loop capture facts; "
-                    "fresh J represents them through its body and scope"
-                )
-            visit(operation.get("body"), f"{operation_path}.body")
-            for arm_name in ("positive", "negative"):
-                arm = operation.get(arm_name)
-                if isinstance(arm, Mapping):
-                    visit(arm.get("body"), f"{operation_path}.{arm_name}.body")
-
-    visit(function.get("body"), "j.intent.intent_function.body")
 
 
 def check_scrc_lift_candidate(
@@ -3990,7 +3941,7 @@ def check_scrc_lift_candidate(
         artifact.j,
         artifact.c,
         artifact.pi,
-        require_program_axes=artifact.wire_schema == artifact.SCHEMA,
+        require_program_axes=True,
     )
     return {
         "protocol": CANDIDATE_CHECK_PROTOCOL,

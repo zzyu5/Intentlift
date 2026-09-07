@@ -25,11 +25,6 @@ _LAZY_EXPORTS = {
         "intentir.verify.gate2.inputs",
         "materialize_ragged_input_values",
     ),
-    "extract_gate1_gate2_observation": (
-        "intentir.verify.gate2.metrics",
-        "extract_gate1_gate2_observation",
-    ),
-    "summarize_gate1_gate2": ("intentir.verify.gate2.metrics", "summarize_gate1_gate2"),
     "ExecutionResult": ("intentir.verify.gate2.model", "ExecutionResult"),
     "ExecutionBinding": ("intentir.verify.gate2.model", "ExecutionBinding"),
     "Gate2Result": ("intentir.verify.gate2.model", "Gate2Result"),
@@ -108,11 +103,9 @@ __all__ = [
     "boundary_1d_extents",
     "close_q",
     "compare_outputs",
-    "extract_gate1_gate2_observation",
     "generate_input_matrix",
     "generate_tensor_input",
     "materialize_ragged_input_values",
-    "summarize_gate1_gate2",
     "scalar_broadcast_axes",
     "validate_j_inputs",
 ]

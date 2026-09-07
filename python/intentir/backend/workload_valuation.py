@@ -38,8 +38,6 @@ PRODUCTION_CASE_IDS: dict[str, str] = {
     "llama4_rope": "high_performance:liger_llama4_rope",
     "liger_rope": "high_performance:liger_rope",
     "liger_rms_norm": "high_performance:liger_rms_norm",
-    "masked_copy": "scrc_canary:masked_copy",
-    "masked_row_square_sum": "scrc_canary:masked_row_square_sum",
     "poly_norm": "high_performance:liger_poly_norm",
     "qwen2vl_mrope": "high_performance:liger_qwen2vl_mrope",
     "softmax": "high_performance:liger_softmax",
@@ -60,14 +58,8 @@ PRODUCTION_CASE_IDS: dict[str, str] = {
     ),
 }
 
-# Formal performance inputs are the accepted high-performance J entries.  The
-# two SCRC canaries stay available to explicit compiler/correctness regression,
-# but no default paper experiment may silently include them.
-FORMAL_PRODUCTION_CASE_IDS: dict[str, str] = {
-    name: case_id
-    for name, case_id in PRODUCTION_CASE_IDS.items()
-    if case_id.startswith("high_performance:")
-}
+# Every production entry is a registered high-performance Source workload.
+FORMAL_PRODUCTION_CASE_IDS: dict[str, str] = dict(PRODUCTION_CASE_IDS)
 
 PRODUCTION_WORKLOAD_PROFILE_CLOSED = "closed-v1"
 PRODUCTION_WORKLOAD_PROFILE_NATURAL_HEADLINE = "natural-headline-v1"

@@ -125,9 +125,6 @@ RecordedLiftAdapter = (
     ResponsesSCRCLiftAdapter | MiniSWELiftAdapter | CodexCLILiftAdapter
 )
 PreparedWorkload = PreparedTritonWorkload | PreparedFrontendDatasetWorkload
-GATE1_DIAGNOSTIC_RECHECK_PROTOCOL = (
-    "intentir.scrc.gate1-diagnostic-recheck.v1"
-)
 LIFT_SEMANTIC_PROBE_PROTOCOL = "intentir.lift.public-semantic-probe.v1"
 LIFT_SEMANTIC_PROBE_SEED = 2026073001
 LIFT_SEMANTIC_PROBE_MAX_BUFFER_BYTES = 64 * 1024 * 1024
@@ -1273,7 +1270,7 @@ def run_prepared_workload_consistency(
             artifact.j,
             artifact.c,
             artifact.pi,
-            require_program_axes=artifact.wire_schema == artifact.SCHEMA,
+            require_program_axes=True,
         )
         record_stage(
             "typecheck",
@@ -1528,27 +1525,6 @@ class WorkloadGate1Search:
 
 
 @dataclass(frozen=True)
-class WorkloadGate1Recheck:
-    """One diagnostic-only Gate1 run over an already accepted artifact.
-
-    This result is deliberately outside the SCRC candidate/winner lifecycle.
-    It cannot select a candidate, change a prior verdict, or enter Gate2.
-    """
-
-    artifact: Gate1Artifact
-    artifact_digest: str
-    typecheck: TypeCheckReport
-    gate1: Gate1ExecutionResult | None
-    replay_writer: RecordedReplayWriter | None
-    protocol: str = GATE1_DIAGNOSTIC_RECHECK_PROTOCOL
-    diagnostic_only: bool = True
-
-    @property
-    def passed(self) -> bool:
-        return self.gate1 is not None and self.gate1.passed
-
-
-@dataclass(frozen=True)
 class WorkloadConsistencyResult:
     """Diagnostic-only result for the current Source-to-J objective.
 
@@ -1653,73 +1629,6 @@ class WorkloadExecutionError(RuntimeError):
             if isinstance(value, Mapping)
         }
         super().__init__(f"{type(cause).__name__}: {cause}")
-
-
-def recheck_prepared_workload_gate1(
-    prepared: PreparedWorkload,
-    artifact: Gate1Artifact,
-    *,
-    provider: ProviderConfig,
-    effort: str | None = None,
-    replay_backend: str = "responses",
-) -> WorkloadGate1Recheck:
-    """Re-run normal Gate1 for one fixed artifact without Lift or Gate2.
-
-    The input remains the ordinary ``Gate1Artifact``; this function creates no
-    repair artifact or alternate certificate object.  Canonicalization and the
-    authoritative TypeCheck run before any provider call.  A TypeCheck failure
-    is returned as diagnostic evidence and never reaches Replay.
-    """
-
-    frontend = _prepared_frontend(prepared)
-    canonical = canonicalize_gate1_artifact(artifact)
-    digest = canonical_artifact_digest(canonical)
-    checked = type_check(
-        canonical.j,
-        canonical.c,
-        canonical.pi,
-        require_program_axes=canonical.wire_schema == canonical.SCHEMA,
-    )
-    if not checked.passed:
-        return WorkloadGate1Recheck(
-            canonical,
-            digest,
-            checked,
-            None,
-            None,
-        )
-
-    compiler, case = _workload_compiler(frontend, prepared)
-    compile_checker = (
-        _native_replay_compile_checker(frontend, compiler, case)
-        if frontend in {Frontend.CUDA, Frontend.TILELANG}
-        else None
-    )
-    writer = _new_replay_writer(
-        replay_backend,
-        provider=provider,
-        effort=effort,
-        frontend=frontend,
-        compile_checker=compile_checker,
-    )
-    gate1 = _build_gate1_adapter(
-        frontend,
-        compiler=compiler,
-        writer=writer,
-        masked_writer=None,
-        run_masked_j=False,
-    ).run(canonical, prepared.request)
-    if gate1.artifact_digest != digest:
-        raise RuntimeError("fixed-artifact Gate1 digest changed during recheck")
-    if gate1.masked_j is not None or gate1.masked_j_calls != 0:
-        raise RuntimeError("diagnostic Gate1 recheck must not run masked-J")
-    return WorkloadGate1Recheck(
-        canonical,
-        digest,
-        checked,
-        gate1,
-        writer,
-    )
 
 
 def _build_workload_runtime(
@@ -2420,16 +2329,7 @@ def next_candidate_fanout_dir(
     return _next_evidence_dir(output_root, case_id, prefix="fanout-")
 
 
-def next_gate1_recheck_dir(
-    output_root: str | Path,
-    case_id: str,
-) -> Path:
-    """Atomically allocate evidence isolated from canonical ``run-*`` data."""
-
-    return _next_evidence_dir(output_root, case_id, prefix="recheck-")
-
-
-def _read_recheck_lineage_object(path: Path, label: str) -> dict[str, Any]:
+def _read_workload_lineage_object(path: Path, label: str) -> dict[str, Any]:
     if not path.is_file():
         raise ValueError(f"parent Gate1 evidence lacks {label}")
     try:
@@ -2565,30 +2465,30 @@ def _refresh_workload_manifest_lineage(
         raise ValueError(
             "workload evidence must be initialized before manifest lineage is refreshed"
         )
-    request = _read_recheck_lineage_object(request_path, "request.json")
+    request = _read_workload_lineage_object(request_path, "request.json")
     _write_json(source_projection_path, _workload_source_projection(prepared))
     request.update(_prepared_manifest_lineage(prepared))
     _write_json(request_path, request)
 
 
-def validate_workload_gate1_recheck_parent(
+def validate_workload_gate1_continuation_parent(
     parent_evidence: str | Path,
     prepared: PreparedWorkload,
     artifact: Gate1Artifact,
 ) -> Path:
-    """Bind a diagnostic recheck to one exact parent case/source/artifact.
+    """Bind a Gate1 continuation to one exact parent case/source/artifact.
 
-    This is lineage validation only, not a Gate or certificate predicate.  It
-    fails closed before any provider call when an old evidence directory lacks
-    the exact artifact/request/source content needed to identify its parent run.
+    This is lineage validation only.  It fails closed before any provider call
+    when the parent evidence lacks the exact artifact/request/source content
+    needed to identify its current run.
     """
 
     parent = Path(parent_evidence).expanduser().resolve()
     if not parent.is_dir():
         raise ValueError("parent Gate1 evidence directory does not exist")
 
-    _read_recheck_lineage_object(parent / "gate1.json", "gate1.json")
-    parent_artifact_payload = _read_recheck_lineage_object(
+    _read_workload_lineage_object(parent / "gate1.json", "gate1.json")
+    parent_artifact_payload = _read_workload_lineage_object(
         parent / "artifact.json",
         "artifact.json",
     )
@@ -2617,7 +2517,7 @@ def validate_workload_gate1_recheck_parent(
     if lineage_root is None:
         raise ValueError("parent Gate1 evidence lacks request/source lineage")
 
-    request = _read_recheck_lineage_object(
+    request = _read_workload_lineage_object(
         lineage_root / "request.json", "request.json"
     )
     expected_request = {
@@ -2660,7 +2560,10 @@ def validate_workload_gate1_recheck_parent(
         for source, expected in expected_source_to_opaque.items()
         if parent_source_to_opaque.get(source) != expected
     )
-    if missing_abi or mismatched_abi:
+    unexpected_abi = sorted(
+        set(parent_source_to_opaque) - set(expected_source_to_opaque)
+    )
+    if missing_abi or mismatched_abi or unexpected_abi:
         details: list[str] = []
         if missing_abi:
             details.append("missing ABI source name(s): " + ", ".join(missing_abi))
@@ -2668,20 +2571,13 @@ def validate_workload_gate1_recheck_parent(
             details.append(
                 "mismatched ABI source name(s): " + ", ".join(mismatched_abi)
             )
+        if unexpected_abi:
+            details.append(
+                "unexpected ABI source name(s): " + ", ".join(unexpected_abi)
+            )
         raise ValueError(
             "parent Gate1 source_to_opaque mapping differs from selected workload: "
             + "; ".join(details)
-        )
-    legacy_physical = sorted(
-        source
-        for source, opaque in parent_source_to_opaque.items()
-        if source not in expected_source_to_opaque
-        and re.fullmatch(r"(?:p|c)[0-9]+", opaque) is not None
-    )
-    if legacy_physical:
-        raise ValueError(
-            "parent Gate1 source_to_opaque has extra physical ABI mapping(s): "
-            + ", ".join(legacy_physical)
         )
     if artifact.c.values != request["c0"]:
         raise ValueError("input artifact C differs from parent Gate1 request c0")
@@ -2693,21 +2589,18 @@ def validate_workload_gate1_recheck_parent(
     # false claim that Gate1 executed against it.
     expected_manifest_lineage = _execution_manifest_lineage(bound_prepared)
     manifest_keys = set(expected_manifest_lineage)
-    recorded_manifest_keys = manifest_keys & set(request)
-    legacy_manifest_lineage = not recorded_manifest_keys
-    if not legacy_manifest_lineage:
-        missing_manifest = sorted(manifest_keys - set(request))
-        if missing_manifest:
+    missing_manifest = sorted(manifest_keys - set(request))
+    if missing_manifest:
+        raise ValueError(
+            "parent Gate1 request has incomplete generated-source manifest "
+            "lineage: " + ", ".join(missing_manifest)
+        )
+    for key, expected in expected_manifest_lineage.items():
+        if request[key] != expected:
             raise ValueError(
-                "parent Gate1 request has incomplete generated-source manifest "
-                "lineage: " + ", ".join(missing_manifest)
+                "parent Gate1 generated-source manifest differs from the "
+                f"selected workload: {key}"
             )
-        for key, expected in expected_manifest_lineage.items():
-            if request[key] != expected:
-                raise ValueError(
-                    "parent Gate1 generated-source manifest differs from the "
-                    f"selected workload: {key}"
-                )
     final_manifest_payload = request.get(
         "final_generated_target_source_manifest"
     )
@@ -2732,7 +2625,7 @@ def validate_workload_gate1_recheck_parent(
                 "parent Gate1 final manifest digest does not match its payload"
             )
 
-    projection = _read_recheck_lineage_object(
+    projection = _read_workload_lineage_object(
         lineage_root / "source_projection.json", "source_projection.json"
     )
     expected_projection = _workload_source_projection(bound_prepared)
@@ -2744,22 +2637,6 @@ def validate_workload_gate1_recheck_parent(
             "selected_device_entry_symbol",
         }
     )
-    if legacy_manifest_lineage:
-        projection_lineage_keys.update(
-            key
-            for key in expected_manifest_lineage
-            if key not in projection
-        )
-        # These source identity fields were introduced together with the
-        # generated-source manifest.  An older parent can still be checked
-        # against the exact source.py and source-slice digest below; do not
-        # reject it solely because the old projection did not persist the
-        # redundant source-kind/hash pair.
-        projection_lineage_keys.update(
-            key
-            for key in ("lift_source_kind", "lift_source_sha256")
-            if key not in projection
-        )
     for key, expected in expected_projection.items():
         if key in projection_lineage_keys:
             continue
@@ -2768,8 +2645,6 @@ def validate_workload_gate1_recheck_parent(
                 "parent Gate1 source projection differs from selected workload"
             )
     for key, expected in _execution_manifest_lineage(bound_prepared).items():
-        if legacy_manifest_lineage and key not in projection:
-            continue
         if projection.get(key) != expected:
             raise ValueError(
                 "parent Gate1 source projection execution lineage differs"
@@ -2778,10 +2653,7 @@ def validate_workload_gate1_recheck_parent(
         bound_prepared.source_slice.code.encode("utf-8")
     ).hexdigest()
     recorded_source_slice_sha256 = projection.get("selected_source_slice_sha256")
-    if (
-        recorded_source_slice_sha256 is not None
-        and recorded_source_slice_sha256 != expected_source_slice_sha256
-    ):
+    if recorded_source_slice_sha256 != expected_source_slice_sha256:
         raise ValueError(
             "parent Gate1 source projection differs from selected workload"
         )
@@ -2792,61 +2664,6 @@ def validate_workload_gate1_recheck_parent(
     if parent_source != prepared.request.source.text:
         raise ValueError("parent Gate1 source differs from selected workload")
     return lineage_root
-
-
-def initialize_workload_gate1_recheck_evidence(
-    recheck_dir: Path,
-    prepared: PreparedWorkload,
-    *,
-    provider: ProviderConfig,
-    effort: str | None,
-    parent_evidence: str | Path,
-    replay_backend: str = "responses",
-) -> None:
-    """Initialize an immutable diagnostic recheck directory.
-
-    ``parent_evidence`` is a reference only.  No file below it is opened for
-    writing, and this evidence cannot replace a prior SCRC verdict.
-    """
-
-    parent = Path(parent_evidence).expanduser().resolve()
-    if not parent.is_dir():
-        raise ValueError("parent Gate1 evidence directory does not exist")
-    if not recheck_dir.is_dir():
-        raise ValueError("Gate1 recheck evidence directory was not allocated")
-    if any(recheck_dir.iterdir()):
-        raise ValueError("Gate1 recheck evidence directory must be empty")
-
-    (recheck_dir / "source.py").write_text(
-        prepared.request.source.text, encoding="utf-8"
-    )
-    _write_json(recheck_dir / "adapter.json", prepared.adapter.to_json())
-    _write_json(
-        recheck_dir / "source_projection.json",
-        _workload_source_projection(prepared),
-    )
-    _write_json(
-        recheck_dir / "request.json",
-        {
-            "protocol": GATE1_DIAGNOSTIC_RECHECK_PROTOCOL,
-            "diagnostic_only": True,
-            "enters_gate2": False,
-            "changes_prior_verdict": False,
-            "case_id": prepared.entry.case_id,
-            "parent_evidence": str(parent),
-            "provider": provider.name,
-            "model": provider.model,
-            "reasoning_effort": effort or provider.reasoning_effort,
-            "replay_backend": replay_backend,
-            "frontend": prepared.entry.frontend,
-            "observer_profile": prepared.entry.observer_profile,
-            "c0": prepared.request.binding.values,
-            "grid": list(prepared.adapter.grid),
-            "run_masked_j": False,
-            "source_to_opaque": dict(prepared.source_to_opaque),
-            **_prepared_manifest_lineage(prepared),
-        },
-    )
 
 
 def initialize_workload_evidence(
@@ -3025,116 +2842,6 @@ def _save_replay_record_evidence(
         # Write the parsed sanitized value only after its canonical byte hash has
         # been bound to the record receipt.
         _write_json(directory / f"{prefix}_trajectory.json", record.trajectory)
-
-
-def save_workload_gate1_recheck(
-    recheck_dir: Path,
-    prepared: PreparedWorkload,
-    result: WorkloadGate1Recheck,
-) -> None:
-    """Persist fixed-artifact diagnostic evidence without a new verdict."""
-
-    request_path = recheck_dir / "request.json"
-    if not request_path.is_file():
-        raise ValueError("Gate1 recheck evidence was not initialized")
-    request = json.loads(request_path.read_text(encoding="utf-8"))
-    if request.get("protocol") != GATE1_DIAGNOSTIC_RECHECK_PROTOCOL:
-        raise ValueError("Gate1 recheck evidence protocol differs")
-    if request.get("case_id") != prepared.entry.case_id:
-        raise ValueError("Gate1 recheck evidence case differs")
-    if not result.diagnostic_only:
-        raise ValueError("fixed-artifact recheck result must be diagnostic-only")
-    if canonical_artifact_digest(result.artifact) != result.artifact_digest:
-        raise ValueError("fixed-artifact recheck digest differs from artifact")
-
-    bound_prepared = _bind_prepared_manifest(prepared, result.artifact)
-    _write_json(
-        recheck_dir / "source_projection.json",
-        _workload_source_projection(bound_prepared),
-    )
-    request.update(_prepared_manifest_lineage(bound_prepared))
-    _write_json(request_path, request)
-
-    _write_json(recheck_dir / "artifact.json", result.artifact.to_json())
-    _write_json(recheck_dir / "typecheck.json", result.typecheck.to_json())
-    if result.gate1 is not None:
-        _write_json(recheck_dir / "gate1.json", result.gate1.to_json())
-
-    records = (
-        tuple(result.replay_writer.records)
-        if result.replay_writer is not None
-        else ()
-    )
-    if len(records) > 1:
-        raise ValueError("normal-only Gate1 recheck produced multiple Replay records")
-    record: ReplayGeneration | ReplayAttempt | None = (
-        records[0] if records else None
-    )
-    if record is None and result.gate1 is not None:
-        record = result.gate1.normal.generation
-    if isinstance(record, ReplayGeneration):
-        _save_replay_record_evidence(
-            recheck_dir,
-            prefix="replay",
-            exact_source_name="replay.py",
-            record=record,
-        )
-    elif isinstance(record, ReplayAttempt):
-        _save_replay_record_evidence(
-            recheck_dir,
-            prefix="replay",
-            exact_source_name="replay_rejected.txt",
-            record=record,
-        )
-    else:
-        _write_json(
-            recheck_dir / "replay_receipt.json",
-            {
-                "recorded": False,
-                "status": "not_run" if result.gate1 is None else "unavailable",
-                "diagnostic": (
-                    result.gate1.normal.diagnostic
-                    if result.gate1 is not None
-                    else "TypeCheck rejected the fixed artifact before Replay"
-                ),
-            },
-        )
-
-    status = (
-        "typecheck_failed"
-        if result.gate1 is None
-        else result.gate1.status.value
-    )
-    _write_json(
-        recheck_dir / "recheck.json",
-        {
-            "protocol": GATE1_DIAGNOSTIC_RECHECK_PROTOCOL,
-            "diagnostic_only": True,
-            "enters_gate2": False,
-            "changes_prior_verdict": False,
-            "case_id": prepared.entry.case_id,
-            "parent_evidence": request["parent_evidence"],
-            "artifact_digest": result.artifact_digest,
-            "artifact_schema": result.artifact.wire_schema,
-            "typecheck_protocol": result.typecheck.protocol,
-            "typecheck_status": result.typecheck.status.value,
-            "gate1_protocol": (
-                result.gate1.protocol if result.gate1 is not None else None
-            ),
-            "status": status,
-        },
-    )
-    (recheck_dir / "SUMMARY.md").write_text(
-        f"# {prepared.entry.case_id} {recheck_dir.name}\n\n"
-        f"- protocol: `{GATE1_DIAGNOSTIC_RECHECK_PROTOCOL}`\n"
-        "- diagnostic_only: `true`\n"
-        "- enters_gate2: `false`\n"
-        "- changes_prior_verdict: `false`\n"
-        f"- parent_evidence: `{request['parent_evidence']}`\n"
-        f"- artifact_digest: `{result.artifact_digest}`\n"
-        f"- status: `{status}`\n",
-        encoding="utf-8",
-    )
 
 
 def save_workload_execution(
@@ -3638,13 +3345,11 @@ def save_workload_failure(
 
 
 __all__ = [
-    "GATE1_DIAGNOSTIC_RECHECK_PROTOCOL",
     "LIFT_SEMANTIC_PROBE_PROTOCOL",
     "LIFT_SEMANTIC_PROBE_SEED",
     "WorkloadExecution",
     "WorkloadExecutionError",
     "WorkloadGate1Search",
-    "WorkloadGate1Recheck",
     "WorkloadConsistencyResult",
     "build_workload_gate2_suite",
     "build_workload_jc_suite",
@@ -3652,12 +3357,9 @@ __all__ = [
     "complete_prepared_workload_gate2",
     "execute_prepared_workload",
     "gate2_exposes_logical_j_pass_implementation_failure",
-    "initialize_workload_gate1_recheck_evidence",
     "initialize_workload_evidence",
     "next_candidate_fanout_dir",
-    "next_gate1_recheck_dir",
     "next_workload_run_dir",
-    "recheck_prepared_workload_gate1",
     "retry_prepared_workload_gate1_fixed_artifact",
     "run_workload_lift_semantic_probe",
     "run_prepared_workload_consistency",
@@ -3665,11 +3367,10 @@ __all__ = [
     "save_workload_execution",
     "save_workload_failure",
     "save_workload_gate1_search",
-    "save_workload_gate1_recheck",
     "merge_fixed_artifact_replay_retry_execution",
     "scrc_gate1_search_diagnostic",
     "scrc_attempt_stage_counts",
     "scrc_report_diagnostic",
     "search_prepared_workload_gate1",
-    "validate_workload_gate1_recheck_parent",
+    "validate_workload_gate1_continuation_parent",
 ]

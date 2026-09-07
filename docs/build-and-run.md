@@ -66,7 +66,7 @@ PYTHONPATH=python python tools/scrc_frontend.py \
   --json
 ```
 
-该命令会调用 Lift/Replay provider。若只需零模型调用的能力复核，应使用已接受 artifact 与精确 parent Replay 的 Gate2 recheck，见 [工作流](workflows.md)。
+该命令会调用 Lift/Replay provider。真实闭包只能由该 fresh Lift → BindSource → Replay → Gate 流程产生；历史 artifact 不进入活动验证路径。
 
 ## 5. CUDA 后端
 

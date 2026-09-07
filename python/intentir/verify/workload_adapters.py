@@ -3190,12 +3190,9 @@ class TritonWorkloadAdapter:
     protocol: str = TRITON_WORKLOAD_ADAPTER_PROTOCOL
 
     def __post_init__(self) -> None:
-        if not self.case_id.startswith(
-            ("high_performance:", "scrc_canary:", "tilelang:")
-        ):
+        if not self.case_id.startswith("high_performance:"):
             raise ValueError(
-                "adapter case_id must reference the active registry or an accepted "
-                "external Source namespace"
+                "adapter case_id must reference the active workload registry"
             )
         buffers = tuple(
             item if isinstance(item, BufferBinding) else BufferBinding(*item)
@@ -4028,93 +4025,6 @@ def prepare_triton_workload(
         source=source,
         source_location=resolution.location,
         search_roots=(module_root,),
-    )
-
-
-def prepare_triton_source_workload(
-    adapter: TritonWorkloadAdapter,
-    source_path: str | Path,
-    *,
-    source_symbol: str,
-    source_location: str | None = None,
-) -> PreparedTritonWorkload:
-    """Prepare one exact certified Source outside the active registry."""
-
-    if not adapter.case_id.startswith(("scrc_canary:", "tilelang:")):
-        raise ValueError(
-            "explicit Source preparation is reserved for certified canaries "
-            "and accepted TileLang workload adapters"
-        )
-    path = Path(source_path).resolve()
-    source = path.read_text(encoding="utf-8")
-    entry = SCRCWorkloadEntry(
-        ordinal=0,
-        case_id=adapter.case_id,
-        suite=(
-            "tilelang"
-            if adapter.case_id.startswith("tilelang:")
-            else "scrc_canary"
-        ),
-        symbol=source_symbol,
-        mechanisms=("certified_source_reuse",),
-        source_module="intentir.certified_canary",
-        source_alignment="exact archived accepted Source",
-        lowering_status="certified",
-        representative_tier="certified_canary",
-        adapter_readiness="declared",
-    )
-    return _prepare_triton_workload_source(
-        adapter,
-        entry=entry,
-        source=source,
-        source_location=(source_location or str(path)),
-        search_roots=(path.parent,),
-    )
-
-
-def prepare_captured_triton_workload(
-    adapter: TritonWorkloadAdapter,
-    *,
-    source: str,
-    source_symbol: str,
-    source_location: str,
-    search_roots: Iterable[str | Path] = (),
-    suite: str = "flaggems",
-    mechanisms: Iterable[str] = (),
-) -> PreparedTritonWorkload:
-    """Prepare one captured launch without adding it to the static corpus registry.
-
-    The caller supplies the exact source projection and Harness bindings.  This
-    boundary performs no operator, role, shape, or J inference; it only routes a
-    captured real launch through the same anonymization and SCRC lifecycle as the
-    registered corpus.
-    """
-
-    if not isinstance(source, str) or not source.strip():
-        raise ValueError("captured Triton source must be non-empty")
-    if not source_symbol.isidentifier():
-        raise ValueError("captured Triton source symbol must be a Python identifier")
-    if not source_location:
-        raise ValueError("captured Triton source location must be non-empty")
-    entry = SCRCWorkloadEntry(
-        ordinal=0,
-        case_id=adapter.case_id,
-        suite=suite,
-        symbol=source_symbol,
-        mechanisms=tuple(mechanisms),
-        source_module="captured_triton",
-        source_alignment="captured_launch",
-        lowering_status="captured",
-        representative_tier="zero_shot",
-        adapter_readiness="captured",
-    )
-    roots = tuple(Path(root).expanduser().resolve() for root in search_roots)
-    return _prepare_triton_workload_source(
-        adapter,
-        entry=entry,
-        source=source,
-        source_location=source_location,
-        search_roots=roots,
     )
 
 
@@ -5883,8 +5793,6 @@ __all__ = [
     "ScalarBinding",
     "TritonWorkloadAdapter",
     "build_generated_source_manifest",
-    "prepare_captured_triton_workload",
     "reingress_triton_workload",
-    "prepare_triton_source_workload",
     "prepare_triton_workload",
 ]

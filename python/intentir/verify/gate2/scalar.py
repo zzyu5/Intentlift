@@ -513,18 +513,14 @@ def _validate_masked_sum_reduction(
         raise NotImplementedError(
             "E_J padded reduction requires the single physical tile axis 0"
         )
-    for name, value in (
-        ("identity", contract.identity),
-        ("masked_contribution", contract.masked_contribution),
+    if (
+        isinstance(contract.identity, bool)
+        or not isinstance(contract.identity, (int, float))
+        or float(contract.identity) != 0.0
     ):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or float(value) != 0.0
-        ):
-            raise NotImplementedError(
-                f"E_J padded sum requires explicit neutral {name}=0"
-            )
+        raise NotImplementedError(
+            "E_J padded sum requires explicit neutral identity=0"
+        )
 
 
 def _validate_dense_functional_boundary(j: SemanticArchive) -> None:

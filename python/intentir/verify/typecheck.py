@@ -7072,15 +7072,10 @@ def _check_consumer_extensions(
     node_operations: Mapping[str, Mapping[str, Any]],
     diagnostics: list[TypeCheckDiagnostic],
 ) -> None:
-    """Check v4's unique per-consumer outside-domain authority."""
+    """Check the unique per-consumer outside-domain authority."""
 
     value_types = j_elaboration(j).value_type_by_name
     accesses = {item.access_id: item for item in j.boundary.accesses}
-    legacy_masked_reductions = {
-        item.node_ref
-        for item in j.boundary.reductions
-        if item.masked_contribution is not None
-    }
     declared = {
         (item.consumer_ref, item.operand_index, item.access_ref): item
         for item in j.boundary.consumer_extensions
@@ -7207,16 +7202,6 @@ def _check_consumer_extensions(
                     f"{path}.access_ref",
                     path_issue,
                     extension.access_ref,
-                )
-            )
-        if extension.consumer_ref in legacy_masked_reductions:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.CONSUMER_EXTENSION_INVALID,
-                    path,
-                    "masked_contribution and consumer extension are duplicate "
-                    "authorities",
-                    extension.consumer_ref,
                 )
             )
 

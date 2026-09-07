@@ -1,9 +1,6 @@
 """Stable names for the closed production snapshots and their source baselines."""
 
 from __future__ import annotations
-
-import json
-from pathlib import Path
 from typing import Any, Mapping
 
 from intentir.backend.workload_valuation import (
@@ -27,14 +24,8 @@ from intentir.verify.gate1.model import (
     SemanticArchive,
 )
 from intentir.verify.workload_adapters import (
-    BufferBinding,
-    BufferInitializer,
-    BufferRole,
     PreparedTritonWorkload,
-    ScalarBinding,
     TRITON_WORKLOAD_ADAPTERS,
-    TritonWorkloadAdapter,
-    prepare_triton_source_workload,
     prepare_triton_workload,
 )
 from intentir.verify.gate2.policy import (
@@ -42,52 +33,6 @@ from intentir.verify.gate2.policy import (
     DEFAULT_GATE2_POLICY,
     NumericTolerance,
 )
-
-
-_REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
-_SOURCE_MANIFEST = (
-    _REPOSITORY_ROOT / "corpus" / "production-source-v1" / "manifest.json"
-)
-_CERTIFIED_CANARY_ADAPTERS: dict[str, TritonWorkloadAdapter] = {
-    "scrc_canary:masked_copy": TritonWorkloadAdapter(
-        case_id="scrc_canary:masked_copy",
-        buffers=(
-            BufferBinding(
-                "X",
-                BufferRole.INPUT,
-                "f32",
-                (1000,),
-                initializer=BufferInitializer.STANDARD_NORMAL,
-            ),
-            BufferBinding("Y", BufferRole.OUTPUT, "f32", (1000,), "output0"),
-        ),
-        scalars=(ScalarBinding("N", "i32", 1000),),
-        semantic_constexprs=(),
-        c_values=(("BLOCK_SIZE", 1024),),
-        grid=(1,),
-        grid_contract=("1",),
-        seed=11,
-    ),
-    "scrc_canary:masked_row_square_sum": TritonWorkloadAdapter(
-        case_id="scrc_canary:masked_row_square_sum",
-        buffers=(
-            BufferBinding(
-                "X",
-                BufferRole.INPUT,
-                "f32",
-                (2, 1000),
-                initializer=BufferInitializer.STANDARD_NORMAL,
-            ),
-            BufferBinding("Y", BufferRole.OUTPUT, "f32", (2,), "output0"),
-        ),
-        scalars=(ScalarBinding("N", "i32", 1000),),
-        semantic_constexprs=(),
-        c_values=(("BLOCK_SIZE", 1024),),
-        grid=(2,),
-        grid_contract=("2",),
-        seed=19,
-    ),
-}
 
 # Q is an external workload policy, not a permission encoded in J.  Natural
 # headline runs use the same f32 thresholds as the corresponding upstream test
@@ -169,36 +114,14 @@ def prepare_production_workload(
     *,
     profile: str = PRODUCTION_WORKLOAD_PROFILE_CLOSED,
 ) -> PreparedTritonWorkload:
-    """Resolve an active Source or an exact content-checked certified canary."""
+    """Resolve one active registered Source workload."""
 
     case_id = PRODUCTION_CASE_IDS[name]
-    if case_id in TRITON_WORKLOAD_ADAPTERS:
-        adapter = _apply_workload_profile(
-            name, TRITON_WORKLOAD_ADAPTERS[case_id], profile
-        )
-        return prepare_triton_workload(adapter)
-    adapter = _CERTIFIED_CANARY_ADAPTERS.get(case_id)
+    adapter = TRITON_WORKLOAD_ADAPTERS.get(case_id)
     if adapter is None:
         raise KeyError(f"production case {name!r} has no Source adapter")
-    payload = json.loads(_SOURCE_MANIFEST.read_text(encoding="utf-8"))
-    record = payload.get(name)
-    if not isinstance(record, dict) or not {
-        "case_id",
-        "path",
-        "symbol",
-    }.issubset(record):
-        raise ValueError(f"certified Source manifest entry {name!r} is invalid")
-    if record["case_id"] != case_id:
-        raise ValueError("certified Source manifest case_id mismatch")
-    source_path = (_REPOSITORY_ROOT / record["path"]).resolve()
-    if _REPOSITORY_ROOT not in source_path.parents:
-        raise ValueError("certified Source path escapes the repository")
-    profiled_adapter = _apply_workload_profile(name, adapter, profile)
-    return prepare_triton_source_workload(
-        profiled_adapter,
-        source_path,
-        source_symbol=record["symbol"],
-        source_location=f"corpus://production-source-v1/{source_path.name}",
+    return prepare_triton_workload(
+        _apply_workload_profile(name, adapter, profile)
     )
 
 

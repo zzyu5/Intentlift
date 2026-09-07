@@ -35,7 +35,7 @@ from intentir.verify.scrc_workload_run import (
     save_workload_failure,
     save_workload_gate1_search,
     search_prepared_workload_gate1,
-    validate_workload_gate1_recheck_parent,
+    validate_workload_gate1_continuation_parent,
 )
 from intentir.verify.typecheck import type_check
 from intentir.verify.workload_adapters import (
@@ -157,7 +157,7 @@ def _load_seed(parent_path: Path, prepared: Any) -> LiftFeedback:
         raise ValueError(
             f"parent artifact decode rejected: {type(exc).__name__}: {exc}"
         ) from exc
-    validate_workload_gate1_recheck_parent(parent, prepared, artifact)
+    validate_workload_gate1_continuation_parent(parent, prepared, artifact)
     checked = type_check(
         artifact.j,
         artifact.c,

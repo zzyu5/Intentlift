@@ -1,1 +1,1 @@
-"""Run scripts for mini-SWE-agent."""
+"""IntentIR Lift and Replay runner components."""

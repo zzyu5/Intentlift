@@ -2082,7 +2082,7 @@ class SCRCGateRunner:
                 artifact.j,
                 artifact.c,
                 artifact.pi,
-                require_program_axes=artifact.wire_schema == artifact.SCHEMA,
+                require_program_axes=True,
             )
             record_stage(
                 "typecheck",
