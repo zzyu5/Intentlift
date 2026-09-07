@@ -615,6 +615,12 @@ Source-to-J authoring 输出没有遵守已经统一的闭合 grammar，不是 p
 正确拒绝了这些不完整候选；在不放宽验收合同的前提下，还需要后续未耗尽 case 的最小真实
 Lift 来验证 authoring 改善，再进入 BindSource 和 Gate 流程。
 
+`pi.program_bindings` 的 relation 形式现在在 schema、解析、normalization、Replay ABI
+投影和编译 obligation 中都带有同一 physical axis；但当前可读取的 28 个历史
+`artifact.json` 都没有非空的该字段。因此它尚缺真实 Kernel Gate 工件，不能作为 closure
+证据或计数依据。后续只能在真实 Source observation 产生该 relation 后走完整 Gate；不得
+人工构造 π artifact 来替代该证据。
+
 另一个确定性流程漏洞已经修复：共享 Gate2 输入物化器此前会对没有 Ragged op 的 dense J
 抛出“没有 descriptor producer”，导致合法 dense candidate 在 Gate2 前被错误阻塞。现在
 dense 图保持原始输入，只有检测到 `ragged`/`ragged_outer`/`ragged_member` 才进入严格的
