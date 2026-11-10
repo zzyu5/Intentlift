@@ -3,6 +3,7 @@ add_mlir_library(MLIRIntentConversionCUDA
   ConvertIntentPaddedRowReductionToGPU.cpp
   ConvertIntentElementwiseToGPU.cpp
   ConvertIntentGatherToGPU.cpp
+  ConvertIntentRaggedToGPU.cpp
   ConvertIntentLayoutToGPU.cpp
   ConvertIntentCompactToGPU.cpp
   ConvertIntentRngToGPU.cpp
@@ -47,4 +48,5 @@ add_mlir_library(MLIRIntentConversionCUDA
   MLIRVectorDialect
   MLIRMemRefDialect
   MLIRFuncDialect
+  MLIRLLVMDialect
 )

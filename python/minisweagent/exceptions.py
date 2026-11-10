@@ -10,6 +10,33 @@ class Submitted(InterruptAgentFlow):
     """Raised when the agent has completed its task."""
 
 
+class CandidateRejected(InterruptAgentFlow):
+    """Raised when one submitted candidate fails host admission checks.
+
+    A rejected candidate ends the current logical Lift immediately.  The
+    bounded CandidateCheck receipt is retained by the host for the next fresh
+    relift; it is not returned as a normal MCP observation for the same agent
+    to reinterpret or submit again.
+    """
+
+
+class LiftPreparationFailed(InterruptAgentFlow):
+    """End a Lift before candidate submission on a closed MCP lifecycle error.
+
+    This is distinct from ``CandidateRejected``: no candidate reached semantic
+    admission, so a partial buffer must not become a repairable draft.
+    """
+
+
+class ReplayOrchestrationExceeded(InterruptAgentFlow):
+    """End Replay when a bounded construction-repair lifecycle is exhausted.
+
+    This carries no semantic acceptance implication.  In particular, it cannot
+    turn a preflight rejection into an acceptable Replay source or a Gate1
+    result.
+    """
+
+
 class LimitsExceeded(InterruptAgentFlow):
     """Raised when the agent has exceeded its cost or step limit."""
 

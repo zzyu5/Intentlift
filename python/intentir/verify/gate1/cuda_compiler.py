@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -54,6 +55,12 @@ class CudaCompileCase:
     arch: str = "sm_80"
     compiler_options: tuple[str, ...] = ()
     include_dirs: tuple[str, ...] = ()
+    # A Dataset CUDA source may expose a physical ABI (for example a
+    # CUtensorMap slot) while Gate1 intentionally compares its logical J ABI.
+    # This optional view is used only for trusted module-file sources; Replay
+    # code is checked against ``parameters`` because it must realize the
+    # source-blind logical contract.
+    physical_parameters: tuple[FrontendParameter, ...] | None = None
 
     def __post_init__(self) -> None:
         parameters = tuple(
@@ -96,11 +103,22 @@ class CudaCompileCase:
         include_dirs = tuple(
             str(Path(item).expanduser().resolve()) for item in self.include_dirs
         )
+        physical_parameters = self.physical_parameters
+        if physical_parameters is not None:
+            physical_parameters = tuple(
+                item
+                if isinstance(item, FrontendParameter)
+                else FrontendParameter(**item)
+                for item in physical_parameters
+            )
+            if not physical_parameters:
+                raise ValueError("CUDA physical ABI view cannot be empty")
         object.__setattr__(self, "parameters", parameters)
         object.__setattr__(self, "schedule", schedule)
         object.__setattr__(self, "compiler_options", options)
         object.__setattr__(self, "include_dirs", include_dirs)
         object.__setattr__(self, "arch", arch)
+        object.__setattr__(self, "physical_parameters", physical_parameters)
 
     @property
     def interface(self) -> dict[str, Any]:
@@ -118,6 +136,11 @@ class CudaCompileCase:
             "arch": self.arch,
             "compiler_options": list(self.compiler_options),
             "include_dirs": list(self.include_dirs),
+            "physical_parameters": (
+                [item.to_json() for item in self.physical_parameters]
+                if self.physical_parameters is not None
+                else None
+            ),
         }
 
 
@@ -225,6 +248,258 @@ def find_nvcc() -> str | None:
     return next((str(item) for item in candidates if item.is_file()), None)
 
 
+_CUDA_DTYPE_ALIASES = (
+    ("unsigned long long", "u64"),
+    ("long long", "i64"),
+    ("unsigned int", "u32"),
+    ("unsigned short", "u16"),
+    ("unsigned char", "u8"),
+    ("__nv_bfloat16", "bf16"),
+    ("nv_bfloat16", "bf16"),
+    ("bfloat16_t", "bf16"),
+    ("__half", "f16"),
+    ("half_t", "f16"),
+    ("double", "f64"),
+    ("float", "f32"),
+    ("uint64_t", "u64"),
+    ("int64_t", "i64"),
+    ("uint32_t", "u32"),
+    ("int32_t", "i32"),
+    ("uint16_t", "u16"),
+    ("int16_t", "i16"),
+    ("uint8_t", "u8"),
+    ("int8_t", "i8"),
+    ("bool", "i1"),
+    ("int", "i32"),
+    ("short", "i16"),
+    ("char", "i8"),
+)
+
+
+def _without_cuda_comments_and_literals(code: str) -> str:
+    """Blank comments/literals while retaining delimiters and newlines."""
+
+    result = list(code)
+    index = 0
+    state = "normal"
+    while index < len(code):
+        character = code[index]
+        following = code[index + 1] if index + 1 < len(code) else ""
+        if state == "normal":
+            if character == "/" and following == "/":
+                result[index] = result[index + 1] = " "
+                index += 2
+                state = "line_comment"
+                continue
+            if character == "/" and following == "*":
+                result[index] = result[index + 1] = " "
+                index += 2
+                state = "block_comment"
+                continue
+            if character in {"\"", "'"}:
+                result[index] = " "
+                state = character
+            index += 1
+            continue
+        if state == "line_comment":
+            if character == "\n":
+                state = "normal"
+            elif character != "\r":
+                result[index] = " "
+            index += 1
+            continue
+        if state == "block_comment":
+            if character == "*" and following == "/":
+                result[index] = result[index + 1] = " "
+                index += 2
+                state = "normal"
+                continue
+            if character not in {"\n", "\r"}:
+                result[index] = " "
+            index += 1
+            continue
+        # String/character literal.  Keep line structure but hide all content.
+        if character == "\\":
+            result[index] = " "
+            if index + 1 < len(code) and code[index + 1] not in {"\n", "\r"}:
+                result[index + 1] = " "
+                index += 2
+            else:
+                index += 1
+            continue
+        if character == state:
+            result[index] = " "
+            state = "normal"
+        elif character not in {"\n", "\r"}:
+            result[index] = " "
+        index += 1
+    return "".join(result)
+
+
+def _matching_cuda_parenthesis(code: str, opening: int) -> int:
+    depth = 0
+    for index in range(opening, len(code)):
+        character = code[index]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ValueError("CUDA kernel declaration has unbalanced parentheses")
+
+
+def _split_cuda_parameters(parameters: str) -> tuple[str, ...]:
+    result: list[str] = []
+    start = 0
+    depth = 0
+    for index, character in enumerate(parameters):
+        if character in "(<[{":
+            depth += 1
+        elif character in ")]>}":
+            depth -= 1
+        elif character == "," and depth == 0:
+            result.append(parameters[start:index].strip())
+            start = index + 1
+    tail = parameters[start:].strip()
+    if tail:
+        result.append(tail)
+    if not result or any(not item for item in result):
+        return ()
+    return tuple(result)
+
+
+def _cuda_kernel_parameter_declarations(code: str, function: str) -> tuple[str, ...]:
+    inspected = _without_cuda_comments_and_literals(code)
+    match = re.search(
+        rf"\b__global__\b[^;{{}}]*?\b{re.escape(function)}\s*\(",
+        inspected,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        raise ValueError(
+            f"CUDA source has no __global__ declaration for {function!r}"
+        )
+    opening = inspected.find("(", match.start())
+    closing = _matching_cuda_parenthesis(inspected, opening)
+    return _split_cuda_parameters(code[opening + 1 : closing])
+
+
+def _cuda_parameter_name(declaration: str) -> str:
+    declaration = re.sub(r"__attribute__\s*\(.*?\)", " ", declaration)
+    match = re.search(
+        r"([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\])?\s*$",
+        declaration.strip(),
+    )
+    if match is None:
+        raise ValueError(f"cannot parse CUDA parameter declaration {declaration!r}")
+    return match.group(1)
+
+
+def _cuda_parameter_dtype(declaration: str, name: str) -> str:
+    type_spelling = declaration[: declaration.rfind(name)].strip()
+    if "CUtensorMap" in type_spelling:
+        return "tensor_map"
+    for spelling, dtype in _CUDA_DTYPE_ALIASES:
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(spelling)}(?![A-Za-z0-9_])", type_spelling):
+            return dtype
+    normalized = re.sub(
+        r"\b(?:const|volatile|restrict|__restrict__|static|register)\b",
+        " ",
+        type_spelling,
+    )
+    normalized = re.sub(r"[*&]", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _observe_cuda_interface(code: str, function: str) -> dict[str, Any]:
+    """Observe the physical CUDA declaration emitted by this source.
+
+    CUDA C++ declarations do not carry J rank, symbolic shape, or effect mode.
+    Those facts remain in the Harness/J interface.  This observer therefore
+    records only declaration-order physical ABI facts and pointer pointee
+    constness, rather than copying semantic metadata into the compiler result.
+    """
+
+    parameters: list[dict[str, Any]] = []
+    for position, declaration in enumerate(
+        _cuda_kernel_parameter_declarations(code, function)
+    ):
+        name = _cuda_parameter_name(declaration)
+        if "CUtensorMap" in declaration:
+            kind = "opaque"
+        elif "*" in declaration:
+            kind = "pointer"
+        elif "&" in declaration:
+            raise ValueError(
+                f"CUDA parameter {name!r} uses a reference outside the native ABI"
+            )
+        else:
+            kind = "scalar"
+        row: dict[str, Any] = {
+            "position": position,
+            "name": name,
+            "kind": kind,
+            "dtype": _cuda_parameter_dtype(declaration, name),
+            "declaration": " ".join(declaration.split()),
+        }
+        if kind == "pointer":
+            star = declaration.find("*")
+            row["pointee_const"] = bool(
+                re.search(r"\bconst\b", declaration[:star])
+            )
+        parameters.append(row)
+    return {"parameters": parameters}
+
+
+def _cuda_dtype_key(value: str) -> str:
+    normalized = str(value).strip().lower().removeprefix("torch.")
+    aliases = dict(_CUDA_DTYPE_ALIASES)
+    return aliases.get(normalized, normalized)
+
+
+def _validate_cuda_interface(
+    observed: Mapping[str, Any],
+    expected: tuple[FrontendParameter, ...],
+) -> None:
+    raw_parameters = observed.get("parameters")
+    if not isinstance(raw_parameters, list):
+        raise ValueError("CUDA compiler did not report a physical parameter interface")
+    if len(raw_parameters) != len(expected):
+        raise ValueError("CUDA physical parameter count differs from the compile case")
+    expected_kind = {
+        "pointer": "pointer",
+        "scalar": "scalar",
+        "opaque": "opaque",
+    }
+    for index, (parameter, raw) in enumerate(zip(expected, raw_parameters, strict=True)):
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"CUDA physical parameter {index} is not an object")
+        if raw.get("kind") != expected_kind[parameter.kind]:
+            raise ValueError(
+                f"CUDA physical parameter {index} kind differs from the accepted source ABI"
+            )
+        if _cuda_dtype_key(str(raw.get("dtype"))) != _cuda_dtype_key(parameter.dtype):
+            raise ValueError(
+                f"CUDA physical parameter {index} dtype differs from the accepted source ABI"
+            )
+        if parameter.kind == "pointer" and not isinstance(
+            raw.get("pointee_const"), bool
+        ):
+            raise ValueError(
+                f"CUDA physical pointer parameter {index} lacks pointee constness"
+            )
+
+
+def _expected_cuda_parameters(
+    source: CudaKernelSource,
+    case: CudaCompileCase,
+) -> tuple[FrontendParameter, ...]:
+    if source.kind == "module_file" and case.physical_parameters is not None:
+        return case.physical_parameters
+    return case.parameters
+
+
 class CudaCompiler:
     """Compile a trusted Source or validated Replay to PTX without launching it."""
 
@@ -264,6 +539,25 @@ class CudaCompiler:
             return CudaCompileResult(
                 False,
                 diagnostic=f"source read failed: {type(exc).__name__}: {exc}",
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            )
+        interface: Mapping[str, Any] = {}
+        try:
+            interface = _observe_cuda_interface(code, source.function)
+            _validate_cuda_interface(
+                interface,
+                _expected_cuda_parameters(source, case),
+            )
+        except Exception as exc:
+            return CudaCompileResult(
+                False,
+                entry=source.function,
+                interface=interface,
+                diagnostic=(
+                    f"CUDA physical ABI observation failed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                cache_key=None,
                 elapsed_ms=(time.perf_counter() - started) * 1000.0,
             )
         key_payload = {
@@ -332,7 +626,7 @@ class CudaCompiler:
                 True,
                 ptx=ptx_path.read_text(encoding="utf-8"),
                 entry=source.function,
-                interface=case.interface,
+                interface=interface,
                 compiler={"name": "nvcc", "version": self._version()},
                 target={"arch": case.arch},
                 cache_key=cache_key,

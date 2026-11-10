@@ -53,6 +53,8 @@ _SAFE_NAME_CALLS = {
     *_ALLOWED_FROM_IMPORTS["cutlass"],
 }
 _FORBIDDEN_NODES = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
     ast.AsyncFor,
     ast.AsyncWith,
     ast.Await,
@@ -177,12 +179,20 @@ def _validate_function(
         _fail(node, f"function must be decorated only with @cute.{decorator}")
     if node.args.vararg is not None or node.args.kwarg is not None:
         _fail(node, "variadic CuTe replay functions are forbidden")
+    if getattr(node, "type_params", ()):
+        _fail(node, "generic CuTe replay functions are forbidden")
+    # Defaults execute while loading the module, before CuTe compiles its body.
+    for default in (*node.args.defaults, *node.args.kw_defaults):
+        if default is not None and not _literal_constant(default):
+            _fail(default, "CuTe replay defaults must be literals")
     for argument in [
         *node.args.posonlyargs,
         *node.args.args,
         *node.args.kwonlyargs,
     ]:
         _identifier(argument.arg, argument, "argument")
+        _validate_annotation(argument.annotation)
+    _validate_annotation(node.returns)
     for item in ast.walk(ast.Module(body=node.body, type_ignores=[])):
         if isinstance(item, _FORBIDDEN_NODES):
             _fail(item, f"{type(item).__name__} is forbidden in CuTe replay code")
@@ -201,6 +211,25 @@ def _validate_function(
                     _fail(target, f"unqualified call {target.id!r} is not public CuTe")
             elif not isinstance(target, ast.Attribute):
                 _fail(target, "dynamic CuTe replay call target is forbidden")
+
+
+def _validate_annotation(node: ast.AST | None) -> None:
+    """Permit public type names only, never executable annotation expressions."""
+
+    if node is None or (isinstance(node, ast.Constant) and node.value is None):
+        return
+    numeric = _ALLOWED_FROM_IMPORTS["cutlass"]
+    if isinstance(node, ast.Name) and node.id in numeric | {"bool", "int", "float"}:
+        return
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if (
+            node.value.id == "cutlass" and node.attr in numeric | {"Constexpr"}
+        ) or (
+            node.value.id == "cute"
+            and node.attr in {"Tensor", "Shape", "Stride", "Layout", "IntTuple"}
+        ):
+            return
+    _fail(node, "CuTe replay annotations must be approved public type names")
 
 
 def validate_cute_module(

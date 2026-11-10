@@ -100,12 +100,14 @@ def encode_triton_spec(spec: TritonExecutionSpec) -> dict[str, Any]:
                 "shape": list(item.shape) if item.shape is not None else None,
                 "value": item.value,
                 "output_key": item.output_key,
+                "strides": list(item.strides) if item.strides is not None else None,
             }
             for item in spec.arguments
         ],
         "grid": list(spec.grid),
         "schedule": dict(spec.schedule),
         "device": spec.device,
+        "metadata": dict(spec.metadata),
     }
 
 
@@ -124,12 +126,18 @@ def decode_triton_spec(value: Mapping[str, Any]) -> TritonExecutionSpec:
                 ),
                 value=item.get("value"),
                 output_key=item.get("output_key"),
+                strides=(
+                    tuple(int(value) for value in item["strides"])
+                    if item.get("strides") is not None
+                    else None
+                ),
             )
             for item in value["arguments"]
         ),
         grid=tuple(int(item) for item in value["grid"]),
         schedule=dict(value["schedule"]),
         device=str(value.get("device", "cuda")),
+        metadata=dict(value.get("metadata", {})),
     )
 
 

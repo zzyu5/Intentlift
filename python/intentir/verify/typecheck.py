@@ -7,9 +7,9 @@ run an SMT solver, or decide whether a generated Replay behaves correctly.
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+import math
 import re
 from typing import Any, Iterable, Mapping
 
@@ -19,17 +19,48 @@ from intentir.ir.canonical_j import (
     direct_unit_dimension_refs,
     j_elaboration,
 )
+from intentir.ir.canonical_construction import (
+    CanonicalHandleAllocator,
+    canonical_operation_records,
+    canonical_value_type_records,
+)
+from intentir.ir.intent_op_contract import (
+    map_binary_result_dtype,
+    map_unary_result_dtype,
+    CANONICAL_J_OPS,
+    RAGGED_ARITY,
+    _broadcast_projection,
+    canonicalize_dtype,
+    is_closed_boolean_dtype,
+    is_closed_dtype,
+    is_closed_floating_dtype,
+    is_closed_integer_dtype,
+    is_consumer_reduction_identity,
+    is_non_boolean_integer_dtype,
+    is_ragged_carrier_dtype,
+    IntentOpContractError,
+    operation_attr_contract,
+    operation_attr_enum,
+    RAGGED_OPS,
+    STRUCTURED_INTENT_OPS,
+    validate_const_literal,
+)
+from intentir.ir.model import intent_op_producers, walk_intent_op_scopes
 from intentir.ir.contract_ir import ContractIRProjectionError, project_contract_ir
 from intentir.ir.dim_expr import (
     DimExprError,
     DimensionConstraintSet,
-    parse_affine_dim_expr,
+    dimension_expression_references,
+    equivalent_dimension_expr,
+    parse_dimension_expr,
 )
 from intentir.ir.dimension_relation import (
     DimensionRelationError,
+    declared_dimension_handles,
     validate_dimension_relations,
 )
 from intentir.ir.functional_boundary import (
+    _numpy_broadcast_positions,
     complete_conditional_effect_outputs,
     functional_boundary_closure_issues,
     functional_consumer_extension_requirements,
@@ -50,42 +81,56 @@ from intentir.verify.gate1.model import (
     ResultRelationKind,
     ScheduleSlotKind,
     SemanticArchive,
+    implementation_value_matches,
 )
 from intentir.verify.gate1.pi import (
+    NORMALIZATION_CLASS_SCOPES,
     NORMALIZATION_WITNESS_SCHEMA,
+    PER_PROGRAM_SCALAR_KEEPDIMS_CLASS,
+    ProgramCoordinateProjectionError,
     RealizationWitness,
+    RealizationWitnessError,
+    canonical_program_coordinate_projection,
+    closed_consumer_identity_extensions,
+    per_program_scalar_keepdims_reductions,
+    zero_lower_bound_coordinates_from_j,
+    validate_normalization_bindings_against_j,
 )
 
 
 TYPECHECK_PROTOCOL = "intentir.scrc.typecheck.v32"
-GLOBAL_SAFE_REFINEMENTS = frozenset(
-    {"identity_materialization", "reduction_linearization"}
+_MAP_UNARY_FNS = operation_attr_enum("map_unary", "fn")
+_MAP_BINARY_FNS = operation_attr_enum("map_binary", "fn")
+_MAP_ATTRS = frozenset(operation_attr_contract("map_unary")["allowed"])
+_GATHER_MODES = operation_attr_enum("gather", "mode")
+_SCATTER_MODES = operation_attr_enum("scatter", "mode")
+_SCATTER_REDUCES = operation_attr_enum("scatter", "reduce")
+_SCATTER_ATOMIC_KINDS = operation_attr_enum("scatter", "atomic")
+_SCATTER_ORDERINGS = operation_attr_enum("scatter", "ordering")
+_SCATTER_MEMORY_SCOPES = operation_attr_enum("scatter", "memory_scope")
+_SCATTER_CAS_RETRIES = operation_attr_enum("scatter", "cas_retry")
+_REDUCE_CONTRACT = operation_attr_contract("reduce")
+_REDUCE_FNS = frozenset(
+    _REDUCE_CONTRACT["properties"]["fn"].get("enum", ())
 )
-
-_MAP_UNARY_FNS = frozenset(
-    {
-        "identity", "exp", "log", "log2", "neg", "abs", "sqrt", "rsqrt", "recip",
-        "tanh", "sigmoid", "cos", "sin", "tan", "exp2", "erf", "atan",
-        "logical_not", "isnan", "isinf", "isfinite",
-    }
-)
-_MAP_BINARY_FNS = frozenset(
-    {
-        "add", "sub", "mul", "div", "max", "min", "pow", "cmp", "atan2",
-        "gt", "ge", "lt", "le", "eq", "ne", "logical_and", "logical_or",
-        "logical_xor", "isclose",
-    }
-)
-_MAP_ATTRS = frozenset({"fn"})
-_REDUCE_FNS = frozenset({"sum", "mean", "max", "min", "prod", "any", "all"})
 _REDUCE_ASSOCIATIVITY = frozenset(
-    {"associative", "float_nondeterministic"}
+    _REDUCE_CONTRACT["properties"]["assoc"].get("enum", ())
 )
-_REDUCE_ATTRS = frozenset({"fn", "axes", "assoc", "keepdims"})
-_CONTRACTION_ATTRS = frozenset({"subscripts"})
-_TILE_ATTRS = frozenset({"reps"})
+_REDUCE_ATTRS = frozenset(_REDUCE_CONTRACT["allowed"])
+_PAD_CONTRACT = operation_attr_contract("pad")
+_PAD_ATTRS = frozenset(_PAD_CONTRACT["allowed"])
+_PAD_REQUIRED_ATTRS = frozenset(_PAD_CONTRACT["required"])
+_CONTRACTION_ATTRS = frozenset(
+    operation_attr_contract("contraction")["allowed"]
+)
+_TILE_ATTRS = frozenset(operation_attr_contract("tile")["allowed"])
+_SCAN_FNS = operation_attr_enum("scan", "fn")
+_ARG_REDUCE_FNS = operation_attr_enum("arg_reduce", "fn")
+_SORT_RETURN_MODES = operation_attr_enum("sort", "return")
+_POOL_FNS = operation_attr_enum("pool", "fn")
+_UPSAMPLE_MODES = operation_attr_enum("upsample", "mode")
 _EINSUM_TERM = re.compile(r"^[A-Za-z]*$")
-_INTEGER_DTYPE = re.compile(r"^(?P<signedness>[iu])(?P<bits>[1-9][0-9]*)$")
+_KNOWN_OPERATION_CONTRACTS = CANONICAL_J_OPS - STRUCTURED_INTENT_OPS
 
 
 class TypeCheckStatus(str, Enum):
@@ -134,6 +179,7 @@ class TypeCheckErrorCode(str, Enum):
     ITERATION_WITNESS_MISSING = "iteration_witness_missing"
     CONSUMER_EXTENSION_INVALID = "consumer_extension_invalid"
     CONSUMER_EXTENSION_MISSING = "consumer_extension_missing"
+    ACCESS_REPRESENTATION_INVALID = "access_representation_invalid"
     DIMENSION_CONSTRAINT_INVALID = "dimension_constraint_invalid"
     VALUE_DIMENSION_RELATION_INVALID = "value_dimension_relation_invalid"
     DIMENSION_RELATION_INVALID = "dimension_relation_invalid"
@@ -196,8 +242,9 @@ class TypeCheckReport:
 
 @dataclass(frozen=True)
 class _ValueType:
-    dtype: str
+    dtype: str | None
     rank: int
+    kind: str = "tensor"
 
 
 @dataclass(frozen=True)
@@ -217,30 +264,18 @@ def _operation_results(value: Any) -> tuple[str, ...]:
     return ()
 
 
-def _walk_operations(
-    operations: Iterable[Mapping[str, Any]], prefix: str = "body"
-) -> Iterable[tuple[str, Mapping[str, Any]]]:
-    for index, operation in enumerate(operations):
-        path = f"{prefix}[{index}]"
-        yield path, operation
-        body = operation.get("body")
-        if isinstance(body, list):
-            yield from _walk_operations(body, f"{path}.body")
-        if operation.get("op") in {"effect_if", "value_if"}:
-            for polarity in ("positive", "negative"):
-                arm = operation.get(polarity)
-                arm_body = arm.get("body") if isinstance(arm, Mapping) else None
-                if isinstance(arm_body, list):
-                    yield from _walk_operations(
-                        arm_body,
-                        f"{path}.{polarity}.body",
-                    )
-
-
 def _explicit_type(operation: Mapping[str, Any]) -> _ValueType | None:
     value = operation.get("type")
     if not isinstance(value, Mapping):
         return None
+    if value.get("kind") in {"record", "ragged"}:
+        try:
+            parsed = CanonicalValueType.from_json(
+                dict(value), context="IntentOp.type"
+            )
+        except (TypeError, ValueError):
+            return None
+        return _ValueType(parsed.dtype, len(parsed.shape), parsed.kind)
     dtype = value.get("dtype")
     shape = value.get("shape")
     if not isinstance(dtype, str) or not isinstance(shape, list):
@@ -249,36 +284,102 @@ def _explicit_type(operation: Mapping[str, Any]) -> _ValueType | None:
 
 
 def _surface_value_types(j: SemanticArchive) -> dict[str, CanonicalValueType]:
-    """Read only explicitly authored value types without elaborating J."""
+    """Read explicit value types through the shared operation record.
+
+    A malformed in-memory archive may not have a recordable operation table.
+    In that case only the already-declared tensor types remain available; the
+    checker must not reconstruct a second operation grammar from raw body
+    fields.
+    """
 
     result = {
         tensor.name: CanonicalValueType(tensor.dtype, tuple(tensor.shape))
         for tensor in [*j.intent.inputs, *j.intent.outputs]
     }
-    intent = j.intent.to_json()["intent_function"]
-    for _path, operation in _walk_operations(intent.get("body", [])):
-        names = _operation_results(operation.get("result"))
-        declared = operation.get("type")
-        if (
-            len(names) != 1
-            or not isinstance(declared, Mapping)
-            or not isinstance(declared.get("dtype"), str)
-            or not isinstance(declared.get("shape"), list)
-        ):
-            continue
-        result[names[0]] = CanonicalValueType(
-            declared["dtype"], tuple(declared["shape"])
-        )
+    intent = _surface_intent_function(j)
+    records = canonical_operation_records(intent)
+    if records is not None:
+        explicit_types = canonical_value_type_records(intent, records)
+        if explicit_types is None:
+            return result
+        for name, declared in explicit_types.items():
+            if declared.get("kind") in {"record", "ragged"}:
+                try:
+                    result[name] = CanonicalValueType.from_json(
+                        dict(declared), context=f"IntentOp {name}.type"
+                    )
+                except (TypeError, ValueError):
+                    continue
+            else:
+                dtype = declared.get("dtype")
+                shape = declared.get("shape")
+                if isinstance(dtype, str) and isinstance(shape, list):
+                    result[name] = CanonicalValueType(dtype, tuple(shape))
+        return result
     return result
 
 
-def _declared_dimensions(j: SemanticArchive) -> frozenset[str]:
-    return frozenset(
-        dimension
-        for tensor in [*j.intent.inputs, *j.intent.outputs]
-        for dimension in tensor.shape
-        if isinstance(dimension, str) and re.fullmatch(r"x[0-9]+", dimension)
+def _surface_intent_function(j: SemanticArchive) -> dict[str, Any]:
+    """Project typed J without invoking operation semantic serialization.
+
+    TypeCheck must be able to diagnose a malformed in-memory operation after a
+    caller mutates a typed archive.  ``IntentFunction.to_json`` intentionally
+    rejects such a mutation, so the diagnostic pass uses the raw structural
+    payload here and leaves the normal serialization boundary fail-closed.
+    """
+
+    fn = j.intent
+    return {
+        "name": fn.name,
+        "inputs": [item.to_json() for item in fn.inputs],
+        "outputs": [item.to_json() for item in fn.outputs],
+        "returns": [item.to_json() for item in fn.returns],
+        "body": [item._structural_payload() for item in fn.body],
+    }
+
+
+def _canonical_operation_items(
+    j: SemanticArchive,
+) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    """Return the one operation wire view used by valid TypeCheck paths.
+
+    A valid SemanticArchive always uses the shared construction record.  If a
+    caller mutates an archive so that the construction record is unavailable,
+    return no operation rows and let the surrounding fail-closed checks report
+    the malformed archive; do not build a second path/result/type grammar.
+    """
+
+    try:
+        records = j_elaboration(j).operation_records
+    except (IndexError, KeyError, TypeError, ValueError):
+        records = None
+    if records is not None:
+        return tuple(
+            (record["path"], record["wire"])
+            for record in records
+            if isinstance(record.get("wire"), Mapping)
+        )
+    return ()
+
+
+def _canonical_operation_body(j: SemanticArchive) -> tuple[Any, ...]:
+    """Return the canonical typed top-level body for scope-sensitive checks."""
+
+    try:
+        rows = j_elaboration(j).typed_operation_rows
+    except (IndexError, KeyError, TypeError, ValueError):
+        return ()
+    if rows is None:
+        return ()
+    return tuple(
+        operation
+        for path, operation in rows
+        if "." not in path and path.startswith("body[")
     )
+
+
+def _declared_dimensions(j: SemanticArchive) -> frozenset[str]:
+    return declared_dimension_handles(j)
 
 
 def _check_dimension_and_pad_contracts(
@@ -303,9 +404,9 @@ def _check_dimension_and_pad_contracts(
         )
         return
 
-    value_types = j_elaboration(j).value_type_by_name
-    intent = j.intent.to_json()["intent_function"]
-    for operation_path, operation in _walk_operations(intent.get("body", [])):
+    elaboration = j_elaboration(j)
+    value_types = elaboration.value_type_by_name
+    for operation_path, operation in _canonical_operation_items(j):
         if operation.get("op") != "pad":
             continue
         base = f"j.intent.intent_function.{operation_path}"
@@ -315,7 +416,10 @@ def _check_dimension_and_pad_contracts(
         attrs = attrs_value if isinstance(attrs_value, Mapping) else {}
         operands = operation.get("operands")
         result = operation.get("result")
-        if set(attrs) != {"lo", "hi", "value"}:
+        if (
+            not _PAD_REQUIRED_ATTRS.issubset(attrs)
+            or set(attrs) - _PAD_ATTRS
+        ):
             diagnostics.append(
                 TypeCheckDiagnostic(
                     TypeCheckErrorCode.PAD_SHAPE_INVALID,
@@ -386,22 +490,22 @@ def _check_dimension_and_pad_contracts(
         ):
             axis_path = f"{base}.attrs"
             try:
-                input_form = parse_affine_dim_expr(
+                input_form = parse_dimension_expr(
                     input_dim,
                     dimensions=dimensions,
                     context=f"{base}.operand_shape[{axis}]",
                 )
-                low_form = parse_affine_dim_expr(
+                low_form = parse_dimension_expr(
                     low,
                     dimensions=dimensions,
                     context=f"{base}.attrs.lo[{axis}]",
                 )
-                high_form = parse_affine_dim_expr(
+                high_form = parse_dimension_expr(
                     high,
                     dimensions=dimensions,
                     context=f"{base}.attrs.hi[{axis}]",
                 )
-                output_form = parse_affine_dim_expr(
+                output_form = parse_dimension_expr(
                     output_dim,
                     dimensions=dimensions,
                     context=f"{base}.result_shape[{axis}]",
@@ -420,19 +524,19 @@ def _check_dimension_and_pad_contracts(
             expected = input_form.plus(
                 low_form, context=f"{base}.shape[{axis}]"
             ).plus(high_form, context=f"{base}.shape[{axis}]")
-            if expected != output_form:
+            if not equivalent_dimension_expr(expected, output_form):
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.PAD_SHAPE_INVALID,
                         axis_path,
-                        "pad shape equation is not an affine identity: "
+                        "pad shape equation is not a closed identity: "
                         f"input + lo + hi normalizes to {expected.to_text()!r}, "
                         f"but result is {output_form.to_text()!r}",
                         ref,
                     )
                 )
             for field, form in (("lo", low_form), ("hi", high_form)):
-                if constraints.proves_nonnegative(form):
+                if constraints.proves_dimension_nonnegative(form):
                     continue
                 code = (
                     TypeCheckErrorCode.PAD_SHAPE_INVALID
@@ -482,6 +586,446 @@ def _check_dimension_relations(
         )
 
 
+def _known_contract_diagnostic(
+    diagnostics: list[TypeCheckDiagnostic],
+    path: str,
+    detail: str,
+    ref: str,
+) -> None:
+    diagnostics.append(
+        TypeCheckDiagnostic(
+            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+            path,
+            detail,
+            ref,
+        )
+    )
+
+
+def _known_tensor_type(
+    value_types: Mapping[str, CanonicalValueType],
+    name: Any,
+    *,
+    path: str,
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+) -> CanonicalValueType | None:
+    value_type = value_types.get(name) if isinstance(name, str) else None
+    if value_type is None:
+        _known_contract_diagnostic(
+            diagnostics,
+            path,
+            "operation operand/result requires a closed J value type",
+            ref,
+        )
+        return None
+    if not value_type.is_tensor:
+        _known_contract_diagnostic(
+            diagnostics,
+            path,
+            "operation requires a tensor value rather than a record or ragged descriptor",
+            ref,
+        )
+        return None
+    if not is_closed_dtype(value_type.dtype):
+        _known_contract_diagnostic(
+            diagnostics,
+            path,
+            f"operation value has a dtype outside the closed J grammar: {value_type.dtype!r}",
+            ref,
+        )
+        return None
+    return value_type
+
+
+def _known_result_names(value: Any) -> tuple[str, ...]:
+    return _operation_results(value)
+
+
+def _known_exact_attrs(
+    attrs: Mapping[str, Any],
+    *,
+    allowed: frozenset[str],
+    required: frozenset[str],
+    base: str,
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+    label: str,
+) -> bool:
+    # ``allowed``/``required`` remain in the call shape for the existing
+    # operation branches, but they are no longer an authority.  Every ordinary
+    # operation attr set is read from the same discriminated schema contract
+    # used by MCP/schema_lookup and the provider-facing wire profile.  This
+    # prevents a schema change such as gather.mode or reduce.keepdims from
+    # requiring a second repository-wide hand-maintained field update.
+    del allowed, required
+    try:
+        contract = operation_attr_contract(label)
+    except (KeyError, TypeError, ValueError) as exc:
+        _known_contract_diagnostic(
+            diagnostics,
+            f"{base}.attrs",
+            f"{label} has no canonical schema attr contract: {exc}",
+            ref,
+        )
+        return False
+    schema_allowed = frozenset(contract["allowed"])
+    schema_required = frozenset(contract["required"])
+    valid = True
+    missing = sorted(schema_required - set(attrs))
+    unknown = sorted(set(attrs) - schema_allowed)
+    if missing:
+        _known_contract_diagnostic(
+            diagnostics,
+            f"{base}.attrs",
+            f"{label} is missing required attr(s): {', '.join(missing)}",
+            ref,
+        )
+        valid = False
+    if unknown:
+        for key in unknown:
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.attrs.{key}",
+                f"{label} contains unsupported attr {key!r}",
+                ref,
+            )
+        valid = False
+    return valid
+
+
+def _known_arity(
+    operation: Mapping[str, Any],
+    *,
+    operands: int | tuple[int, ...],
+    results: int | tuple[int, ...],
+    base: str,
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+    label: str,
+) -> tuple[list[str], tuple[str, ...], bool]:
+    raw_operands = operation.get("operands")
+    operand_refs = (
+        list(raw_operands)
+        if isinstance(raw_operands, list)
+        else []
+    )
+    raw_results = _known_result_names(operation.get("result"))
+    operand_ok = (
+        len(operand_refs) in operands
+        if isinstance(operands, tuple)
+        else len(operand_refs) == operands
+    ) and all(isinstance(item, str) and item for item in operand_refs)
+    result_ok = (
+        len(raw_results) in results
+        if isinstance(results, tuple)
+        else len(raw_results) == results
+    ) and len(raw_results) == len(set(raw_results))
+    if not operand_ok:
+        _known_contract_diagnostic(
+            diagnostics,
+            f"{base}.operands",
+            f"{label} has an invalid operand count or operand reference list",
+            ref,
+        )
+    if not result_ok:
+        _known_contract_diagnostic(
+            diagnostics,
+            f"{base}.result",
+            f"{label} has an invalid result count or result reference list",
+            ref,
+        )
+    return operand_refs, raw_results, operand_ok and result_ok
+
+
+def _known_axis(
+    value: Any,
+    *,
+    rank: int,
+    base: str,
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+    attribute: str = "axis",
+    allow_negative: bool = True,
+) -> int | None:
+    if type(value) is not int:
+        _known_contract_diagnostic(
+            diagnostics,
+            f"{base}.attrs.{attribute}",
+            f"{attribute} must be an integer axis",
+            ref,
+        )
+        return None
+    normalized = value + rank if allow_negative and value < 0 else value
+    if not 0 <= normalized < rank:
+        _known_contract_diagnostic(
+            diagnostics,
+            f"{base}.attrs.{attribute}",
+            f"{attribute} {value} is outside rank-{rank}",
+            ref,
+        )
+        return None
+    return normalized
+
+
+def _known_integer_sequence(
+    value: Any,
+    *,
+    base: str,
+    attribute: str,
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+    minimum: int | None = None,
+    nonempty: bool = False,
+) -> list[int] | None:
+    if not isinstance(value, list) or (nonempty and not value):
+        _known_contract_diagnostic(
+            diagnostics,
+            f"{base}.attrs.{attribute}",
+            f"{attribute} must be a {'non-empty ' if nonempty else ''}integer array",
+            ref,
+        )
+        return None
+    result: list[int] = []
+    for index, item in enumerate(value):
+        if type(item) is not int or (minimum is not None and item < minimum):
+            suffix = (
+                f" >= {minimum}"
+                if minimum is not None
+                else ""
+            )
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.attrs.{attribute}[{index}]",
+                f"{attribute} entries must be integers{suffix}",
+                ref,
+            )
+            continue
+        result.append(item)
+    return result if len(result) == len(value) else None
+
+
+def _known_shape_entries(
+    value: Any,
+    *,
+    base: str,
+    attribute: str,
+    dimensions: frozenset[str],
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+) -> list[int | str] | None:
+    if not isinstance(value, list):
+        _known_contract_diagnostic(
+            diagnostics,
+            f"{base}.attrs.{attribute}",
+            f"{attribute} must be an array of non-negative integers or symbolic dimensions",
+            ref,
+        )
+        return None
+    result: list[int | str] = []
+    for index, item in enumerate(value):
+        if type(item) is int and item >= 0:
+            result.append(item)
+            continue
+        if isinstance(item, str) and item:
+            try:
+                parse_dimension_expr(
+                    item,
+                    dimensions=dimensions,
+                    context=f"{base}.attrs.{attribute}[{index}]",
+                )
+            except DimExprError as exc:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.{attribute}[{index}]",
+                    str(exc),
+                    ref,
+                )
+            else:
+                result.append(item)
+            continue
+        else:
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.attrs.{attribute}[{index}]",
+                f"{attribute} entries must be non-negative integers or non-empty symbols",
+                ref,
+            )
+    return result if len(result) == len(value) else None
+
+
+def _known_dimension_entry(
+    value: Any,
+    *,
+    base: str,
+    attribute: str,
+    dimensions: frozenset[str],
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+) -> int | str | None:
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parse_dimension_expr(
+                value,
+                dimensions=dimensions,
+                context=f"{base}.attrs.{attribute}",
+            )
+        except DimExprError as exc:
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.attrs.{attribute}",
+                str(exc),
+                ref,
+            )
+            return None
+        return value
+    _known_contract_diagnostic(
+        diagnostics,
+        f"{base}.attrs.{attribute}",
+        f"{attribute} must be a non-negative integer or a closed dimension expression",
+        ref,
+    )
+    return None
+
+
+def _known_integer_attr(
+    value: Any,
+    *,
+    base: str,
+    attribute: str,
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+    minimum: int | None = None,
+) -> int | None:
+    if type(value) is int and (minimum is None or value >= minimum):
+        return value
+    suffix = f" >= {minimum}" if minimum is not None else ""
+    _known_contract_diagnostic(
+        diagnostics,
+        f"{base}.attrs.{attribute}",
+        f"{attribute} must be an integer{suffix}",
+        ref,
+    )
+    return None
+
+
+def _closed_integer_dtype_info(dtype: object) -> tuple[str, int] | None:
+    """Return signedness/width only for the closed logical J integer set."""
+
+    if not is_closed_integer_dtype(dtype):
+        return None
+    try:
+        canonical = canonicalize_dtype(dtype, context="integer dtype")
+    except ValueError:
+        return None
+    return canonical[0], int(canonical[1:])
+
+
+def _known_broadcast_contract(
+    j: SemanticArchive,
+    *,
+    operation_path: str,
+    operand_refs: list[str],
+    result_type: CanonicalValueType,
+    value_types: Mapping[str, CanonicalValueType],
+    base: str,
+    diagnostics: list[TypeCheckDiagnostic],
+    ref: str,
+) -> None:
+    """Validate select/map broadcast projections at their consuming node."""
+
+    path_node = next(
+        (
+            node_ref
+            for node_ref, path in j.node_ids.items()
+            if path == operation_path
+        ),
+        None,
+    )
+    node_refs = {operation_path, ref}
+    if path_node is not None:
+        node_refs.add(path_node)
+    explicit: dict[str, tuple[int, ...]] = {}
+    direct_unit_dimensions = direct_unit_dimension_refs(
+        j.dimension_constraints
+    )
+    for projection in j.boundary.broadcasts:
+        if projection.node_ref not in node_refs:
+            continue
+        operand = projection.operand
+        if operand not in operand_refs:
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.boundary.broadcasts",
+                f"broadcast projection names a non-consumed operand {operand!r}",
+                ref,
+            )
+            continue
+        if any(type(axis) is not int for axis in projection.axes):
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.boundary.broadcasts",
+                "broadcast axes must be integer positions in the result rank",
+                ref,
+            )
+            continue
+        axes = tuple(projection.axes)
+        previous = explicit.get(operand)
+        if previous is not None and previous != axes:
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.boundary.broadcasts",
+                f"conflicting broadcast projections for operand {operand!r}",
+                ref,
+            )
+            continue
+        explicit[operand] = axes
+
+    for operand in operand_refs:
+        operand_type = value_types.get(operand)
+        if operand_type is None or not operand_type.is_tensor:
+            continue
+        axes = explicit.get(operand)
+        if axes is None:
+            positions = _numpy_broadcast_positions(
+                operand_type.shape,
+                result_type.shape,
+                unit_dimensions=direct_unit_dimensions,
+            )
+        else:
+            try:
+                projected, inserted = _broadcast_projection(
+                    list(operand_type.shape),
+                    axes,
+                    list(result_type.shape),
+                    unit_dimensions=direct_unit_dimensions,
+                )
+            except (NotImplementedError, ValueError):
+                positions = None
+            else:
+                positions = (
+                    tuple(
+                        index
+                        for index in range(len(result_type.shape))
+                        if index not in set(inserted)
+                    )
+                    if projected is not None
+                    else None
+                )
+                if positions is not None and len(positions) != len(operand_type.shape):
+                    positions = None
+        if positions is None:
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.boundary.broadcasts",
+                f"operand {operand!r} cannot broadcast to the result shape "
+                f"{result_type.shape!r} under its authored axes",
+                ref,
+            )
+
+
 def _check_known_operation_contracts(
     j: SemanticArchive,
 ) -> tuple[TypeCheckDiagnostic, ...]:
@@ -501,15 +1045,21 @@ def _check_known_operation_contracts(
         # dependent-contract diagnostics; they are never completed here.
         value_types = _surface_value_types(j)
 
-    intent = j.intent.to_json()["intent_function"]
-    for operation_path, operation in _walk_operations(
-        intent.get("body", [])
-    ):
+    dimensions = _declared_dimensions(j)
+    for operation_path, operation in _canonical_operation_items(j):
         op_name = operation.get("op")
-        if op_name not in {
-            "const", "map_unary", "map_binary", "reduce", "contraction", "tile",
-            "scatter",
-        }:
+        if op_name not in CANONICAL_J_OPS:
+            base = f"j.intent.intent_function.{operation_path}"
+            ref_value = operation.get("id")
+            ref = ref_value if isinstance(ref_value, str) else operation_path
+            _known_contract_diagnostic(
+                diagnostics,
+                f"{base}.op",
+                f"operation opcode {op_name!r} is outside the closed IntentIR set",
+                ref,
+            )
+            continue
+        if op_name not in _KNOWN_OPERATION_CONTRACTS:
             continue
         base = f"j.intent.intent_function.{operation_path}"
         ref_value = operation.get("id")
@@ -517,53 +1067,440 @@ def _check_known_operation_contracts(
         attrs_value = operation.get("attrs")
         attrs = attrs_value if isinstance(attrs_value, Mapping) else {}
 
+        if op_name == "cast":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="cast",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"to_dtype"}),
+                required=frozenset({"to_dtype"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="cast",
+            )
+            target = attrs.get("to_dtype")
+            if not is_closed_dtype(target):
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.to_dtype",
+                    f"cast target dtype {target!r} is outside the closed J dtype set",
+                    ref,
+                )
+                attrs_ok = False
+            if (
+                arity_ok
+                and isinstance(operation.get("result"), str)
+                and attrs_ok
+            ):
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None:
+                    expected_dtype = canonicalize_dtype(
+                        target,
+                        context=f"{base}.attrs.to_dtype",
+                    )
+                    if source_type.shape != result_type.shape:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.shape",
+                            "cast preserves the operand shape",
+                            ref,
+                        )
+                    if result_type.dtype != expected_dtype:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "cast result dtype must equal attrs.to_dtype",
+                            ref,
+                        )
+            continue
+
+        if op_name == "select":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=3,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="select",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset(),
+                required=frozenset(),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="select",
+            )
+            if arity_ok and isinstance(operation.get("result"), str):
+                condition = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                positive = _known_tensor_type(
+                    value_types,
+                    operands[1],
+                    path=f"{base}.operands[1]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                negative = _known_tensor_type(
+                    value_types,
+                    operands[2],
+                    path=f"{base}.operands[2]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if (
+                    condition is not None
+                    and positive is not None
+                    and negative is not None
+                    and result_type is not None
+                ):
+                    if not is_closed_boolean_dtype(condition.dtype):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.operands[0].type.dtype",
+                            "select condition must have boolean/i1 dtype",
+                            ref,
+                        )
+                    if not (
+                        positive.dtype
+                        == negative.dtype
+                        == result_type.dtype
+                    ):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "select value operands and result must have one common dtype",
+                            ref,
+                        )
+                    if attrs_ok:
+                        _known_broadcast_contract(
+                            j,
+                            operation_path=operation_path,
+                            operand_refs=operands,
+                            result_type=result_type,
+                            value_types=value_types,
+                            base=base,
+                            diagnostics=diagnostics,
+                            ref=ref,
+                        )
+            continue
+
+        if op_name == "gather":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=2,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="gather",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"axis", "mode"}),
+                required=frozenset({"axis", "mode"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="gather",
+            )
+            mode = attrs.get("mode")
+            if mode not in _GATHER_MODES:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.mode",
+                    "gather mode must be 'along_axis' or 'take'",
+                    ref,
+                )
+                attrs_ok = False
+            if arity_ok and isinstance(operation.get("result"), str):
+                data_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                index_type = _known_tensor_type(
+                    value_types,
+                    operands[1],
+                    path=f"{base}.operands[1]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if data_type is not None and index_type is not None and result_type is not None:
+                    if not is_non_boolean_integer_dtype(index_type.dtype):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.operands[1].type.dtype",
+                            "gather index must have a closed non-boolean integer dtype",
+                            ref,
+                        )
+                    axis = _known_axis(
+                        attrs.get("axis"),
+                        rank=len(data_type.shape),
+                        base=base,
+                        diagnostics=diagnostics,
+                        ref=ref,
+                    )
+                    if attrs_ok and axis is not None:
+                        if mode == "along_axis":
+                            data_rank = len(data_type.shape)
+                            index_rank = len(index_type.shape)
+                            equal_rank = index_rank == data_rank
+                            compressed_rank = (
+                                index_rank == data_rank - 1 and index_rank > 0
+                            )
+                            if not (equal_rank or compressed_rank):
+                                _known_contract_diagnostic(
+                                    diagnostics,
+                                    f"{base}.operands[1].type.shape",
+                                    "along_axis gather index rank must equal "
+                                    "data rank or data rank minus one",
+                                    ref,
+                                )
+                            else:
+                                expected_index_shape = (
+                                    data_type.shape
+                                    if equal_rank
+                                    else (
+                                        data_type.shape[:axis]
+                                        + data_type.shape[axis + 1 :]
+                                    )
+                                )
+                                if index_type.shape != expected_index_shape:
+                                    _known_contract_diagnostic(
+                                        diagnostics,
+                                        f"{base}.operands[1].type.shape",
+                                        "along_axis gather index must match "
+                                        "data on every non-gather axis",
+                                        ref,
+                                    )
+                            expected_shape = index_type.shape
+                        else:
+                            expected_shape = (
+                                *data_type.shape[:axis],
+                                *index_type.shape,
+                                *data_type.shape[axis + 1 :],
+                            )
+                        if result_type.shape != expected_shape:
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.type.shape",
+                                f"gather result shape must be {expected_shape!r} for mode={mode!r}",
+                                ref,
+                            )
+                    if result_type.dtype != data_type.dtype:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "gather result dtype must equal data dtype",
+                            ref,
+                        )
+            continue
+
         if op_name == "scatter":
             operands = operation.get("operands")
             operand_refs = operands if isinstance(operands, list) else []
             result = operation.get("result")
+            attrs_value = operation.get("attrs")
+            attrs = attrs_value if isinstance(attrs_value, Mapping) else {}
+            atomic = attrs.get("atomic")
+            is_cas = atomic == "cas"
             valid_arity = (
-                len(operand_refs) == 3
+                len(operand_refs) == (4 if is_cas else 3)
                 and all(isinstance(item, str) and item for item in operand_refs)
-                and isinstance(result, str)
-                and bool(result)
+                and (
+                    isinstance(result, str)
+                    and bool(result)
+                    if not is_cas
+                    else isinstance(result, list)
+                    and len(result) == 2
+                    and all(isinstance(item, str) and item for item in result)
+                    and len(set(result)) == 2
+                )
             )
             if not valid_arity:
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
                         f"{base}.operands",
-                        "scatter requires base, index, source, and one result",
+                        (
+                            "atomic='cas' scatter requires data, index, compare, "
+                            "replacement, and [updated, observed] results"
+                            if is_cas
+                            else "scatter requires base, index, source, and one result"
+                        ),
                         ref,
                     )
                 )
                 continue
 
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset(),
+                required=frozenset(),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="scatter",
+            )
             axis = attrs.get("axis")
             if (
-                set(attrs) != {"axis", "mode", "reduce"}
+                not attrs_ok
                 or type(axis) is not int
-                or attrs.get("mode") != "along_axis"
-                or attrs.get("reduce") not in {"none", "add"}
+                or attrs.get("mode") not in _SCATTER_MODES
+                or attrs.get("reduce") not in _SCATTER_REDUCES
             ):
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
                         f"{base}.attrs",
-                        "scatter requires closed axis, mode='along_axis', and "
-                        "reduce='none' or 'add'",
+                        "scatter requires closed axis, mode='along_axis', reduce, "
+                        "and closed atomic ordering/scope/retry attrs",
+                        ref,
+                    )
+                )
+            if atomic is not None:
+                if atomic not in _SCATTER_ATOMIC_KINDS:
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.attrs.atomic",
+                            f"atomic must be one of {sorted(_SCATTER_ATOMIC_KINDS)}",
+                            ref,
+                        )
+                    )
+                if attrs.get("ordering") not in _SCATTER_ORDERINGS:
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.attrs.ordering",
+                            "atomic scatter requires a closed ordering",
+                            ref,
+                        )
+                    )
+                if attrs.get("memory_scope") not in _SCATTER_MEMORY_SCOPES:
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.attrs.memory_scope",
+                            "atomic scatter requires a closed memory_scope",
+                            ref,
+                        )
+                    )
+                if atomic == "add" and attrs.get("reduce") != "add":
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.attrs.atomic",
+                            "atomic='add' requires reduce='add'",
+                            ref,
+                        )
+                    )
+                if atomic == "add" and "cas_retry" in attrs:
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.attrs.cas_retry",
+                            "cas_retry is only valid for atomic='cas'",
+                            ref,
+                        )
+                    )
+                if atomic == "cas":
+                    if attrs.get("reduce") != "none":
+                        diagnostics.append(
+                            TypeCheckDiagnostic(
+                                TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                                f"{base}.attrs.atomic",
+                                "atomic='cas' requires reduce='none'",
+                                ref,
+                            )
+                        )
+                    if attrs.get("cas_retry", "single_attempt") not in _SCATTER_CAS_RETRIES:
+                        diagnostics.append(
+                            TypeCheckDiagnostic(
+                                TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                                f"{base}.attrs.cas_retry",
+                                "cas_retry must be single_attempt or until_success",
+                                ref,
+                            )
+                        )
+            elif (
+                "ordering" in attrs
+                or "memory_scope" in attrs
+                or "cas_retry" in attrs
+            ):
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                        f"{base}.attrs",
+                        "ordering and memory_scope require atomic",
                         ref,
                     )
                 )
 
-            assert isinstance(result, str)
             data_type = value_types.get(operand_refs[0])
             index_type = value_types.get(operand_refs[1])
-            source_type = value_types.get(operand_refs[2])
-            result_type = value_types.get(result)
-            if any(
-                item is None
-                for item in (data_type, index_type, source_type, result_type)
-            ):
+            compare_type = value_types.get(operand_refs[2]) if is_cas else None
+            source_index = 3 if is_cas else 2
+            source_type = value_types.get(operand_refs[source_index])
+            result_names = list(result) if isinstance(result, list) else [result]
+            result_type = value_types.get(result_names[0])
+            observed_type = (
+                value_types.get(result_names[1]) if is_cas else None
+            )
+            required_types = [
+                data_type,
+                index_type,
+                source_type,
+                result_type,
+            ]
+            if is_cas:
+                required_types.extend([compare_type, observed_type])
+            if any(item is None for item in required_types):
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
@@ -575,9 +1512,11 @@ def _check_known_operation_contracts(
                 continue
             assert data_type is not None
             assert index_type is not None
+            if is_cas:
+                assert compare_type is not None
             assert source_type is not None
             assert result_type is not None
-            if _INTEGER_DTYPE.fullmatch(index_type.dtype) is None:
+            if not is_non_boolean_integer_dtype(index_type.dtype):
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
@@ -588,6 +1527,7 @@ def _check_known_operation_contracts(
                 )
             if (
                 index_type.shape != source_type.shape
+                or (is_cas and index_type.shape != compare_type.shape)
                 or len(index_type.shape) != len(data_type.shape)
             ):
                 diagnostics.append(
@@ -603,17 +1543,29 @@ def _check_known_operation_contracts(
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
-                        f"{base}.operands[2]",
+                        f"{base}.operands[{source_index}]",
                         "scatter source dtype must equal the data dtype",
                         ref,
                     )
                 )
-            if result_type != data_type:
+            if is_cas and compare_type.dtype != data_type.dtype:
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                        f"{base}.operands[2]",
+                        "compare dtype must equal the data dtype",
+                        ref,
+                    )
+                )
+            if result_type != data_type or (
+                is_cas and observed_type is not None and observed_type != data_type
+            ):
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
                         f"{base}.type",
-                        "scatter result type must equal the data type",
+                        "scatter updated and observed result types must equal "
+                        "the data type",
                         ref,
                     )
                 )
@@ -628,58 +1580,919 @@ def _check_known_operation_contracts(
                 )
             continue
 
-        if op_name == "const":
-            value = attrs.get("value")
-            dtype_value = attrs.get("dtype")
-            operation_type = operation.get("type")
-            result_dtype = (
-                operation_type.get("dtype")
-                if isinstance(operation_type, Mapping)
-                else None
+        if op_name == "reshape":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="reshape",
             )
-            dtype = dtype_value if isinstance(dtype_value, str) else result_dtype
-            if isinstance(value, str) and (
-                value not in {"-inf", "inf", "nan"}
-                or not isinstance(dtype, str)
-                or not _floating_dtype(dtype)
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"shape"}),
+                required=frozenset({"shape"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="reshape",
+            )
+            shape = _known_shape_entries(
+                attrs.get("shape"),
+                base=base,
+                attribute="shape",
+                dimensions=dimensions,
+                diagnostics=diagnostics,
+                ref=ref,
+            )
+            if shape is not None and "?" in shape:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.shape",
+                    "reshape does not accept the dynamic '?' extent marker",
+                    ref,
+                )
+                shape = None
+            if (
+                arity_ok
+                and attrs_ok
+                and shape is not None
+                and isinstance(operation.get("result"), str)
             ):
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
-                        f"{base}.attrs.value",
-                        "const string values are closed floating literals only: "
-                        "'-inf', 'inf', or 'nan' with a floating dtype",
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None:
+                    if source_type.dtype != result_type.dtype:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "reshape preserves the operand dtype",
+                            ref,
+                        )
+                    if tuple(shape) != result_type.shape:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.shape",
+                            "reshape result shape must equal attrs.shape",
+                            ref,
+                        )
+                    if all(type(item) is int for item in source_type.shape) and all(
+                        type(item) is int for item in shape
+                    ):
+                        source_elements = math.prod(source_type.shape) if source_type.shape else 1
+                        result_elements = math.prod(shape) if shape else 1
+                        if source_elements != result_elements:
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.attrs.shape",
+                                "reshape must preserve the total element count",
+                                ref,
+                            )
+            continue
+
+        if op_name == "transpose":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="transpose",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"perm"}),
+                required=frozenset({"perm"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="transpose",
+            )
+            if arity_ok and isinstance(operation.get("result"), str):
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                perm = _known_integer_sequence(
+                    attrs.get("perm"),
+                    base=base,
+                    attribute="perm",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None and perm is not None and attrs_ok:
+                    rank = len(source_type.shape)
+                    if len(perm) != rank or sorted(perm) != list(range(rank)):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs.perm",
+                            "transpose perm must be a complete non-repeating input-axis permutation",
+                            ref,
+                        )
+                    else:
+                        expected_shape = tuple(source_type.shape[axis] for axis in perm)
+                        if result_type.shape != expected_shape:
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.type.shape",
+                                "transpose result shape must follow attrs.perm",
+                                ref,
+                            )
+                    if result_type.dtype != source_type.dtype:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "transpose preserves the operand dtype",
+                            ref,
+                        )
+            continue
+
+        if op_name == "concat":
+            raw_operands = operation.get("operands")
+            operands = list(raw_operands) if isinstance(raw_operands, list) else []
+            results = _known_result_names(operation.get("result"))
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"axis"}),
+                required=frozenset({"axis"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="concat",
+            )
+            if (
+                not operands
+                or any(not isinstance(item, str) or not item for item in operands)
+            ):
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.operands",
+                    "concat requires at least one tensor operand",
+                    ref,
+                )
+                operands = []
+            if len(results) != 1 or not isinstance(operation.get("result"), str):
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.result",
+                    "concat requires one string result",
+                    ref,
+                )
+                results = ()
+            if operands and results and attrs_ok:
+                operand_types = [
+                    _known_tensor_type(
+                        value_types,
+                        operand,
+                        path=f"{base}.operands[{index}]",
+                        diagnostics=diagnostics,
+                        ref=ref,
+                    )
+                    for index, operand in enumerate(operands)
+                ]
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if all(item is not None for item in operand_types) and result_type is not None:
+                    typed_operands = [item for item in operand_types if item is not None]
+                    rank = len(typed_operands[0].shape)
+                    axis = _known_axis(
+                        attrs.get("axis"),
+                        rank=rank,
+                        base=base,
+                        diagnostics=diagnostics,
+                        ref=ref,
+                    )
+                    if any(len(item.shape) != rank for item in typed_operands[1:]):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.operands",
+                            "concat operands must have one common rank",
+                            ref,
+                        )
+                    elif axis is not None:
+                        first = typed_operands[0]
+                        for dimension in range(rank):
+                            if dimension == axis:
+                                continue
+                            if any(
+                                item.shape[dimension] != first.shape[dimension]
+                                for item in typed_operands[1:]
+                            ):
+                                _known_contract_diagnostic(
+                                    diagnostics,
+                                    f"{base}.operands",
+                                    "concat operands must agree on every non-concat dimension",
+                                    ref,
+                                )
+                        if any(item.dtype != first.dtype for item in typed_operands) or result_type.dtype != first.dtype:
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.type.dtype",
+                                "concat operands and result must share one dtype",
+                                ref,
+                            )
+                        axis_extents = [item.shape[axis] for item in typed_operands]
+                        if all(type(item) is int for item in axis_extents):
+                            expected_shape = list(first.shape)
+                            expected_shape[axis] = sum(axis_extents)
+                            if result_type.shape != tuple(expected_shape):
+                                _known_contract_diagnostic(
+                                    diagnostics,
+                                    f"{base}.type.shape",
+                                    "concat result axis extent must equal the sum of input extents",
+                                    ref,
+                                )
+            continue
+
+        if op_name == "pad":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="pad",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"lo", "hi", "value"}),
+                required=frozenset({"lo", "hi", "value"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="pad",
+            )
+            lo = _known_shape_entries(
+                attrs.get("lo"),
+                base=base,
+                attribute="lo",
+                dimensions=dimensions,
+                diagnostics=diagnostics,
+                ref=ref,
+            )
+            hi = _known_shape_entries(
+                attrs.get("hi"),
+                base=base,
+                attribute="hi",
+                dimensions=dimensions,
+                diagnostics=diagnostics,
+                ref=ref,
+            )
+            for field, values in (("lo", lo), ("hi", hi)):
+                if values is None:
+                    continue
+                for index, item in enumerate(values):
+                    if type(item) is int and item >= 0:
+                        continue
+                    if not isinstance(item, str):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs.{field}[{index}]",
+                            f"pad {field} entry must be a non-negative integer "
+                            "or a closed dimension expression",
+                            ref,
+                        )
+                        continue
+                    try:
+                        parse_dimension_expr(
+                            item,
+                            dimensions=dimensions,
+                            context=f"{base}.attrs.{field}[{index}]",
+                        )
+                    except DimExprError as exc:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs.{field}[{index}]",
+                            str(exc),
+                            ref,
+                        )
+            value = attrs.get("value")
+            if not (
+                value is None
+                or type(value) in {bool, int, float}
+                or isinstance(value, str)
+            ):
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.value",
+                    "pad value must be a scalar literal",
+                    ref,
+                )
+            if arity_ok and attrs_ok and isinstance(operation.get("result"), str):
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None:
+                    if source_type.dtype != result_type.dtype:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "pad preserves the operand dtype",
+                            ref,
+                        )
+                    if (
+                        lo is not None
+                        and hi is not None
+                        and (len(lo) != len(source_type.shape) or len(hi) != len(source_type.shape))
+                    ):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs",
+                            "pad lo/hi lengths must equal the operand rank",
+                            ref,
+                        )
+            continue
+
+        if op_name == "flip":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="flip",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"axes"}),
+                required=frozenset({"axes"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="flip",
+            )
+            if arity_ok and isinstance(operation.get("result"), str):
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                axes = _known_integer_sequence(
+                    attrs.get("axes"),
+                    base=base,
+                    attribute="axes",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None and axes is not None and attrs_ok:
+                    normalized = [
+                        axis + len(source_type.shape) if axis < 0 else axis
+                        for axis in axes
+                    ]
+                    if len(set(normalized)) != len(normalized) or any(
+                        axis < 0 or axis >= len(source_type.shape) for axis in normalized
+                    ):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs.axes",
+                            "flip axes must be unique and within the operand rank",
+                            ref,
+                        )
+                    if result_type.shape != source_type.shape or result_type.dtype != source_type.dtype:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type",
+                            "flip preserves the complete operand type",
+                            ref,
+                        )
+            continue
+
+        if op_name == "triu":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="triu",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"k"}),
+                required=frozenset({"k"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="triu",
+            )
+            if type(attrs.get("k")) is not int:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.k",
+                    "triu k must be an integer diagonal offset",
+                    ref,
+                )
+            if arity_ok and attrs_ok and isinstance(operation.get("result"), str):
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None:
+                    if len(source_type.shape) != 2:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.operands[0].type.shape",
+                            "triu requires a rank-2 operand",
+                            ref,
+                        )
+                    if result_type.shape != source_type.shape or result_type.dtype != source_type.dtype:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type",
+                            "triu preserves the complete operand type",
+                            ref,
+                        )
+            continue
+
+        if op_name == "record":
+            operands = operation.get("operands")
+            result = operation.get("result")
+            fields = attrs.get("fields")
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"fields"}),
+                required=frozenset({"fields"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="record",
+            )
+            operands_ok = (
+                isinstance(operands, list)
+                and all(isinstance(item, str) and item for item in operands)
+            )
+            if not operands_ok:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.operands",
+                    "record operands must be a list of value references",
+                    ref,
+                )
+            result_ok = isinstance(result, str) and bool(result)
+            if not result_ok:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.result",
+                    "record requires exactly one result value reference",
+                    ref,
+                )
+            fields_ok = (
+                isinstance(fields, list)
+                and bool(fields)
+                and all(isinstance(name, str) and bool(name) for name in fields)
+                and len(fields) == len(set(fields))
+            )
+            if not fields_ok:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.fields",
+                    "record fields must be a non-empty list of unique names",
+                    ref,
+                )
+            result_type = value_types.get(result) if result_ok else None
+            if result_type is None or not result_type.is_record:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.type",
+                    "record result must have a closed record value type",
+                    ref,
+                )
+            elif fields_ok:
+                declared_fields = tuple(name for name, _ in result_type.fields)
+                if tuple(fields) != declared_fields:
+                    _known_contract_diagnostic(
+                        diagnostics,
+                        f"{base}.attrs.fields",
+                        "record attrs.fields must exactly match record result "
+                        "field names and order",
                         ref,
                     )
+            if (
+                operands_ok
+                and fields_ok
+                and result_type is not None
+                and result_type.is_record
+                and len(operands) == len(result_type.fields)
+            ):
+                for index, ((field_name, field_type), operand) in enumerate(
+                    zip(result_type.fields, operands, strict=True)
+                ):
+                    operand_type = value_types.get(operand)
+                    if operand_type is None:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.operands[{index}]",
+                            "record field operand requires a closed J value type",
+                            ref,
+                        )
+                    elif operand_type != field_type:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.operands[{index}]",
+                            f"record field {field_name!r} operand type must "
+                            "exactly match its declared field type",
+                            ref,
+                        )
+            continue
+
+        if op_name == "record_get":
+            operands = operation.get("operands")
+            result = operation.get("result")
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"field"}),
+                required=frozenset({"field"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="record_get",
+            )
+            operands_ok = (
+                isinstance(operands, list)
+                and len(operands) == 1
+                and isinstance(operands[0], str)
+                and bool(operands[0])
+            )
+            if not operands_ok:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.operands",
+                    "record_get requires exactly one record operand reference",
+                    ref,
+                )
+            result_ok = isinstance(result, str) and bool(result)
+            if not result_ok:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.result",
+                    "record_get requires exactly one result value reference",
+                    ref,
+                )
+            field = attrs.get("field")
+            field_ok = isinstance(field, str) and bool(field)
+            if not field_ok:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.field",
+                    "record_get field must be a non-empty string",
+                    ref,
+                )
+            record_type = value_types.get(operands[0]) if operands_ok else None
+            if record_type is None or not record_type.is_record:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.operands[0]",
+                    "record_get operand must have a closed record value type",
+                    ref,
+                )
+            field_type = None
+            if record_type is not None and record_type.is_record and field_ok:
+                try:
+                    field_type = record_type.field(field)
+                except KeyError:
+                    _known_contract_diagnostic(
+                        diagnostics,
+                        f"{base}.attrs.field",
+                        f"record_get field {field!r} is not present in the "
+                        "record operand type",
+                        ref,
+                    )
+            result_type = value_types.get(result) if result_ok else None
+            if result_type is None:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.type",
+                    "record_get result requires a closed J value type",
+                    ref,
+                )
+            elif field_type is not None and result_type != field_type:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.type",
+                    "record_get result type must exactly match the selected "
+                    "record field type",
+                    ref,
                 )
             continue
 
-        if op_name in {"map_unary", "map_binary"}:
-            expected_fns = (
-                _MAP_UNARY_FNS if op_name == "map_unary" else _MAP_BINARY_FNS
-            )
-            for key in sorted(set(attrs) - _MAP_ATTRS):
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
-                        f"{base}.attrs.{key}",
-                        f"{op_name} attrs contain unsupported key {key!r}",
-                        ref,
-                    )
-                )
-            fn = attrs.get("fn")
+        if op_name in RAGGED_OPS:
+            operands = operation.get("operands")
+            result = operation.get("result")
             if (
-                set(attrs) != _MAP_ATTRS
-                or not isinstance(fn, str)
-                or fn not in expected_fns
+                not isinstance(operands, list)
+                or len(operands) != RAGGED_ARITY[op_name]
+                or not isinstance(result, str)
+                or not isinstance(operation.get("type"), Mapping)
+                or set(attrs)
             ):
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
-                        f"{base}.attrs.fn",
-                        f"{op_name} requires exactly one closed fn; got {fn!r}",
+                        f"{base}",
+                        f"{op_name} requires explicit closed operand/result types "
+                        "and no attrs",
                         ref,
                     )
+                )
+                continue
+            if op_name == "ragged":
+                offsets = value_types.get(operands[0])
+                indices = value_types.get(operands[1])
+                result_type = value_types.get(result)
+                if (
+                    result_type is None
+                    or not result_type.is_ragged
+                    or offsets is None
+                    or indices is None
+                    or not offsets.is_tensor
+                    or not indices.is_tensor
+                    or len(offsets.shape) != 1
+                    or len(indices.shape) != 1
+                    or not is_ragged_carrier_dtype(offsets.dtype)
+                    or not is_ragged_carrier_dtype(indices.dtype)
+                    or result_type.field("offsets") != offsets
+                    or result_type.field("indices") != indices
+                ):
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.type",
+                            "ragged result fields must exactly match offsets and indices operands",
+                            ref,
+                        )
+                    )
+                continue
+            descriptor = value_types.get(operands[0])
+            if descriptor is None or not descriptor.is_ragged:
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                        f"{base}.operands[0]",
+                        f"{op_name} requires a ragged descriptor operand",
+                        ref,
+                    )
+                )
+                continue
+            result_type = value_types.get(result)
+            if result_type is None or not result_type.is_tensor:
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                        f"{base}.type",
+                        f"{op_name} requires a closed tensor result type",
+                        ref,
+                    )
+                )
+                continue
+            expected_rank = 0 if op_name == "ragged_outer" else 1
+            if len(result_type.shape) != expected_rank or not is_ragged_carrier_dtype(result_type.dtype):
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                        f"{base}.type",
+                        f"{op_name} result must be an integer rank-{expected_rank} tensor",
+                        ref,
+                    )
+                )
+            if op_name == "ragged_member" and result_type.shape != ("?",):
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                        f"{base}.type.shape",
+                        "ragged_member result must use the dynamic shape ['?']",
+                        ref,
+                    )
+                )
+            if op_name == "ragged_member":
+                index_type = value_types.get(operands[1])
+                if index_type is None or not index_type.is_tensor or len(index_type.shape) != 0 or not is_ragged_carrier_dtype(index_type.dtype):
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.operands[1]",
+                            "ragged_member outer index must be a rank-0 integer tensor",
+                            ref,
+                        )
+                    )
+                elif result_type.dtype != descriptor.field("indices").dtype:
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.type.dtype",
+                            "ragged_member result dtype must equal descriptor indices dtype",
+                            ref,
+                        )
+                    )
+            else:
+                expected_dtype = descriptor.field("offsets").dtype
+                if result_type.dtype != expected_dtype:
+                    diagnostics.append(
+                        TypeCheckDiagnostic(
+                            TypeCheckErrorCode.KNOWN_OP_CONTRACT_INVALID,
+                            f"{base}.type.dtype",
+                            f"{op_name} result dtype must equal offsets dtype",
+                            ref,
+                        )
+                    )
+            continue
+
+        if op_name == "const":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=0,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="const",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"value", "dtype", "shape"}),
+                required=frozenset({"value"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="const",
+            )
+            if arity_ok and attrs_ok:
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if result_type is not None:
+                    try:
+                        validate_const_literal(
+                            attrs,
+                            result_type=result_type.to_json(),
+                            context=base,
+                        )
+                    except IntentOpContractError as exc:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs",
+                            str(exc),
+                            ref,
+                        )
+            continue
+
+        if op_name in {"map_unary", "map_binary"}:
+            expected_fns = _MAP_UNARY_FNS if op_name == "map_unary" else _MAP_BINARY_FNS
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=_MAP_ATTRS,
+                required=_MAP_ATTRS,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label=op_name,
+            )
+            fn = attrs.get("fn")
+            if not isinstance(fn, str) or fn not in expected_fns:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.fn",
+                    f"{op_name} requires exactly one closed fn; got {fn!r}",
+                    ref,
+                )
+                attrs_ok = False
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1 if op_name == "map_unary" else 2,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label=op_name,
+            )
+            if not attrs_ok or not arity_ok:
+                continue
+
+            operand_types = [
+                _known_tensor_type(
+                    value_types,
+                    operand,
+                    path=f"{base}.operands[{index}]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                for index, operand in enumerate(operands)
+            ]
+            result_type = _known_tensor_type(
+                value_types,
+                results[0],
+                path=f"{base}.result",
+                diagnostics=diagnostics,
+                ref=ref,
+            )
+            if any(item is None for item in operand_types) or result_type is None:
+                continue
+            if op_name == "map_unary":
+                operand_type = operand_types[0]
+                assert operand_type is not None
+                expected_dtype = map_unary_result_dtype(fn, operand_type.dtype)
+                if operand_type.shape != result_type.shape:
+                    _known_contract_diagnostic(
+                        diagnostics,
+                        f"{base}.type.shape",
+                        "map_unary preserves the complete operand shape",
+                        ref,
+                    )
+            else:
+                lhs_type, rhs_type = operand_types
+                assert lhs_type is not None and rhs_type is not None
+                expected_dtype = map_binary_result_dtype(
+                    fn, lhs_type.dtype, rhs_type.dtype
+                )
+                _known_broadcast_contract(
+                    j,
+                    operation_path=operation_path,
+                    operand_refs=operands,
+                    result_type=result_type,
+                    value_types=value_types,
+                    base=base,
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+            if expected_dtype is None:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.type.dtype",
+                    f"{op_name} fn {fn!r} has no valid closed dtype contract",
+                    ref,
+                )
+            elif result_type.dtype != expected_dtype:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.type.dtype",
+                    f"{op_name} fn {fn!r} result dtype must be {expected_dtype!r}",
+                    ref,
                 )
             continue
 
@@ -793,12 +2606,12 @@ def _check_known_operation_contracts(
                 )
             ):
                 try:
-                    input_form = parse_affine_dim_expr(
+                    input_form = parse_dimension_expr(
                         input_dim,
                         dimensions=dimensions,
                         context=f"{base}.operand_shape[{axis}]",
                     )
-                    output_form = parse_affine_dim_expr(
+                    output_form = parse_dimension_expr(
                         output_dim,
                         dimensions=dimensions,
                         context=f"{base}.result_shape[{axis}]",
@@ -817,7 +2630,7 @@ def _check_known_operation_contracts(
                         )
                     )
                     continue
-                if expected == output_form:
+                if equivalent_dimension_expr(expected, output_form):
                     continue
                 difference = output_form.plus(
                     expected,
@@ -826,8 +2639,8 @@ def _check_known_operation_contracts(
                 )
                 proven_equal = (
                     constraints is not None
-                    and constraints.proves_nonnegative(difference)
-                    and constraints.proves_nonnegative(
+                    and constraints.proves_dimension_nonnegative(difference)
+                    and constraints.proves_dimension_nonnegative(
                         difference.scaled(
                             -1,
                             context=f"{base}.shape[{axis}]",
@@ -1033,6 +2846,873 @@ def _check_known_operation_contracts(
                             )
             continue
 
+        if op_name == "rand":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=0,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="rand",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"seed", "shape", "dtype"}),
+                required=frozenset({"seed", "shape"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="rand",
+            )
+            seed = _known_integer_attr(
+                attrs.get("seed"),
+                base=base,
+                attribute="seed",
+                diagnostics=diagnostics,
+                ref=ref,
+            )
+            shape = _known_shape_entries(
+                attrs.get("shape"),
+                base=base,
+                attribute="shape",
+                dimensions=dimensions,
+                diagnostics=diagnostics,
+                ref=ref,
+            )
+            dtype = attrs.get("dtype")
+            if dtype is not None and not is_closed_dtype(dtype):
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.dtype",
+                    "rand dtype must be in the closed J dtype set",
+                    ref,
+                )
+                dtype = None
+            if (
+                arity_ok
+                and attrs_ok
+                and seed is not None
+                and shape is not None
+                and isinstance(operation.get("result"), str)
+            ):
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if result_type is not None:
+                    if tuple(shape) != result_type.shape:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.shape",
+                            "rand result shape must equal attrs.shape",
+                            ref,
+                        )
+                    if dtype is not None and result_type.dtype != canonicalize_dtype(
+                        dtype, context=f"{base}.attrs.dtype"
+                    ):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "rand result dtype must equal attrs.dtype",
+                            ref,
+                        )
+            continue
+
+        if op_name == "iota":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=0,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="iota",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"n", "dtype"}),
+                required=frozenset({"n"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="iota",
+            )
+            n = _known_dimension_entry(
+                attrs.get("n"),
+                base=base,
+                attribute="n",
+                dimensions=dimensions,
+                diagnostics=diagnostics,
+                ref=ref,
+            )
+            # The wire attribute is optional.  If it is omitted, use the
+            # authored result type when available; this preserves an explicit
+            # Source/compiler index width such as ``index``/i64 and keeps
+            # TypeCheck aligned with emit_mlir and the structured reference
+            # evaluator.  A result-less malformed operation still receives the
+            # historical i32 fallback so the diagnostic remains structural.
+            result_type = None
+            if arity_ok and attrs_ok and n is not None:
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+            dtype = attrs.get(
+                "dtype",
+                result_type.dtype if result_type is not None else "i32",
+            )
+            dtype_ok = is_non_boolean_integer_dtype(dtype)
+            if not dtype_ok:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.dtype",
+                    "iota dtype must be a closed non-boolean integer dtype",
+                    ref,
+                )
+            if arity_ok and attrs_ok and n is not None and dtype_ok:
+                if result_type is not None:
+                    if len(result_type.shape) != 1 or result_type.shape[0] != n:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.shape",
+                            "iota result must be rank one with extent attrs.n",
+                            ref,
+                        )
+                    if result_type.dtype != canonicalize_dtype(
+                        dtype, context=f"{base}.attrs.dtype"
+                    ):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "iota result dtype must equal attrs.dtype",
+                            ref,
+                        )
+            continue
+
+        if op_name == "scan":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="scan",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"fn", "axis"}),
+                required=frozenset({"fn", "axis"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="scan",
+            )
+            fn = attrs.get("fn")
+            if fn not in _SCAN_FNS:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.fn",
+                    "scan fn must be one of ['max', 'min', 'sum']",
+                    ref,
+                )
+                attrs_ok = False
+            if arity_ok and attrs_ok:
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None:
+                    _known_axis(
+                        attrs.get("axis"),
+                        rank=len(source_type.shape),
+                        base=base,
+                        diagnostics=diagnostics,
+                        ref=ref,
+                    )
+                    if result_type != source_type:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type",
+                            "scan preserves the complete operand type",
+                            ref,
+                        )
+            continue
+
+        if op_name == "arg_reduce":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="arg_reduce",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"fn", "axis"}),
+                required=frozenset({"fn", "axis"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="arg_reduce",
+            )
+            if attrs.get("fn") not in _ARG_REDUCE_FNS:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.fn",
+                    "arg_reduce fn must be 'argmax' or 'argmin'",
+                    ref,
+                )
+                attrs_ok = False
+            if arity_ok and attrs_ok:
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None:
+                    axis = _known_axis(
+                        attrs.get("axis"),
+                        rank=len(source_type.shape),
+                        base=base,
+                        diagnostics=diagnostics,
+                        ref=ref,
+                    )
+                    if axis is not None:
+                        expected_shape = tuple(
+                            dim
+                            for index, dim in enumerate(source_type.shape)
+                            if index != axis
+                        )
+                        if result_type.shape != expected_shape:
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.type.shape",
+                                "arg_reduce result must remove attrs.axis",
+                                ref,
+                            )
+                    if result_type.dtype != "i32":
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.dtype",
+                            "arg_reduce result dtype must be i32",
+                            ref,
+                        )
+            continue
+
+        if op_name == "sort":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=(1, 2),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="sort",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"descending", "axis", "k", "return"}),
+                required=frozenset({"descending", "axis"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="sort",
+            )
+            if type(attrs.get("descending")) is not bool:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.descending",
+                    "sort descending must be boolean",
+                    ref,
+                )
+                attrs_ok = False
+            return_mode = attrs.get("return")
+            if return_mode is not None and return_mode not in _SORT_RETURN_MODES:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.return",
+                    "sort return, when present, must be 'indices'",
+                    ref,
+                )
+                attrs_ok = False
+            if arity_ok and attrs_ok:
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None:
+                    axis = _known_axis(
+                        attrs.get("axis"),
+                        rank=len(source_type.shape),
+                        base=base,
+                        diagnostics=diagnostics,
+                        ref=ref,
+                    )
+                    if axis is None or not source_type.shape or axis != len(source_type.shape) - 1:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs.axis",
+                            "sort axis must be the last operand axis",
+                            ref,
+                        )
+                    width = attrs.get("k")
+                    if width is not None and (
+                        type(width) is not int or width <= 0
+                    ):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs.k",
+                            "sort k must be a positive integer",
+                            ref,
+                        )
+                        width = None
+                    if (
+                        width is not None
+                        and source_type.shape
+                        and type(source_type.shape[-1]) is int
+                        and width > source_type.shape[-1]
+                    ):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.attrs.k",
+                            "sort k cannot exceed the last operand extent",
+                            ref,
+                        )
+                    expected_shape = list(source_type.shape)
+                    if width is not None:
+                        expected_shape[-1] = width
+                    raw_result = operation.get("result")
+                    if return_mode == "indices" and not (
+                        isinstance(raw_result, str) and len(results) == 1
+                    ):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.result",
+                            "sort return='indices' requires one string index result",
+                            ref,
+                        )
+                    elif return_mode is None and isinstance(raw_result, list) and len(results) != 2:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.result",
+                            "sort result list must contain values and indices",
+                            ref,
+                        )
+                    if return_mode is None and isinstance(raw_result, list) and len(results) == 2:
+                        value_result = _known_tensor_type(
+                            value_types,
+                            results[0],
+                            path=f"{base}.result[0]",
+                            diagnostics=diagnostics,
+                            ref=ref,
+                        )
+                        index_result = _known_tensor_type(
+                            value_types,
+                            results[1],
+                            path=f"{base}.result[1]",
+                            diagnostics=diagnostics,
+                            ref=ref,
+                        )
+                        if value_result is not None and (
+                            value_result.shape != tuple(expected_shape)
+                            or value_result.dtype != source_type.dtype
+                        ):
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.result[0].type",
+                                "sort values result must preserve the source dtype and sorted shape",
+                                ref,
+                            )
+                        if index_result is not None and (
+                            index_result.shape != tuple(expected_shape)
+                            or index_result.dtype != "i32"
+                        ):
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.result[1].type",
+                                "sort index result must have sorted shape and i32 dtype",
+                                ref,
+                            )
+                    elif isinstance(raw_result, str):
+                        result_type = _known_tensor_type(
+                            value_types,
+                            raw_result,
+                            path=f"{base}.result",
+                            diagnostics=diagnostics,
+                            ref=ref,
+                        )
+                        expected_dtype = "i32" if return_mode == "indices" else source_type.dtype
+                        if result_type is not None and (
+                            result_type.shape != tuple(expected_shape)
+                            or result_type.dtype != expected_dtype
+                        ):
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.type",
+                                "sort result has an incompatible shape or dtype",
+                                ref,
+                            )
+            continue
+
+        if op_name == "pool":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=(1, 2),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="pool",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"fn", "kH", "kW", "sH", "sW", "padH", "padW"}),
+                required=frozenset({"fn", "kH", "kW", "sH", "sW", "padH", "padW"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="pool",
+            )
+            fn = attrs.get("fn")
+            if fn not in _POOL_FNS:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.fn",
+                    "pool fn must be 'avg' or 'max'",
+                    ref,
+                )
+                attrs_ok = False
+            scalar_attrs = {
+                name: _known_integer_attr(
+                    attrs.get(name),
+                    base=base,
+                    attribute=name,
+                    diagnostics=diagnostics,
+                    ref=ref,
+                    minimum=0 if name.startswith("pad") else 1,
+                )
+                for name in ("kH", "kW", "sH", "sW", "padH", "padW")
+            }
+            if arity_ok and attrs_ok:
+                if fn == "avg" and len(results) != 1:
+                    _known_contract_diagnostic(
+                        diagnostics,
+                        f"{base}.result",
+                        "avg pool has one result; only max pool may return indices",
+                        ref,
+                    )
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None:
+                    if len(source_type.shape) != 4:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.operands[0].type.shape",
+                            "pool requires an NCHW rank-4 operand",
+                            ref,
+                        )
+                    result_type = _known_tensor_type(
+                        value_types,
+                        results[0],
+                        path=f"{base}.result[0]" if len(results) == 2 else f"{base}.result",
+                        diagnostics=diagnostics,
+                        ref=ref,
+                    )
+                    if result_type is not None and len(source_type.shape) == 4:
+                        if result_type.dtype != source_type.dtype or result_type.shape[:2] != source_type.shape[:2]:
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.result[0].type",
+                                "pool output must preserve N/C and operand dtype",
+                                ref,
+                            )
+                        if all(type(source_type.shape[index]) is int for index in (2, 3)) and all(
+                            value is not None for value in scalar_attrs.values()
+                        ):
+                            oh = (source_type.shape[2] + 2 * scalar_attrs["padH"] - scalar_attrs["kH"]) // scalar_attrs["sH"] + 1
+                            ow = (source_type.shape[3] + 2 * scalar_attrs["padW"] - scalar_attrs["kW"]) // scalar_attrs["sW"] + 1
+                            expected_shape = (source_type.shape[0], source_type.shape[1], oh, ow)
+                            if oh < 0 or ow < 0 or result_type.shape != expected_shape:
+                                _known_contract_diagnostic(
+                                    diagnostics,
+                                    f"{base}.type.shape",
+                                    "pool result shape does not match the NCHW window formula",
+                                    ref,
+                                )
+                    if len(results) == 2:
+                        if fn != "max":
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.result",
+                                "only max pool may produce an indices result",
+                                ref,
+                            )
+                        index_type = _known_tensor_type(
+                            value_types,
+                            results[1],
+                            path=f"{base}.result[1]",
+                            diagnostics=diagnostics,
+                            ref=ref,
+                        )
+                        if index_type is not None and result_type is not None and (
+                            index_type.shape != result_type.shape or index_type.dtype != "i64"
+                        ):
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.result[1].type",
+                                "pool indices must match output shape and use i64",
+                                ref,
+                            )
+            continue
+
+        if op_name == "upsample":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="upsample",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"mode", "scale"}),
+                required=frozenset({"mode", "scale"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="upsample",
+            )
+            if attrs.get("mode") not in _UPSAMPLE_MODES:
+                _known_contract_diagnostic(
+                    diagnostics,
+                    f"{base}.attrs.mode",
+                    "upsample mode must be 'nearest' or 'bicubic'",
+                    ref,
+                )
+                attrs_ok = False
+            scale = _known_integer_sequence(
+                attrs.get("scale"),
+                base=base,
+                attribute="scale",
+                diagnostics=diagnostics,
+                ref=ref,
+                minimum=1,
+                nonempty=True,
+            )
+            if arity_ok and attrs_ok and scale is not None:
+                source_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if source_type is not None and result_type is not None:
+                    if len(source_type.shape) != 4 or len(scale) != 2:
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.shape",
+                            "upsample requires rank-4 NCHW input and a two-element scale",
+                            ref,
+                        )
+                    else:
+                        expected_shape = list(source_type.shape)
+                        if type(expected_shape[2]) is int:
+                            expected_shape[2] *= scale[0]
+                        if type(expected_shape[3]) is int:
+                            expected_shape[3] *= scale[1]
+                        if result_type.shape != tuple(expected_shape) or result_type.dtype != source_type.dtype:
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.type",
+                                "upsample result must preserve dtype/N/C and scale H/W",
+                                ref,
+                            )
+            continue
+
+        if op_name == "conv":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=(2, 3),
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="conv",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset({"stride", "padding", "dilation", "groups"}),
+                required=frozenset({"stride", "padding", "dilation", "groups"}),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="conv",
+            )
+            groups = _known_integer_attr(
+                attrs.get("groups"),
+                base=base,
+                attribute="groups",
+                diagnostics=diagnostics,
+                ref=ref,
+                minimum=1,
+            )
+            if arity_ok and attrs_ok:
+                input_type = _known_tensor_type(
+                    value_types,
+                    operands[0],
+                    path=f"{base}.operands[0]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                weight_type = _known_tensor_type(
+                    value_types,
+                    operands[1],
+                    path=f"{base}.operands[1]",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                result_type = _known_tensor_type(
+                    value_types,
+                    results[0],
+                    path=f"{base}.result",
+                    diagnostics=diagnostics,
+                    ref=ref,
+                )
+                if input_type is not None and weight_type is not None and result_type is not None:
+                    spatial_rank = len(input_type.shape) - 2
+                    if spatial_rank not in {1, 2, 3} or len(weight_type.shape) != len(input_type.shape):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type.shape",
+                            "conv input and weight must be rank 3, 4, or 5 with matching ranks",
+                            ref,
+                        )
+                    else:
+                        sequences = {
+                            "stride": _known_integer_sequence(
+                                attrs.get("stride"), base=base, attribute="stride",
+                                diagnostics=diagnostics, ref=ref, minimum=1,
+                            ),
+                            "padding": _known_integer_sequence(
+                                attrs.get("padding"), base=base, attribute="padding",
+                                diagnostics=diagnostics, ref=ref, minimum=0,
+                            ),
+                            "dilation": _known_integer_sequence(
+                                attrs.get("dilation"), base=base, attribute="dilation",
+                                diagnostics=diagnostics, ref=ref, minimum=1,
+                            ),
+                        }
+                        if any(value is None or len(value) != spatial_rank for value in sequences.values()):
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.attrs",
+                                "conv stride, padding, and dilation lengths must equal the spatial rank",
+                                ref,
+                            )
+                        if groups is not None:
+                            cin, cout, weight_cin = input_type.shape[1], weight_type.shape[0], weight_type.shape[1]
+                            if all(type(value) is int for value in (cin, cout, weight_cin)):
+                                if cin % groups != 0 or cout % groups != 0 or weight_cin != cin // groups:
+                                    _known_contract_diagnostic(
+                                        diagnostics,
+                                        f"{base}.type.shape",
+                                        "conv channel dimensions are incompatible with groups",
+                                        ref,
+                                    )
+                        if len(operands) == 3:
+                            bias_type = _known_tensor_type(
+                                value_types,
+                                operands[2],
+                                path=f"{base}.operands[2]",
+                                diagnostics=diagnostics,
+                                ref=ref,
+                            )
+                            if bias_type is not None and (
+                                len(bias_type.shape) != 1
+                                or bias_type.shape[0] != weight_type.shape[0]
+                                or bias_type.dtype != input_type.dtype
+                            ):
+                                _known_contract_diagnostic(
+                                    diagnostics,
+                                    f"{base}.operands[2].type",
+                                    "conv bias must be a [Cout] tensor with the input dtype",
+                                    ref,
+                                )
+                        if (
+                            weight_type.dtype != input_type.dtype
+                            or result_type.dtype != input_type.dtype
+                            or result_type.shape[:2] != (input_type.shape[0], weight_type.shape[0])
+                        ):
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.type",
+                                "conv input, weight, bias, and result must use one dtype and result N/C must be [input N, weight Cout]",
+                                ref,
+                            )
+                        if all(
+                            type(input_type.shape[2 + index]) is int
+                            and type(weight_type.shape[2 + index]) is int
+                            and sequences[name] is not None
+                            for index in range(spatial_rank)
+                            for name in ("stride", "padding", "dilation")
+                        ):
+                            expected_spatial = tuple(
+                                (
+                                    input_type.shape[2 + index]
+                                    + 2 * sequences["padding"][index]
+                                    - sequences["dilation"][index]
+                                    * (weight_type.shape[2 + index] - 1)
+                                    - 1
+                                )
+                                // sequences["stride"][index]
+                                + 1
+                                for index in range(spatial_rank)
+                            )
+                            if any(value < 0 for value in expected_spatial) or result_type.shape[2:] != expected_spatial:
+                                _known_contract_diagnostic(
+                                    diagnostics,
+                                    f"{base}.type.shape",
+                                    "conv result spatial shape does not match the convolution formula",
+                                    ref,
+                                )
+            continue
+
+        if op_name == "nonzero":
+            operands, results, arity_ok = _known_arity(
+                operation,
+                operands=1,
+                results=1,
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="nonzero",
+            )
+            attrs_ok = _known_exact_attrs(
+                attrs,
+                allowed=frozenset(),
+                required=frozenset(),
+                base=base,
+                diagnostics=diagnostics,
+                ref=ref,
+                label="nonzero",
+            )
+            if arity_ok and attrs_ok:
+                source_type = _known_tensor_type(value_types, operands[0], path=f"{base}.operands[0]", diagnostics=diagnostics, ref=ref)
+                result_type = _known_tensor_type(value_types, results[0], path=f"{base}.result", diagnostics=diagnostics, ref=ref)
+                if source_type is not None and result_type is not None:
+                    if len(result_type.shape) != 2 or result_type.dtype != "i64" or result_type.shape[1] != len(source_type.shape):
+                        _known_contract_diagnostic(
+                            diagnostics,
+                            f"{base}.type",
+                            "nonzero result must be dynamic rank-2 [nnz, input_rank] i64",
+                            ref,
+                        )
+                    if all(type(dim) is int for dim in source_type.shape) and result_type.shape[0] != "?":
+                        expected_capacity = math.prod(source_type.shape) if source_type.shape else 1
+                        if result_type.shape[0] != expected_capacity:
+                            _known_contract_diagnostic(
+                                diagnostics,
+                                f"{base}.type.shape[0]",
+                                "nonzero dynamic leading extent must use '?'",
+                                ref,
+                            )
+            continue
+
+        if op_name == "masked_select":
+            operands, results, arity_ok = _known_arity(operation, operands=2, results=1, base=base, diagnostics=diagnostics, ref=ref, label="masked_select")
+            attrs_ok = _known_exact_attrs(attrs, allowed=frozenset(), required=frozenset(), base=base, diagnostics=diagnostics, ref=ref, label="masked_select")
+            if arity_ok and attrs_ok:
+                data_type = _known_tensor_type(value_types, operands[0], path=f"{base}.operands[0]", diagnostics=diagnostics, ref=ref)
+                mask_type = _known_tensor_type(value_types, operands[1], path=f"{base}.operands[1]", diagnostics=diagnostics, ref=ref)
+                result_type = _known_tensor_type(value_types, results[0], path=f"{base}.result", diagnostics=diagnostics, ref=ref)
+                if data_type is not None and mask_type is not None and result_type is not None:
+                    if mask_type.dtype != "i1" or mask_type.shape != data_type.shape:
+                        _known_contract_diagnostic(diagnostics, f"{base}.operands[1].type", "masked_select mask must be i1 with the data shape", ref)
+                    if result_type.shape != ("?",) or result_type.dtype != data_type.dtype:
+                        _known_contract_diagnostic(diagnostics, f"{base}.type", "masked_select result must be a dynamic rank-1 tensor with the data dtype", ref)
+            continue
+
+        if op_name == "masked_scatter":
+            operands, results, arity_ok = _known_arity(operation, operands=3, results=1, base=base, diagnostics=diagnostics, ref=ref, label="masked_scatter")
+            attrs_ok = _known_exact_attrs(attrs, allowed=frozenset(), required=frozenset(), base=base, diagnostics=diagnostics, ref=ref, label="masked_scatter")
+            if arity_ok and attrs_ok:
+                data_type = _known_tensor_type(value_types, operands[0], path=f"{base}.operands[0]", diagnostics=diagnostics, ref=ref)
+                mask_type = _known_tensor_type(value_types, operands[1], path=f"{base}.operands[1]", diagnostics=diagnostics, ref=ref)
+                source_type = _known_tensor_type(value_types, operands[2], path=f"{base}.operands[2]", diagnostics=diagnostics, ref=ref)
+                result_type = _known_tensor_type(value_types, results[0], path=f"{base}.result", diagnostics=diagnostics, ref=ref)
+                if data_type is not None and mask_type is not None and source_type is not None and result_type is not None:
+                    if mask_type.dtype != "i1" or mask_type.shape != data_type.shape:
+                        _known_contract_diagnostic(diagnostics, f"{base}.operands[1].type", "masked_scatter mask must be i1 with the data shape", ref)
+                    if len(source_type.shape) != 1 or source_type.dtype != data_type.dtype:
+                        _known_contract_diagnostic(diagnostics, f"{base}.operands[2].type", "masked_scatter source must be a rank-1 vector with the data dtype", ref)
+                    if result_type != data_type:
+                        _known_contract_diagnostic(diagnostics, f"{base}.type", "masked_scatter result must preserve the data type", ref)
+            continue
+
+        if op_name == "polar":
+            operands, results, arity_ok = _known_arity(operation, operands=2, results=2, base=base, diagnostics=diagnostics, ref=ref, label="polar")
+            attrs_ok = _known_exact_attrs(attrs, allowed=frozenset(), required=frozenset(), base=base, diagnostics=diagnostics, ref=ref, label="polar")
+            if arity_ok and attrs_ok:
+                absolute = _known_tensor_type(value_types, operands[0], path=f"{base}.operands[0]", diagnostics=diagnostics, ref=ref)
+                angle = _known_tensor_type(value_types, operands[1], path=f"{base}.operands[1]", diagnostics=diagnostics, ref=ref)
+                real = _known_tensor_type(value_types, results[0], path=f"{base}.result[0]", diagnostics=diagnostics, ref=ref)
+                imaginary = _known_tensor_type(value_types, results[1], path=f"{base}.result[1]", diagnostics=diagnostics, ref=ref)
+                if all(item is not None for item in (absolute, angle, real, imaginary)):
+                    assert absolute is not None and angle is not None and real is not None and imaginary is not None
+                    if not is_closed_floating_dtype(absolute.dtype) or angle != absolute or real != absolute or imaginary != absolute:
+                        _known_contract_diagnostic(diagnostics, f"{base}.type", "polar inputs and both results must share one closed floating tensor type", ref)
+            continue
+
+        if op_name != "reduce":
+            continue
+
         for key in sorted(set(attrs) - _REDUCE_ATTRS):
             detail = (
                 "reduce uses canonical attr 'fn'; alias 'kind' is forbidden "
@@ -1162,25 +3842,6 @@ def _check_known_operation_contracts(
     )
 
 
-def _c_value_matches(value_type: str, value: Any) -> bool:
-    normalized = value_type.casefold()
-    if normalized in {"bool", "i1"}:
-        return isinstance(value, bool)
-    if normalized in {"int", "integer"} or normalized.startswith(("i", "u")):
-        return isinstance(value, int) and not isinstance(value, bool)
-    if normalized in {"float", "number"} or normalized.startswith("f"):
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if normalized in {"str", "string", "layout", "enum"}:
-        # C may select one closed implementation token, but it must not become
-        # a source-code or free-text side channel.  Rich layout expressions
-        # need their own closed schema rather than being smuggled through a
-        # string-valued slot.
-        return isinstance(value, str) and re.fullmatch(
-            r"[A-Za-z][A-Za-z0-9_.:+/-]*", value
-        ) is not None
-    return False
-
-
 def _ordered_expression_refs(expression: Any) -> tuple[str, ...]:
     result: list[str] = []
 
@@ -1212,84 +3873,21 @@ def _check_boundary_value_dominance(
     from their position in an index expression.
     """
 
-    function = j.intent.to_json()["intent_function"]
-    operations = function.get("body", [])
-    inputs = {
-        item.get("name")
-        for item in function.get("inputs", [])
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
+    inputs = {item.name for item in j.intent.inputs}
+    canonical_body = _canonical_operation_body(j)
     all_values = set(inputs)
     visible_before: dict[str, frozenset[str]] = {}
-
-    def operation_results(operation: Mapping[str, Any]) -> tuple[str, ...]:
-        return _operation_results(operation.get("result"))
-
-    def visit_sequence(
-        body: Any,
-        visible: set[str],
-        prefix: str,
-    ) -> set[str]:
-        if not isinstance(body, list):
-            return set(visible)
-        current = set(visible)
-        for index, raw_operation in enumerate(body):
-            if not isinstance(raw_operation, Mapping):
-                continue
-            path = f"{prefix}[{index}]"
-            visible_before[path] = frozenset(current)
-            results = operation_results(raw_operation)
-            all_values.update(results)
-
-            nested = raw_operation.get("body")
-            if isinstance(nested, list):
-                nested_visible = set(current)
-                scans = raw_operation.get("scan")
-                if isinstance(scans, list):
-                    nested_visible.update(
-                        item.get("name")
-                        for item in scans
-                        if isinstance(item, Mapping)
-                        and isinstance(item.get("name"), str)
-                    )
-                carries = raw_operation.get("carry")
-                if isinstance(carries, list):
-                    nested_visible.update(
-                        item.get("body_argument")
-                        for item in carries
-                        if isinstance(item, Mapping)
-                        and isinstance(item.get("body_argument"), str)
-                    )
-                all_values.update(nested_visible - current)
-                visit_sequence(nested, nested_visible, f"{path}.body")
-            if raw_operation.get("op") in {"effect_if", "value_if"}:
-                predicate = raw_operation.get("predicate")
-                if isinstance(predicate, str):
-                    all_values.add(predicate)
-                for polarity in ("positive", "negative"):
-                    arm = raw_operation.get(polarity)
-                    arm_body = (
-                        arm.get("body") if isinstance(arm, Mapping) else None
-                    )
-                    if isinstance(arm_body, list):
-                        # Branch-local definitions are collected for reference
-                        # diagnostics but deliberately do not enter the parent
-                        # continuation's visible set.
-                        visit_sequence(
-                            arm_body,
-                            set(current),
-                            f"{path}.{polarity}.body",
-                        )
-                    if (
-                        raw_operation.get("op") == "value_if"
-                        and isinstance(arm, Mapping)
-                        and isinstance(arm.get("yield_value"), str)
-                    ):
-                        all_values.add(str(arm["yield_value"]))
-            current.update(results)
-        return current
-
-    visible_at_function_exit = visit_sequence(operations, inputs, "body")
+    for path, _operation, visible in walk_intent_op_scopes(
+        canonical_body,
+        visible=inputs,
+    ):
+        visible_before[path] = frozenset(visible)
+    for _path, operation in _canonical_operation_items(j):
+        all_values.update(_operation_results(operation.get("result")))
+        all_values.update(_operation_dependencies(operation))
+    visible_at_function_exit = set(
+        intent_op_producers(canonical_body, visible=inputs)
+    )
     elaboration = j_elaboration(j)
     visible_by_access: dict[str, tuple[frozenset[str], str]] = {}
     for index, access in enumerate(j.boundary.accesses):
@@ -1369,57 +3967,52 @@ def _check_access_guard_relations(
     if not j.boundary.access_guard_relations:
         return
 
-    from intentir.frontend.emit_mlir import _broadcast_projection
+    from intentir.ir.intent_op_contract import _broadcast_projection
 
-    function = j.intent.to_json()["intent_function"]
+    elaboration = j_elaboration(j)
+    operation_records = elaboration.operation_records
     by_path: dict[str, Mapping[str, Any]] = {}
     loop_stack_by_path: dict[str, tuple[tuple[str, Mapping[str, Any]], ...]] = {}
-    declared_values = {
-        item.get("name")
-        for item in function.get("inputs", [])
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    declared_values = {item.name for item in j.intent.inputs}
+    scope_by_id = elaboration.scope_by_id
+    loop_by_scope = {
+        record.get("wire", {}).get("scope_id"): record
+        for record in operation_records
+        if record.get("op") == "loop"
+        and isinstance(record.get("wire"), Mapping)
+        and isinstance(record["wire"].get("scope_id"), str)
     }
-
-    def visit(
-        operations: Any,
-        prefix: str,
-        loop_stack: tuple[tuple[str, Mapping[str, Any]], ...],
-    ) -> None:
-        if not isinstance(operations, list):
-            return
-        for index, operation in enumerate(operations):
-            if not isinstance(operation, Mapping):
-                continue
-            path = f"{prefix}[{index}]"
-            by_path[path] = operation
-            loop_stack_by_path[path] = loop_stack
-            declared_values.update(_operation_results(operation.get("result")))
-            if operation.get("op") != "loop":
-                visit(operation.get("body"), f"{path}.body", loop_stack)
-                continue
-            scans = operation.get("scan")
-            if isinstance(scans, list):
-                declared_values.update(
-                    item.get("name")
-                    for item in scans
-                    if isinstance(item, Mapping)
-                    and isinstance(item.get("name"), str)
-                )
-            carries = operation.get("carry")
-            if isinstance(carries, list):
-                declared_values.update(
-                    item.get("body_argument")
-                    for item in carries
-                    if isinstance(item, Mapping)
-                    and isinstance(item.get("body_argument"), str)
-                )
-            visit(
-                operation.get("body"),
-                f"{path}.body",
-                (*loop_stack, (path, operation)),
-            )
-
-    visit(function.get("body", []), "body", ())
+    for record in operation_records:
+        operation = record.get("wire")
+        if not isinstance(operation, Mapping):
+            continue
+        path = str(record["path"])
+        by_path[path] = operation
+        stack: list[tuple[str, Mapping[str, Any]]] = []
+        scope_id = record.get("region_scope_id")
+        while isinstance(scope_id, str):
+            scope = scope_by_id.get(scope_id)
+            if scope is None:
+                break
+            if scope.get("kind") == "loop_region":
+                loop_record = loop_by_scope.get(scope_id)
+                if isinstance(loop_record, Mapping) and isinstance(
+                    loop_record.get("wire"), Mapping
+                ):
+                    stack.append((str(loop_record["path"]), loop_record["wire"]))
+            scope_id = scope.get("parent_scope")
+        loop_stack_by_path[path] = tuple(reversed(stack))
+        declared_values.update(
+            result for result in record.get("results", ()) if isinstance(result, str)
+        )
+        for scan in operation.get("scan", ()):
+            if isinstance(scan, Mapping) and isinstance(scan.get("name"), str):
+                declared_values.add(str(scan["name"]))
+        for carry in operation.get("carry", ()):
+            if isinstance(carry, Mapping) and isinstance(
+                carry.get("body_argument"), str
+            ):
+                declared_values.add(str(carry["body_argument"]))
     nodes = dict(by_path)
     for node_ref, path in j.node_ids.items():
         operation = by_path.get(path)
@@ -1427,13 +4020,12 @@ def _check_access_guard_relations(
             nodes[node_ref] = operation
 
     accesses = {item.access_id: item for item in j.boundary.accesses}
-    elaboration = j_elaboration(j)
     value_types = elaboration.value_type_by_name
     input_names = {
         item.name for item in j.intent.inputs
     }
     output_names = {
-        item.name for item in j.intent.outputs
+        binding.output for binding in elaboration.output_bindings
     }
     output_values = {
         item.output: item.value for item in elaboration.output_bindings
@@ -1489,7 +4081,10 @@ def _check_access_guard_relations(
                 relation.value_ref,
             )
             continue
-        if guard_type.dtype.casefold() != "i1":
+        if (
+            not guard_type.is_tensor
+            or not is_closed_boolean_dtype(guard_type.dtype)
+        ):
             reject(
                 index,
                 "value_ref",
@@ -1567,6 +4162,92 @@ def _check_access_guard_relations(
             continue
 
         assert access.kind is AccessKind.STORE
+        # A physical tail-write guard has a second closed representation that
+        # deliberately does *not* manufacture an inout pre-state or a select
+        # merge.  It is valid only when the provider-authored store owner is
+        # itself the one complete, output-only logical result.  The neutral
+        # boundary predicate means the local i1 is a realization guard rather
+        # than a J logical-domain restriction.
+        target_parameters = parameters_by_logical.get(access.tensor, [])
+        parsed_access = elaboration.access_by_id.get(access.access_id)
+        parsed_predicate = (
+            parsed_access.predicate if parsed_access is not None else None
+        )
+        is_literal_true = (
+            access.predicate == "true"
+            and parsed_predicate is not None
+            and parsed_predicate.op == "bool"
+            and parsed_predicate.value is True
+            and not parsed_predicate.args
+        )
+        has_output_only_target = (
+            access.tensor in output_names
+            and access.tensor not in input_names
+            and len(target_parameters) == 1
+            and target_parameters[0].mode is ParameterMode.OUTPUT
+        )
+        if has_output_only_target:
+            if not is_literal_true:
+                reject(
+                    index,
+                    "access_ref",
+                    "an output-only realization-guarded store requires the "
+                    "exact literal logical predicate true",
+                    relation.access_ref,
+                )
+            operation = nodes.get(access.node_ref or "")
+            result = operation.get("result") if operation is not None else None
+            if operation is None or not isinstance(result, str):
+                reject(
+                    index,
+                    "access_ref",
+                    "an output-only realization-guarded store requires one "
+                    "explicit single-result Layer-A owner node",
+                    relation.access_ref,
+                )
+                continue
+            if relation.value_ref in operation.get("operands", ()):
+                reject(
+                    index,
+                    "value_ref",
+                    "the physical realization guard must not also be a logical "
+                    "operand of the output producer",
+                    relation.access_ref,
+                )
+            if output_values.get(access.tensor) != result:
+                reject(
+                    index,
+                    "access_ref",
+                    "the output-only realization-guarded store owner result must "
+                    "be the exact observable output binding",
+                    relation.access_ref,
+                )
+            result_type = value_types.get(result)
+            target_type = value_types.get(access.tensor)
+            if result_type is None or target_type is None or result_type != target_type:
+                reject(
+                    index,
+                    "access_ref",
+                    "the output-only realization-guarded store owner result type "
+                    "must equal the output tensor type exactly",
+                    relation.access_ref,
+                )
+            duplicate_guard_broadcasts = [
+                item
+                for item in j.boundary.broadcasts
+                if item.operand == relation.value_ref
+                and nodes.get(item.node_ref) is operation
+            ]
+            if duplicate_guard_broadcasts:
+                reject(
+                    index,
+                    "axes",
+                    "access_guard_relations is the unique physical-guard axes "
+                    "authority; boundary.broadcasts must not duplicate it",
+                    relation.access_ref,
+                )
+            continue
+
         access_path = (
             j.node_ids.get(access.node_ref, access.node_ref)
             if access.node_ref is not None
@@ -1577,7 +4258,7 @@ def _check_access_guard_relations(
             if access_path is not None
             else ()
         )
-        observable_value = output_values.get(access.tensor, access.tensor)
+        observable_value = output_values[access.tensor]
         matches: list[tuple[str, int, Mapping[str, Any]]] = []
         for loop_path, loop in loop_stack:
             raw_carries = loop.get("carry")
@@ -1589,7 +4270,6 @@ def _check_access_guard_relations(
                 ):
                     matches.append((loop_path, ordinal, carry))
 
-        target_parameters = parameters_by_logical.get(access.tensor, [])
         has_real_inout = (
             access.tensor in input_names
             and access.tensor in output_names
@@ -1674,7 +4354,7 @@ def _check_access_guard_relations(
                 and nodes.get(item.node_ref) is operation
             ]
             if (
-                output_values.get(access.tensor) != result
+                output_values[access.tensor] != result
                 or len(matching_mappings) > 1
             ):
                 reject(
@@ -1751,15 +4431,16 @@ def _axis_refs_v1(
     subject_ref: str,
     node_operations: Mapping[str, Mapping[str, Any]],
 ) -> frozenset[int | str]:
-    """Return the closed dependent axis domain for one C attachment."""
+    """Return the closed dependent axis domain for one target E_C attachment."""
 
     dimensions = {
-        dim
+        reference
         for tensor in [*j.intent.inputs, *j.intent.outputs]
         for dim in tensor.shape
-        if isinstance(dim, str) and re.fullmatch(r"x[0-9]+", dim)
+        for reference in dimension_expression_references(dim)
+        if re.fullmatch(r"x[0-9]+", reference)
     }
-    if subject_ref.startswith("n"):
+    if re.fullmatch(r"n[0-9]+", subject_ref) is not None:
         operation = node_operations.get(subject_ref)
         if operation is None:
             return frozenset()
@@ -1779,8 +4460,9 @@ def _axis_refs_v1(
         if operation.get("op") == "loop":
             trip = operation.get("trip")
             axis = trip.get("axis") if isinstance(trip, Mapping) else None
-            result: set[int | str] = {0}
+            result: set[int | str] = set()
             if isinstance(axis, str) and axis in dimensions:
+                result.add(0)
                 result.add(axis)
             return frozenset(result)
         if operation.get("op") == "contraction":
@@ -1808,13 +4490,17 @@ def _axis_refs_v1(
                 if value_type is None or len(term) != len(value_type.shape):
                     continue
                 for label, extent in zip(term, value_type.shape, strict=True):
-                    if label in contracted and isinstance(extent, str) and extent in dimensions:
-                        result.add(extent)
+                    if label in contracted:
+                        result.update(
+                            reference
+                            for reference in dimension_expression_references(extent)
+                            if reference in dimensions
+                        )
             return frozenset(result)
         return frozenset()
 
     elaboration = j_elaboration(j)
-    if subject_ref.startswith("t"):
+    if re.fullmatch(r"t[0-9]+", subject_ref) is not None:
         tensor = next(
             (
                 item
@@ -1829,13 +4515,14 @@ def _axis_refs_v1(
             [
                 *range(len(tensor.shape)),
                 *(
-                    dim
+                    reference
                     for dim in tensor.shape
-                    if isinstance(dim, str) and dim in dimensions
+                    for reference in dimension_expression_references(dim)
+                    if reference in dimensions
                 ),
             ]
         )
-    if subject_ref.startswith("d"):
+    if re.fullmatch(r"d[0-9]+", subject_ref) is not None:
         expression = elaboration.domain_by_id.get(subject_ref)
         if expression is None:
             return frozenset()
@@ -1844,7 +4531,7 @@ def _axis_refs_v1(
         return frozenset(
             [*range(len(logical_axes)), *(ref for ref in refs if ref in dimensions)]
         )
-    if subject_ref.startswith("a"):
+    if re.fullmatch(r"a[0-9]+", subject_ref) is not None:
         access = elaboration.access_by_id.get(subject_ref)
         if access is None:
             return frozenset()
@@ -1863,30 +4550,28 @@ def _axis_refs_v1(
             tensors.get(access_spec.tensor) if access_spec is not None else None
         )
         symbolic = {
-            dim
+            reference
             for index, dim in enumerate(tensor.shape if tensor is not None else [])
-            if index < len(access.index.components) and dim in dimensions
+            for reference in dimension_expression_references(dim)
+            if index < len(access.index.components) and reference in dimensions
         }
         return frozenset([*range(len(access.index.components)), *symbolic])
-    # Scope/storage attachments are intentionally axis-free in v1.
+    # Effect/scope/authorization/storage attachments are intentionally axis-free.
     return frozenset()
 
 
 _TOLERANCE_UNARY_FNS = frozenset(
     {
         "exp", "log", "log2", "sqrt", "rsqrt", "tanh", "sigmoid", "cos",
-        "sin", "tan", "exp2", "atan", "erf",
+        "sin", "tan", "exp2", "atan", "erf", "acos", "asin", "cbrt",
+        "ceil", "floor", "round", "roundeven", "trunc", "log10", "log1p",
+        "expm1", "erfc",
     }
 )
 
 
 def _floating_dtype(dtype: str | None) -> bool:
-    if dtype is None:
-        return False
-    normalized = dtype.casefold()
-    return normalized in {"float", "half", "bfloat"} or re.fullmatch(
-        r"(?:(?:b?float)|bf|f|fp)[0-9]+", normalized
-    ) is not None
+    return is_closed_floating_dtype(dtype)
 
 
 def _operation_dependencies(operation: Mapping[str, Any]) -> tuple[str, ...]:
@@ -1906,6 +4591,9 @@ def _operation_dependencies(operation: Mapping[str, Any]) -> tuple[str, ...]:
             if isinstance(arm, Mapping):
                 add(arm.get("yield_value"))
     if operation.get("op") == "loop":
+        trip = operation.get("trip")
+        if isinstance(trip, Mapping) and "upper_bound" in trip:
+            add(trip.get("upper_bound"))
         for item in operation.get("scan", []):
             if isinstance(item, Mapping):
                 add(item.get("from"))
@@ -1921,9 +4609,8 @@ def _operation_dependencies(operation: Mapping[str, Any]) -> tuple[str, ...]:
 def _output_dependency(
     j: SemanticArchive, output: str
 ) -> tuple[set[str], list[Mapping[str, Any]]]:
-    intent = j.intent.to_json()["intent_function"]
-    operations = dict(_walk_operations(intent.get("body", [])))
-    path_to_node = {path: node for node, path in j.node_ids.items()}
+    operations = dict(_canonical_operation_items(j))
+    path_to_node = j_elaboration(j).authored_node_by_path(j.node_ids)
     producers: dict[str, tuple[str, str, Mapping[str, Any]]] = {}
     for path, operation in operations.items():
         node_ref = path_to_node.get(path, path)
@@ -1966,9 +4653,8 @@ def _semantic_value_dependency_closure(
     does not inspect Source, C, pi, parameter names, or runtime values.
     """
 
-    intent = j.intent.to_json()["intent_function"]
     producers: dict[str, Mapping[str, Any]] = {}
-    for _path, operation in _walk_operations(intent.get("body", [])):
+    for _path, operation in _canonical_operation_items(j):
         for result in _operation_results(operation.get("result")):
             producers[result] = operation
 
@@ -1994,9 +4680,8 @@ def _rank_zero_semantic_live_values(j: SemanticArchive) -> set[str]:
     }
     node_seed_refs: set[str] = set()
 
-    intent = j.intent.to_json()["intent_function"]
-    operations = dict(_walk_operations(intent.get("body", [])))
-    path_to_node = {path: node for node, path in j.node_ids.items()}
+    operations = dict(_canonical_operation_items(j))
+    path_to_node = elaboration.authored_node_by_path(j.node_ids)
     nodes: dict[str, Mapping[str, Any]] = dict(operations)
     for path, operation in operations.items():
         node = path_to_node.get(path)
@@ -2041,12 +4726,16 @@ def _rank_zero_semantic_live_values(j: SemanticArchive) -> set[str]:
         node_seed_refs.add(item.node_ref)
     for item in j.boundary.updates:
         semantic_refs.update({item.base, item.indices, item.values})
+        if item.compare is not None:
+            semantic_refs.add(item.compare)
+        if item.observed is not None:
+            semantic_refs.add(item.observed)
         node_seed_refs.add(item.node_ref)
     for tensor in [*j.intent.inputs, *j.intent.outputs]:
         semantic_refs.update(
-            dimension
+            reference
             for dimension in tensor.shape
-            if isinstance(dimension, str)
+            for reference in dimension_expression_references(dimension)
         )
     for relation in j.value_dimension_relations:
         semantic_refs.add(relation.value_ref)
@@ -2098,8 +4787,7 @@ def _check_rank_zero_logical_input_liveness(
         return
     live = _rank_zero_semantic_live_values(j)
     representation_j_uses = set(live)
-    intent = j.intent.to_json()["intent_function"]
-    for _path, operation in _walk_operations(intent.get("body", [])):
+    for _path, operation in _canonical_operation_items(j):
         representation_j_uses.update(_operation_dependencies(operation))
     for index, parameter in enumerate(j.signature.parameters):
         logical_ref = parameter.logical_ref
@@ -2114,7 +4802,9 @@ def _check_rank_zero_logical_input_liveness(
                     f"j.signature.parameters[{index}].logical_ref",
                     "representation-only scalar without logical_ref cannot "
                     "participate in J output, boundary, or shape semantics; "
-                    "it may be referenced only by pi realization topology",
+                    "it may be consumed only by physical address/representation "
+                    "realization outside J, while pi records topology without "
+                    "inventing logical ownership",
                     parameter.name,
                 )
             )
@@ -2128,7 +4818,8 @@ def _check_rank_zero_logical_input_liveness(
                 "rank-0 logical input does not contribute to any J output "
                 "dependency or explicit boundary/shape semantic relation; "
                 "a representation-only ABI parameter must use "
-                "logical_ref=null and may be realized only through pi",
+                "logical_ref=null and may be realized only by physical address "
+                "or representation handling outside J (with pi carrying topology)",
                 logical_ref,
             )
         )
@@ -2138,7 +4829,10 @@ def _check_result_relations(
     j: SemanticArchive,
     diagnostics: list[TypeCheckDiagnostic],
 ) -> None:
-    output_types = {item.name: item.dtype for item in j.intent.outputs}
+    output_types = {
+        binding.output: binding.output_type.dtype
+        for binding in j_elaboration(j).output_bindings
+    }
     relations = {
         item.output: (index, item)
         for index, item in enumerate(j.boundary.result_relations)
@@ -2189,23 +4883,6 @@ def _check_result_relations(
         )
 
 
-def _has_cycle(nodes: set[str], edges: set[tuple[str, str]]) -> bool:
-    outgoing: dict[str, set[str]] = {node: set() for node in nodes}
-    indegree = {node: 0 for node in nodes}
-    for source, target in edges:
-        if target not in outgoing[source]:
-            outgoing[source].add(target)
-            indegree[target] += 1
-    ready = deque(node for node, degree in indegree.items() if degree == 0)
-    visited = 0
-    while ready:
-        source = ready.popleft()
-        visited += 1
-        for target in outgoing[source]:
-            indegree[target] -= 1
-            if indegree[target] == 0:
-                ready.append(target)
-    return visited != len(nodes)
 
 
 def _build_anchors(
@@ -2229,12 +4906,18 @@ def _build_anchors(
             return
         anchors[ref] = anchor
 
+    elaboration = j_elaboration(j)
     value_types: dict[str, _ValueType] = {
-        name: _ValueType(value.dtype, len(value.shape))
-        for name, value in j_elaboration(j).value_type_by_name.items()
+        name: _ValueType(value.dtype, len(value.shape), value.kind)
+        for name, value in elaboration.value_type_by_name.items()
     }
     for tensor in [*j.intent.inputs, *j.intent.outputs]:
-        value_type = _ValueType(tensor.dtype, len(tensor.shape))
+        value_type = value_types.get(tensor.name)
+        if value_type is None:
+            # A mutated in-memory archive may be unable to elaborate.  Keep
+            # the diagnostic anchor available, but valid accepted J always
+            # reaches this branch with the canonical value-type record.
+            value_type = _ValueType(tensor.dtype, len(tensor.shape))
         add(
             tensor.name,
             _Anchor("j", "tensor", value_type, carrier_class="value"),
@@ -2270,8 +4953,7 @@ def _build_anchors(
             f"j.signature.parameters[{parameter.name}]",
         )
 
-    intent = j.intent.to_json()["intent_function"]
-    operations = dict(_walk_operations(intent.get("body", [])))
+    operations = dict(_canonical_operation_items(j))
 
     node_operations: dict[str, Mapping[str, Any]] = {}
     for node_id, path in j.node_ids.items():
@@ -2320,21 +5002,33 @@ def _build_anchors(
             type_value = carry.get("type")
             if not isinstance(state_ref, str) or not isinstance(type_value, Mapping):
                 continue
-            dtype = type_value.get("dtype")
-            shape = type_value.get("shape")
-            if not isinstance(dtype, str) or not isinstance(shape, list):
-                continue
+            if type_value.get("kind") == "record":
+                try:
+                    parsed_type = CanonicalValueType.from_json(
+                        dict(type_value),
+                        context=f"j.node_ids.{node_ref}.carry[{ordinal}].type",
+                    )
+                except (TypeError, ValueError):
+                    continue
+                carry_type = _ValueType(
+                    parsed_type.dtype, len(parsed_type.shape), parsed_type.kind
+                )
+            else:
+                dtype = type_value.get("dtype")
+                shape = type_value.get("shape")
+                if not isinstance(dtype, str) or not isinstance(shape, list):
+                    continue
+                carry_type = _ValueType(dtype, len(shape))
             add(
                 state_ref,
                 _Anchor(
                     "j",
                     "loop_state",
-                    _ValueType(dtype, len(shape)),
+                    carry_type,
                     carrier_class="value",
                 ),
                 f"j.node_ids.{node_ref}.carry[{ordinal}]",
             )
-            carry_type = _ValueType(dtype, len(shape))
             for role_name in ("body_argument", "next_value", "result_value"):
                 role_ref = carry.get(role_name)
                 if not isinstance(role_ref, str) or role_ref in anchors:
@@ -2353,7 +5047,8 @@ def _build_anchors(
     for item in j.boundary.domains:
         add(item, _Anchor("j", "domain"), f"j.boundary.domains.{item}")
     tensor_types = {
-        item.name: _ValueType(item.dtype, len(item.shape))
+        item.name: value_types.get(item.name)
+        or _ValueType(item.dtype, len(item.shape))
         for item in [*j.intent.inputs, *j.intent.outputs]
     }
     for item in j.boundary.accesses:
@@ -2373,8 +5068,8 @@ def _build_anchors(
             _Anchor("j", "effect"),
             f"j.boundary.effects.{item.effect_id}",
         )
-    for item in j.scopes:
-        add(item.scope_id, _Anchor("j", "scope"), f"j.scopes.{item.scope_id}")
+    for scope_id in elaboration.scope_by_id:
+        add(scope_id, _Anchor("j", "scope"), f"j.scopes.{scope_id}")
     for item in j.storage:
         add(
             item.storage_id,
@@ -2393,6 +5088,60 @@ def _build_anchors(
     return anchors, node_operations
 
 
+def _check_scatter_atomic_authorizations(
+    j: SemanticArchive,
+    diagnostics: list[TypeCheckDiagnostic],
+) -> None:
+    """Bind each J scatter carrying atomic metadata to one authorization.
+
+    Canonical J uses ``scatter`` with atomic attributes; the separate
+    ``atomic_scatter`` Intent/MLIR op is an internal lowering form and never
+    reaches this checker.  Atomic ordering and scope are Layer-A semantics,
+    while the authorization is the explicit J/Boundary acknowledgement that a
+    realization may use native atomic update machinery.  The stable
+    ``node_ids`` handle is used as the subject so a positional body path cannot
+    silently retarget the permission.
+    """
+
+    path_to_node = j_elaboration(j).authored_node_by_path(j.node_ids)
+    native_atomic_subjects = [
+        item.subject_ref
+        for item in j.boundary.realization_authorizations
+        if item.kind is RefinementKind.NATIVE_ATOMIC
+    ]
+    for operation_path, operation in _canonical_operation_items(j):
+        if operation.get("op") != "scatter":
+            continue
+        attrs_value = operation.get("attrs")
+        attrs = attrs_value if isinstance(attrs_value, Mapping) else {}
+        if attrs.get("atomic") is None:
+            continue
+        node_ref = path_to_node.get(operation_path)
+        base = f"j.intent.intent_function.{operation_path}"
+        if node_ref is None:
+            diagnostics.append(
+                TypeCheckDiagnostic(
+                    TypeCheckErrorCode.REFINEMENT_AUTH_MISSING,
+                    f"{base}.id",
+                    "atomic scatter requires a stable node_ids handle so its "
+                    "native_atomic authorization has an unambiguous subject",
+                    operation_path,
+                )
+            )
+            continue
+        matches = sum(subject == node_ref for subject in native_atomic_subjects)
+        if matches != 1:
+            diagnostics.append(
+                TypeCheckDiagnostic(
+                    TypeCheckErrorCode.REFINEMENT_AUTH_MISSING,
+                    "j.boundary.realization_authorizations",
+                    "atomic scatter requires exactly one native_atomic "
+                    f"authorization for subject_ref {node_ref!r}",
+                    node_ref,
+                )
+            )
+
+
 def _check_total_j_value_typing(
     j: SemanticArchive,
     diagnostics: list[TypeCheckDiagnostic],
@@ -2400,9 +5149,9 @@ def _check_total_j_value_typing(
     """Require every Layer-A result to have one closed canonical value type."""
 
     typed_values = j_elaboration(j).value_type_by_name
-    body = j.intent.to_json()["intent_function"].get("body", [])
-    for path, operation in _walk_operations(body):
-        for result in _operation_results(operation.get("result")):
+    for record in j_elaboration(j).operation_records:
+        path = record["path"]
+        for result in record["results"]:
             if result in typed_values:
                 continue
             diagnostics.append(
@@ -2424,23 +5173,22 @@ def _check_output_binding_types(
     elaboration = j_elaboration(j)
     value_types = elaboration.value_type_by_name
     mapping_positions = {
-        item.output: index
-        for index, item in enumerate(j.boundary.output_mappings)
+        item.output: item.mapping_index
+        for item in elaboration.output_bindings
+        if item.mapping_index is not None
     }
     return_positions = {
-        item.output: index for index, item in enumerate(j.intent.returns)
+        item.output: item.return_index for item in elaboration.output_bindings
     }
     output_positions = {
-        item.name: index for index, item in enumerate(j.intent.outputs)
+        item.output: item.abi_index for item in elaboration.output_bindings
     }
     outputs = {
-        item.name: CanonicalValueType(item.dtype, tuple(item.shape))
-        for item in j.intent.outputs
+        item.output: item.output_type for item in elaboration.output_bindings
     }
     producible_values = {item.name for item in j.intent.inputs}
-    intent = j.intent.to_json()["intent_function"]
-    for _path, operation in _walk_operations(intent.get("body", [])):
-        producible_values.update(_operation_results(operation.get("result")))
+    for record in elaboration.operation_records:
+        producible_values.update(record["results"])
     try:
         effect_defined_outputs = complete_conditional_effect_outputs(j)
     except (NotImplementedError, ValueError):
@@ -2511,326 +5259,57 @@ _ITERATION_TILE_ROLES = frozenset(
 )
 
 
-def _iteration_axis_matches(axis_ref: int | str | None, trip_axis: str) -> bool:
-    """Recognize the two AxisRefs_v1 spellings of one loop trip axis."""
-
-    return axis_ref == 0 or axis_ref == trip_axis
 
 
-def _program_domain_branch_regions(
-    j: SemanticArchive,
-    pi: RealizationWitness,
-    diagnostics: list[TypeCheckDiagnostic],
-) -> dict[str, str]:
-    """Recognize physical consumer branches guarded by authored J domains.
-
-    One empty-slot route from a program-region ``d*`` realization into a branch
-    region means that the region is realized only for coordinates inside that J
-    domain.  The domain expression remains in J and the physical axis remains in
-    ``pi.program_axes``; pi carries no predicate text or target spelling.
-    """
-
-    domains = set(j.boundary.domains)
-    regions = {str(item["id"]): item for item in pi.regions}
-    branch_regions = {
-        region_id
-        for region_id, item in regions.items()
-        if item.get("placement") == "branch"
-    }
-    program_regions = {
-        region_id
-        for region_id, item in regions.items()
-        if item.get("placement") == "program"
-    }
-    instances = {str(item["id"]): item for item in pi.instances}
-    domain_sources = {
-        instance_id: str(item["semantic_ref"])
-        for instance_id, item in instances.items()
-        if item.get("mechanism") == "realize"
-        and item.get("region") in program_regions
-        and item.get("semantic_ref") in domains
-    }
-    bound_domains = {str(item["domain_ref"]) for item in pi.program_axes}
-
-    def owning_branch(region_ref: str) -> str | None:
-        current: str | None = region_ref
-        seen: set[str] = set()
-        while current is not None and current not in seen:
-            if current in branch_regions:
-                return current
-            seen.add(current)
-            parent = regions.get(current, {}).get("parent")
-            current = str(parent) if parent is not None else None
-        return None
-
-    controlled: dict[str, str] = {}
-    guards_by_region: dict[str, set[str]] = {}
-    for route in pi.routes:
-        source_ref = str(route["source"])
-        target = instances.get(str(route["target"]))
-        if route["slots"] or source_ref not in domain_sources or target is None:
-            continue
-        region_ref = owning_branch(str(target["region"]))
-        if region_ref is not None:
-            guards_by_region.setdefault(region_ref, set()).add(
-                domain_sources[source_ref]
-            )
-    for region_ref, guard_domains in sorted(guards_by_region.items()):
-        if not guard_domains:
-            continue
-        if len(guard_domains) != 1:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
-                    "pi.routes",
-                    "one physical branch region may be guarded by exactly one "
-                    "authored J program domain",
-                    region_ref,
-                )
-            )
-            continue
-        domain_ref = next(iter(guard_domains))
-        if domain_ref not in bound_domains:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
-                    "pi.program_axes",
-                    "a program-domain branch requires the same J domain to have "
-                    "one physical launch-axis binding",
-                    domain_ref,
-                )
-            )
-            continue
-        controlled[region_ref] = domain_ref
-    return controlled
 
 
-def _check_program_domain_terminals(
-    pi: RealizationWitness,
-    controlled_regions: Mapping[str, str],
-    diagnostics: list[TypeCheckDiagnostic],
-) -> None:
-    """Check only the terminal complement of an existing J-domain branch.
-
-    The empty-slot route already states that ``continuation_region`` is realized
-    inside ``domain_ref``.  This relation adds only that the domain complement
-    terminates the current invocation; it never introduces or copies a predicate.
-    """
-
-    for index, relation in enumerate(pi.terminal_controls):
-        if "domain_ref" not in relation:
-            continue
-        base = f"pi.terminal_controls[{index}]"
-        domain_ref = str(relation["domain_ref"])
-        continuation_region = str(relation["continuation_region"])
-        if controlled_regions.get(continuation_region) == domain_ref:
-            continue
-        diagnostics.append(
-            TypeCheckDiagnostic(
-                TypeCheckErrorCode.TERMINAL_CONTROL_INVALID,
-                base,
-                "program-domain terminal must annotate an existing branch region "
-                "controlled by an empty-slot route from that exact J domain",
-                f"{domain_ref}:{continuation_region}",
-            )
-        )
 
 
 def _check_effect_conditionals(
     j: SemanticArchive,
-    pi: RealizationWitness,
     diagnostics: list[TypeCheckDiagnostic],
-    program_domain_regions: set[str],
 ) -> None:
-    """Check authored binary effect regions without constructing control.
+    """Check J-owned effect_if predicate, scope, and effect partition."""
 
-    ``effect_if`` owns predicate polarity and lexical arms in Layer A.  The
-    bound ``branch_region`` scopes own effect membership, while pi anchors each
-    scope in an existing ``placement=branch`` region and may relate the two arm
-    instances as terminal versus continuation topology.  This routine never
-    inserts an arm, copies a predicate/polarity into pi, or rewrites the
-    conditional to an SSA ``select``.
-    """
-
-    intent = j.intent.to_json()["intent_function"]
-    conditionals: list[tuple[str, Mapping[str, Any], bool]] = []
-    effect_terminal_controls = [
-        (index, relation)
-        for index, relation in enumerate(pi.terminal_controls)
-        if "terminal_instance" in relation
-    ]
-
-    def collect_conditionals(body: Any, prefix: str) -> None:
-        if not isinstance(body, list):
-            return
-        for index, operation in enumerate(body):
-            if not isinstance(operation, Mapping):
-                continue
-            path = f"{prefix}[{index}]"
-            if operation.get("op") == "effect_if":
-                conditionals.append((path, operation, index == len(body) - 1))
-            collect_conditionals(operation.get("body"), f"{path}.body")
-            for polarity in ("positive", "negative"):
-                arm = operation.get(polarity)
-                if isinstance(arm, Mapping):
-                    collect_conditionals(
-                        arm.get("body"), f"{path}.{polarity}.body"
-                    )
-
-    collect_conditionals(intent.get("body", []), "body")
-    if not conditionals:
-        if effect_terminal_controls:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    "pi.terminal_controls",
-                    "terminal control requires an authored J effect_if",
-                )
-            )
-        return
-
-    value_types = j_elaboration(j).value_type_by_name
-    scopes = {scope.scope_id: scope for scope in j.scopes}
-    scope_children: dict[str, set[str]] = {scope_id: set() for scope_id in scopes}
-    for scope in j.scopes:
-        if scope.parent_scope is not None:
-            scope_children.setdefault(scope.parent_scope, set()).add(scope.scope_id)
+    elaboration = j_elaboration(j)
+    scopes = elaboration.scope_by_id
+    value_types = elaboration.value_type_by_name
     effects = {
         effect.effect_id: effect
         for effect in j.boundary.effects
         if effect.effect_id is not None
     }
+    children: dict[str, set[str]] = {scope_id: set() for scope_id in scopes}
+    for scope_id, scope in scopes.items():
+        parent = scope.get("parent_scope")
+        if isinstance(parent, str):
+            children.setdefault(parent, set()).add(scope_id)
 
-    def scope_descendants(scope_id: str) -> set[str]:
-        result: set[str] = set()
+    def descendants(scope_id: str) -> set[str]:
+        seen: set[str] = set()
         pending = [scope_id]
         while pending:
             current = pending.pop()
-            if current in result:
+            if current in seen:
                 continue
-            result.add(current)
-            pending.extend(scope_children.get(current, ()))
-        return result
+            seen.add(current)
+            pending.extend(children.get(current, ()))
+        return seen
 
-    def nearest_branch_scope(scope_id: str | None) -> str | None:
-        current = scope_id
-        while current is not None:
-            scope = scopes.get(current)
-            if scope is None:
-                return None
-            if scope.kind.value == "branch_region":
-                return current
-            current = scope.parent_scope
-        return None
-
-    # Record the nearest authored branch owner for every semantic handle that
-    # can later anchor pi.  This is a scope lookup, not inferred control: all
-    # scope/polarity choices have already been authored by effect_if and J.scopes.
-    path_to_node = {path: node for node, path in j.node_ids.items()}
-    semantic_branch_owner: dict[str, str] = {}
-
-    def collect_branch_handles(
-        body: Any,
-        *,
-        owner_scope: str,
-        prefix: str,
-    ) -> None:
-        if not isinstance(body, list):
-            return
-        for index, operation in enumerate(body):
-            if not isinstance(operation, Mapping):
-                continue
-            path = f"{prefix}[{index}]"
-            branch_owner = nearest_branch_scope(owner_scope)
-            if branch_owner is not None:
-                node_ref = path_to_node.get(path)
-                if node_ref is not None:
-                    semantic_branch_owner[node_ref] = branch_owner
-                for result in _operation_results(operation.get("result")):
-                    semantic_branch_owner[result] = branch_owner
-            if operation.get("op") == "loop":
-                loop_scope = operation.get("scope_id")
-                if isinstance(loop_scope, str):
-                    loop_branch = nearest_branch_scope(loop_scope)
-                    if loop_branch is not None:
-                        for scan in operation.get("scan", []):
-                            if isinstance(scan, Mapping) and isinstance(
-                                scan.get("name"), str
-                            ):
-                                semantic_branch_owner[str(scan["name"])] = loop_branch
-                        for carry in operation.get("carry", []):
-                            if not isinstance(carry, Mapping):
-                                continue
-                            for key in (
-                                "state_id",
-                                "body_argument",
-                                "next_value",
-                                "result_value",
-                            ):
-                                if isinstance(carry.get(key), str):
-                                    semantic_branch_owner[str(carry[key])] = loop_branch
-                    collect_branch_handles(
-                        operation.get("body"),
-                        owner_scope=loop_scope,
-                        prefix=f"{path}.body",
-                    )
-            elif operation.get("op") in {"effect_if", "value_if"}:
-                for polarity in ("positive", "negative"):
-                    arm = operation.get(polarity)
-                    if not isinstance(arm, Mapping) or not isinstance(
-                        arm.get("scope_id"), str
-                    ):
-                        continue
-                    collect_branch_handles(
-                        arm.get("body"),
-                        owner_scope=str(arm["scope_id"]),
-                        prefix=f"{path}.{polarity}.body",
-                    )
-
-    root_scope = next(
-        (
-            scope.scope_id
-            for scope in j.scopes
-            if scope.kind.value == "function" and scope.parent_scope is None
-        ),
-        "",
-    )
-    program_scope = next(
-        (
-            scope.scope_id
-            for scope in j.scopes
-            if scope.kind.value == "program_instance"
-            and scope.parent_scope == root_scope
-        ),
-        root_scope,
-    )
-    collect_branch_handles(
-        intent.get("body", []),
-        owner_scope=program_scope,
-        prefix="body",
-    )
-    for scope in j.scopes:
-        branch_owner = nearest_branch_scope(scope.scope_id)
-        if branch_owner is None:
+    guarded_accesses = {
+        relation.access_ref for relation in j.boundary.access_guard_relations
+    }
+    for record in elaboration.operation_records:
+        operation = record.get("wire")
+        if record.get("op") != "effect_if" or not isinstance(operation, Mapping):
             continue
-        if scope.kind.value == "branch_region":
-            semantic_branch_owner[scope.scope_id] = scope.scope_id
-        for effect_ref in scope.effects:
-            semantic_branch_owner[effect_ref] = branch_owner
-            effect = effects.get(effect_ref)
-            if effect is not None and effect.access_ref is not None:
-                semantic_branch_owner[effect.access_ref] = branch_owner
-
-    arm_records: list[tuple[str, str, str]] = []
-    controlled_accesses: set[str] = set()
-    for path, operation, _is_final in conditionals:
-        base = f"j.intent.intent_function.{path}"
+        base = f"j.intent.intent_function.{record['path']}"
         predicate = operation.get("predicate")
-        predicate_type = (
-            value_types.get(predicate) if isinstance(predicate, str) else None
-        )
+        predicate_type = value_types.get(predicate) if isinstance(predicate, str) else None
         if (
             predicate_type is None
+            or not predicate_type.is_tensor
+            or predicate_type.dtype is None
             or predicate_type.dtype.casefold() != "i1"
             or predicate_type.shape
         ):
@@ -2838,420 +5317,103 @@ def _check_effect_conditionals(
                 TypeCheckDiagnostic(
                     TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
                     f"{base}.predicate",
-                    "effect_if predicate must be one dominating scalar i1 "
-                    "Layer-A value",
+                    "effect_if predicate must be one dominating scalar i1 value",
                     predicate if isinstance(predicate, str) else None,
                 )
             )
 
-        pair_effect_owners: dict[str, str] = {}
+        owners: dict[str, str] = {}
         for polarity in ("positive", "negative"):
             arm = operation.get(polarity)
-            scope_id = (
-                arm.get("scope_id") if isinstance(arm, Mapping) else None
-            )
-            if not isinstance(scope_id, str):
-                # The strict decoder owns this malformed wire shape.
+            scope_id = arm.get("scope_id") if isinstance(arm, Mapping) else None
+            if not isinstance(scope_id, str) or scope_id not in scopes:
                 continue
-            arm_records.append((path, polarity, scope_id))
-            descendants = scope_descendants(scope_id)
-            for descendant in descendants:
-                scope = scopes.get(descendant)
-                if scope is None:
-                    continue
-                for effect_ref in scope.effects:
-                    previous = pair_effect_owners.get(effect_ref)
+            for descendant in descendants(scope_id):
+                for effect_ref in scopes[descendant].get("effects", ()):
+                    previous = owners.get(str(effect_ref))
                     if previous is not None and previous != polarity:
                         diagnostics.append(
                             TypeCheckDiagnostic(
                                 TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
                                 f"{base}.{polarity}.scope_id",
                                 "one conditional effect cannot belong to both arms",
-                                effect_ref,
+                                str(effect_ref),
                             )
                         )
-                    pair_effect_owners[effect_ref] = polarity
-                    effect = effects.get(effect_ref)
-                    if effect is not None and effect.access_ref is not None:
-                        controlled_accesses.add(effect.access_ref)
-        if not pair_effect_owners:
+                    owners[str(effect_ref)] = polarity
+        if not owners:
             diagnostics.append(
                 TypeCheckDiagnostic(
                     TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
                     base,
-                    "effect_if requires at least one J-owned effect across its "
-                    "two explicit arms",
+                    "effect_if requires at least one J-owned effect across its arms",
                 )
             )
-
-    guarded_accesses = {
-        relation.access_ref for relation in j.boundary.access_guard_relations
-    }
-    for access_ref in sorted(controlled_accesses & guarded_accesses):
-        diagnostics.append(
-            TypeCheckDiagnostic(
-                TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                "j.boundary.access_guard_relations",
-                "effect_if branch control and access_guard_relation cannot "
-                "both own one access predicate",
-                access_ref,
-            )
-        )
-
-    if pi.wire_schema == NORMALIZATION_WITNESS_SCHEMA:
-        # J owns the complete conditional.  Compact pi has no branch-region or
-        # terminal-control graph, so the remaining checks are legacy-only.
-        return
-
-    regions = {str(region["id"]): region for region in pi.regions}
-    branch_regions = {
-        region_id
-        for region_id, region in regions.items()
-        if region.get("placement") == "branch"
-    }
-    scope_anchor_regions: dict[str, str] = {}
-    scope_anchor_instances: dict[str, str] = {}
-    for path, polarity, scope_id in arm_records:
-        matches = [
-            instance
-            for instance in pi.instances
-            if instance.get("semantic_ref") == scope_id
-            and instance.get("mechanism") == "realize"
-        ]
-        base = f"j.intent.intent_function.{path}.{polarity}.scope_id"
-        if len(matches) != 1:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    base,
-                    "each effect_if arm scope requires exactly one pi realize "
-                    "instance anchor",
-                    scope_id,
+        for effect_ref in owners:
+            effect = effects.get(effect_ref)
+            if effect is not None and effect.access_ref in guarded_accesses:
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
+                        "j.boundary.access_guard_relations",
+                        "effect_if branch control and access_guard_relation cannot "
+                        "both own one access predicate",
+                        effect.access_ref,
+                    )
                 )
-            )
-            continue
-        region_ref = str(matches[0]["region"])
-        region = regions.get(region_ref)
-        if region is None or region.get("placement") != "branch":
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    base,
-                    "effect_if arm scope instance must live in one "
-                    "placement=branch pi region",
-                    scope_id,
-                )
-            )
-            continue
-        if region_ref in scope_anchor_regions.values():
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    base,
-                    "one pi branch region cannot anchor multiple effect_if arms",
-                    region_ref,
-                )
-            )
-        scope_anchor_regions[scope_id] = region_ref
-        scope_anchor_instances[scope_id] = str(matches[0]["id"])
-
-    def region_is_within(region_ref: str, ancestor_ref: str) -> bool:
-        current: str | None = region_ref
-        seen: set[str] = set()
-        while current is not None and current not in seen:
-            if current == ancestor_ref:
-                return True
-            seen.add(current)
-            parent = regions.get(current, {}).get("parent")
-            current = str(parent) if parent is not None else None
-        return False
-
-    for scope_id, region_ref in scope_anchor_regions.items():
-        parent_scope = scopes.get(scope_id).parent_scope if scope_id in scopes else None
-        ancestor_scope = nearest_branch_scope(parent_scope)
-        ancestor_region = (
-            scope_anchor_regions.get(ancestor_scope)
-            if ancestor_scope is not None else None
-        )
-        if ancestor_region is not None and not region_is_within(
-            region_ref, ancestor_region
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    "pi.regions",
-                    "nested effect_if branch region must remain inside its "
-                    "authored parent branch",
-                    region_ref,
-                )
-            )
-
-    for index, instance in enumerate(pi.instances):
-        semantic_ref = str(instance.get("semantic_ref"))
-        owner_scope = semantic_branch_owner.get(semantic_ref)
-        if owner_scope is None:
-            continue
-        owner_region = scope_anchor_regions.get(owner_scope)
-        instance_region = str(instance.get("region"))
-        if owner_region is not None and not region_is_within(
-            instance_region, owner_region
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    f"pi.instances[{index}].region",
-                    "branch-local semantic handle must be realized inside its "
-                    "authored effect_if arm region",
-                    semantic_ref,
-                )
-            )
-
-    terminal_pairs: dict[
-        frozenset[str], tuple[str, bool, dict[str, str]]
-    ] = {}
-    for path, operation, is_final in conditionals:
-        arm_values = {
-            polarity: operation.get(polarity)
-            for polarity in ("positive", "negative")
-        }
-        scope_ids = {
-            polarity: (
-                arm.get("scope_id") if isinstance(arm, Mapping) else None
-            )
-            for polarity, arm in arm_values.items()
-        }
-        positive_region = scope_anchor_regions.get(str(scope_ids["positive"]))
-        negative_region = scope_anchor_regions.get(str(scope_ids["negative"]))
-        if positive_region is None or negative_region is None:
-            continue
-        positive_parent = regions[positive_region].get("parent")
-        negative_parent = regions[negative_region].get("parent")
-        if (
-            positive_region == negative_region
-            or positive_parent != negative_parent
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    f"j.intent.intent_function.{path}",
-                    "positive/negative pi branch regions must be distinct "
-                    "siblings with one common parent",
-                )
-            )
-
-        arm_instances = {
-            polarity: scope_anchor_instances.get(str(scope_ids[polarity]))
-            for polarity in ("positive", "negative")
-        }
-        if all(isinstance(value, str) for value in arm_instances.values()):
-            pair = frozenset(str(value) for value in arm_instances.values())
-            terminal_pairs[pair] = (
-                path,
-                is_final,
-                {key: str(value) for key, value in arm_instances.items()},
-            )
-
-    terminal_paths: set[str] = set()
-    for index, relation in effect_terminal_controls:
-        base = f"pi.terminal_controls[{index}]"
-        terminal_instance = str(relation["terminal_instance"])
-        continuation_instance = str(relation["continuation_instance"])
-        record = terminal_pairs.get(
-            frozenset({terminal_instance, continuation_instance})
-        )
-        if record is None:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    base,
-                    "terminal and continuation instances must anchor the two "
-                    "sibling arms of one J effect_if",
-                    terminal_instance,
-                )
-            )
-            continue
-        path, is_final, arm_instances = record
-        if path in terminal_paths:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    base,
-                    "one J effect_if may have at most one terminal-control relation",
-                    terminal_instance,
-                )
-            )
-        terminal_paths.add(path)
-        if not is_final:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    base,
-                    "terminal effect_if must be the final operation in its lexical "
-                    "parent; the continuation belongs only to its sibling arm",
-                    terminal_instance,
-                )
-            )
-        if terminal_instance not in set(arm_instances.values()):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                    f"{base}.terminal_instance",
-                    "terminal instance is not an effect_if arm anchor",
-                    terminal_instance,
-                )
-            )
-
-    value_arm_scopes = {
-        str(arm.get("scope_id"))
-        for _path, operation in _walk_operations(intent.get("body", []))
-        if operation.get("op") == "value_if"
-        for arm in (operation.get("positive"), operation.get("negative"))
-        if isinstance(arm, Mapping) and isinstance(arm.get("scope_id"), str)
-    }
-    value_anchor_regions = {
-        str(instance.get("region"))
-        for instance in pi.instances
-        if instance.get("mechanism") == "realize"
-        and str(instance.get("semantic_ref")) in value_arm_scopes
-        and str(instance.get("region")) in branch_regions
-    }
-    conditional_regions = set(scope_anchor_regions.values()) | value_anchor_regions
-    for region_ref in sorted(conditional_regions & program_domain_regions):
-        diagnostics.append(
-            TypeCheckDiagnostic(
-                TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                "pi.regions",
-                "one branch region cannot simultaneously realize a J conditional "
-                "arm and a program-domain consumer guard",
-                region_ref,
-            )
-        )
-    anchored_regions = conditional_regions | program_domain_regions
-    for region_ref in sorted(branch_regions - anchored_regions):
-        diagnostics.append(
-            TypeCheckDiagnostic(
-                TypeCheckErrorCode.EFFECT_CONDITIONAL_INVALID,
-                "pi.regions",
-                "placement=branch region is not anchored by an authored "
-                "effect_if arm scope",
-                region_ref,
-            )
-        )
 
 
 _VALUE_IF_PURE_OPS = frozenset(
     {
         "map_binary", "map_unary", "reduce", "iota", "const",
         "contraction", "select", "cast", "transpose", "gather", "scatter",
+        "reshape", "record", "record_get",
+        *RAGGED_OPS,
         "concat", "pad", "tile", "flip", "triu", "rand", "scan",
         "arg_reduce", "sort", "pool", "upsample", "polar", "conv",
         "nonzero", "masked_select", "masked_scatter",
     }
 )
 
-
 def _check_value_conditionals(
     j: SemanticArchive,
-    pi: RealizationWitness,
     diagnostics: list[TypeCheckDiagnostic],
-    program_domain_regions: set[str],
 ) -> None:
-    """Check authored single-result pure conditionals without constructing one."""
+    """Check J-owned value_if purity, arm-local effects, and yield types."""
 
-    intent = j.intent.to_json()["intent_function"]
-    operations = dict(_walk_operations(intent.get("body", [])))
-    conditionals = [
-        (path, operation)
-        for path, operation in operations.items()
-        if operation.get("op") == "value_if"
-    ]
-    if not conditionals:
-        return
-
-    value_types = j_elaboration(j).value_type_by_name
-    path_to_node = {path: node for node, path in j.node_ids.items()}
-    node_to_path = {node: path for node, path in j.node_ids.items()}
-    scopes = {scope.scope_id: scope for scope in j.scopes}
-    scope_children: dict[str, set[str]] = {scope_id: set() for scope_id in scopes}
-    for scope in j.scopes:
-        if scope.parent_scope is not None:
-            scope_children.setdefault(scope.parent_scope, set()).add(scope.scope_id)
+    elaboration = j_elaboration(j)
+    operations = dict(_canonical_operation_items(j))
+    value_types = elaboration.value_type_by_name
+    scopes = elaboration.scope_by_id
+    children: dict[str, set[str]] = {scope_id: set() for scope_id in scopes}
+    for scope_id, scope in scopes.items():
+        parent = scope.get("parent_scope")
+        if isinstance(parent, str):
+            children.setdefault(parent, set()).add(scope_id)
 
     def descendants(scope_id: str) -> set[str]:
-        result: set[str] = set()
+        seen: set[str] = set()
         pending = [scope_id]
         while pending:
             current = pending.pop()
-            if current in result:
+            if current in seen:
                 continue
-            result.add(current)
-            pending.extend(scope_children.get(current, ()))
-        return result
-
-    regions = {str(region["id"]): region for region in pi.regions}
-    branch_regions = {
-        region_id
-        for region_id, region in regions.items()
-        if region.get("placement") == "branch"
-    }
-
-    def region_is_within(region_ref: str, ancestor_ref: str) -> bool:
-        current: str | None = region_ref
-        seen: set[str] = set()
-        while current is not None and current not in seen:
-            if current == ancestor_ref:
-                return True
             seen.add(current)
-            parent = regions.get(current, {}).get("parent")
-            current = str(parent) if parent is not None else None
-        return False
+            pending.extend(children.get(current, ()))
+        return seen
 
-    # All authored conditional arms share one physical branch-region namespace.
-    all_arm_scopes: set[str] = set()
-    for _path, operation in operations.items():
-        if operation.get("op") not in {"effect_if", "value_if"}:
+    path_to_node = elaboration.authored_node_by_path(j.node_ids)
+    node_to_path = {node: path for path, node in path_to_node.items()}
+    for path, operation in operations.items():
+        if operation.get("op") != "value_if":
             continue
-        for polarity in ("positive", "negative"):
-            arm = operation.get(polarity)
-            if isinstance(arm, Mapping) and isinstance(arm.get("scope_id"), str):
-                all_arm_scopes.add(str(arm["scope_id"]))
-
-    global_scope_regions: dict[str, str] = {}
-    region_owners: dict[str, list[str]] = {}
-    for scope_id in all_arm_scopes:
-        matches = [
-            instance
-            for instance in pi.instances
-            if instance.get("mechanism") == "realize"
-            and instance.get("semantic_ref") == scope_id
-        ]
-        if len(matches) != 1:
-            continue
-        region_ref = str(matches[0].get("region"))
-        if region_ref not in branch_regions:
-            continue
-        global_scope_regions[scope_id] = region_ref
-        region_owners.setdefault(region_ref, []).append(scope_id)
-    for region_ref, owners in sorted(region_owners.items()):
-        if len(owners) > 1:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
-                    "pi.instances",
-                    "one pi branch region cannot anchor multiple authored "
-                    "conditional arms",
-                    region_ref,
-                )
-            )
-
-    local_owner: dict[str, str] = {}
-    value_arm_scopes: set[str] = set()
-    for path, operation in conditionals:
         base = f"j.intent.intent_function.{path}"
         predicate = operation.get("predicate")
         predicate_type = value_types.get(predicate) if isinstance(predicate, str) else None
         if (
             predicate_type is None
+            or not predicate_type.is_tensor
+            or predicate_type.dtype is None
             or predicate_type.dtype.casefold() != "i1"
             or predicate_type.shape
         ):
@@ -3259,70 +5421,52 @@ def _check_value_conditionals(
                 TypeCheckDiagnostic(
                     TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
                     f"{base}.predicate",
-                    "value_if predicate must be one dominating scalar i1 "
-                    "Layer-A value",
+                    "value_if predicate must be one dominating scalar i1 value",
                     predicate if isinstance(predicate, str) else None,
                 )
             )
 
         result = operation.get("result")
         result_type = value_types.get(result) if isinstance(result, str) else None
-        pair_regions: dict[str, str] = {}
         for polarity in ("positive", "negative"):
             arm = operation.get(polarity)
             if not isinstance(arm, Mapping):
                 continue
             arm_base = f"{base}.{polarity}"
             scope_id = arm.get("scope_id")
-            if not isinstance(scope_id, str):
+            if not isinstance(scope_id, str) or scope_id not in scopes:
                 continue
-            value_arm_scopes.add(scope_id)
-            scope = scopes.get(scope_id)
             for descendant in descendants(scope_id):
-                descendant_scope = scopes.get(descendant)
-                if descendant_scope is not None and descendant_scope.effects:
+                if scopes[descendant].get("effects", ()):
                     diagnostics.append(
                         TypeCheckDiagnostic(
                             TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
                             f"{arm_base}.scope_id",
-                            "value_if arms and descendant scopes must be pure "
-                            "and contain no effects",
+                            "value_if arms and descendant scopes must be pure",
                             descendant,
                         )
                     )
-
-            arm_prefix = f"{path}.{polarity}.body"
+            prefix = f"{path}.{polarity}.body"
             arm_paths = {
-                candidate
-                for candidate in operations
-                if candidate.startswith(f"{arm_prefix}[")
+                candidate for candidate in operations if candidate.startswith(f"{prefix}[")
             }
-            local_handles: set[str] = {scope_id}
             for arm_path in arm_paths:
-                arm_operation = operations[arm_path]
-                op_name = arm_operation.get("op")
+                op_name = operations[arm_path].get("op")
                 if op_name not in _VALUE_IF_PURE_OPS:
                     diagnostics.append(
                         TypeCheckDiagnostic(
                             TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
                             f"j.intent.intent_function.{arm_path}.op",
-                            "value_if arms permit only known pure ordinary "
-                            "IntentIR operations and no nested regions",
+                            "value_if arms permit only known pure ordinary IntentIR operations",
                             str(op_name) if op_name is not None else None,
                         )
                     )
-                local_handles.update(_operation_results(arm_operation.get("result")))
-                node_ref = path_to_node.get(arm_path)
-                if node_ref is not None:
-                    local_handles.add(node_ref)
-                local_owner.update({handle: scope_id for handle in local_handles})
-
             for access in j.boundary.accesses:
                 access_path = (
                     node_to_path.get(access.node_ref, access.node_ref)
                     if access.node_ref is not None else None
                 )
-                if isinstance(access_path, str) and access_path in arm_paths:
+                if access_path in arm_paths:
                     diagnostics.append(
                         TypeCheckDiagnostic(
                             TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
@@ -3336,7 +5480,7 @@ def _check_value_conditionals(
                     node_to_path.get(effect.node_ref, effect.node_ref)
                     if effect.node_ref is not None else None
                 )
-                if isinstance(effect_path, str) and effect_path in arm_paths:
+                if effect_path in arm_paths:
                     diagnostics.append(
                         TypeCheckDiagnostic(
                             TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
@@ -3345,644 +5489,25 @@ def _check_value_conditionals(
                             effect.effect_id,
                         )
                     )
-
             yield_value = arm.get("yield_value")
-            yield_type = (
-                value_types.get(yield_value)
-                if isinstance(yield_value, str) else None
-            )
+            yield_type = value_types.get(yield_value) if isinstance(yield_value, str) else None
             if result_type is None or yield_type is None or yield_type != result_type:
                 diagnostics.append(
                     TypeCheckDiagnostic(
                         TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
                         f"{arm_base}.yield_value",
-                        "each value_if arm yield must have exactly the authored "
-                        "single result dtype and shape",
+                        "each value_if arm yield must match the authored result dtype and shape",
                         yield_value if isinstance(yield_value, str) else None,
                     )
                 )
 
-            if pi.wire_schema == NORMALIZATION_WITNESS_SCHEMA:
-                # All semantic/purity/yield checks above are J-owned.  New pi
-                # intentionally carries no arm-region realization graph.
-                continue
-
-            matches = [
-                instance
-                for instance in pi.instances
-                if instance.get("mechanism") == "realize"
-                and instance.get("semantic_ref") == scope_id
-            ]
-            if len(matches) != 1:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
-                        f"{arm_base}.scope_id",
-                        "each value_if arm scope requires exactly one pi realize "
-                        "instance anchor",
-                        scope_id,
-                    )
-                )
-                continue
-            region_ref = str(matches[0].get("region"))
-            if region_ref not in branch_regions:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
-                        f"{arm_base}.scope_id",
-                        "value_if arm scope instance must live in one "
-                        "placement=branch pi region",
-                        scope_id,
-                    )
-                )
-                continue
-            pair_regions[polarity] = region_ref
-
-        positive_region = pair_regions.get("positive")
-        negative_region = pair_regions.get("negative")
-        if positive_region is not None and negative_region is not None:
-            if (
-                positive_region == negative_region
-                or regions[positive_region].get("parent")
-                != regions[negative_region].get("parent")
-            ):
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
-                        base,
-                        "value_if positive/negative pi branch regions must be "
-                        "distinct siblings with one common parent",
-                    )
-                )
-
-    for index, instance in enumerate(pi.instances):
-        semantic_ref = str(instance.get("semantic_ref"))
-        owner_scope = local_owner.get(semantic_ref)
-        owner_region = global_scope_regions.get(owner_scope or "")
-        if owner_region is None:
-            continue
-        if not region_is_within(str(instance.get("region")), owner_region):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
-                    f"pi.instances[{index}].region",
-                    "value_if arm-local semantic handle must be realized "
-                    "inside its authored branch region",
-                    semantic_ref,
-                )
-            )
-
-    anchored_regions = set(global_scope_regions.values()) | program_domain_regions
-    for region_ref in sorted(branch_regions - anchored_regions):
-        diagnostics.append(
-            TypeCheckDiagnostic(
-                TypeCheckErrorCode.VALUE_CONDITIONAL_INVALID,
-                "pi.regions",
-                "placement=branch region is not anchored by an authored "
-                "effect_if/value_if arm scope",
-                region_ref,
-            )
-        )
 
 
-def _check_iteration_witness(
-    j: SemanticArchive,
-    c: ImplementationConfig,
-    pi: RealizationWitness,
-    node_operations: Mapping[str, Mapping[str, Any]],
-    diagnostics: list[TypeCheckDiagnostic],
-) -> None:
-    """Close the physical induction basis of every C-tiled J loop."""
-
-    loop_axes: dict[str, str] = {}
-    for node_ref, operation in node_operations.items():
-        if not re.fullmatch(r"n[0-9]+", node_ref):
-            continue
-        if operation.get("op") != "loop":
-            continue
-        trip = operation.get("trip")
-        axis = trip.get("axis") if isinstance(trip, Mapping) else None
-        if isinstance(axis, str):
-            loop_axes[node_ref] = axis
-
-    all_slots = {slot.name: slot for slot in c.slots}
-    tile_slots = {
-        slot.name: slot
-        for slot in c.slots
-        if slot.role in _ITERATION_TILE_ROLES
-        and slot.subject_ref in loop_axes
-        and _iteration_axis_matches(
-            slot.axis_ref, loop_axes[str(slot.subject_ref)]
-        )
-    }
-    required_pairs = {
-        (str(slot.subject_ref), slot.name) for slot in tile_slots.values()
-    }
-    regions = {str(item["id"]): item for item in pi.regions}
-    instances = {str(item["id"]): item for item in pi.instances}
-
-    def visible_from(instance_region: str, relation_region: str) -> bool:
-        current: str | None = relation_region
-        while current is not None:
-            if current == instance_region:
-                return True
-            parent = regions.get(current, {}).get("parent")
-            current = str(parent) if parent is not None else None
-        return False
-
-    witnessed_pairs: set[tuple[str, str]] = set()
-
-    for index, relation in enumerate(pi.iterations):
-        path = f"pi.iterations[{index}]"
-        region_ref = str(relation["region"])
-        region = regions.get(region_ref)
-        if region is None or region["placement"] != "loop":
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.ITERATION_WITNESS_INVALID,
-                    f"{path}.region",
-                    "iteration relation requires a placement=loop region",
-                    region_ref,
-                )
-            )
-
-        loop_instance_ref = str(relation["loop_instance"])
-        loop_instance = instances.get(loop_instance_ref)
-        loop_ref = (
-            str(loop_instance["semantic_ref"])
-            if loop_instance is not None
-            else ""
-        )
-        valid_loop = (
-            loop_ref in loop_axes
-            and loop_instance is not None
-            and visible_from(str(loop_instance["region"]), region_ref)
-        )
-        if not valid_loop:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.ITERATION_WITNESS_INVALID,
-                    f"{path}.loop_instance",
-                    "loop_instance must anchor a structured J loop in the "
-                    "relation region or one of its lexical ancestors",
-                    loop_instance_ref,
-                )
-            )
-
-        tile_instance_ref = str(relation["tile_instance"])
-        tile_instance = instances.get(tile_instance_ref)
-        tile_ref = (
-            str(tile_instance["semantic_ref"])
-            if tile_instance is not None
-            else ""
-        )
-        # An explicit iteration relation itself identifies the referenced C
-        # value as the physical tile.  The reserved tile roles are used only
-        # to make omission mechanically detectable; they are not a hidden
-        # validity condition on an otherwise closed relation.
-        slot = all_slots.get(tile_ref)
-        value = c.values.get(tile_ref)
-        valid_tile = (
-            slot is not None
-            and slot.subject_ref == loop_ref
-            and loop_ref in loop_axes
-            and _iteration_axis_matches(
-                slot.axis_ref, loop_axes[loop_ref]
-            )
-            and tile_instance is not None
-            and visible_from(str(tile_instance["region"]), region_ref)
-            and slot.required
-            and slot.value_type.casefold() in {"int", "integer", "i32", "i64", "u32", "u64"}
-            and isinstance(value, int)
-            and not isinstance(value, bool)
-            and value > 0
-        )
-        if not valid_tile:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.ITERATION_WITNESS_INVALID,
-                    f"{path}.tile_instance",
-                    "tile_instance must anchor one required positive-integer C "
-                    "tile slot attached to the same J loop and trip axis, with "
-                    "its instance visible from the relation region",
-                    tile_instance_ref,
-                )
-            )
-
-        pair = (loop_ref, tile_ref)
-        if valid_loop and valid_tile and region is not None:
-            witnessed_pairs.add(pair)
-
-    for loop_ref, tile_ref in sorted(required_pairs - witnessed_pairs):
-        diagnostics.append(
-            TypeCheckDiagnostic(
-                TypeCheckErrorCode.ITERATION_WITNESS_MISSING,
-                "pi.iterations",
-                "C-tiled structured J loop requires at least one physical "
-                "induction-basis relation",
-                f"{loop_ref}:{tile_ref}",
-            )
-            )
 
 
-def _check_physical_iteration_witness(
-    j: SemanticArchive,
-    c: ImplementationConfig,
-    pi: RealizationWitness,
-    node_operations: Mapping[str, Mapping[str, Any]],
-    diagnostics: list[TypeCheckDiagnostic],
-) -> None:
-    """Check source-neutral physical time around an existing J subject/axis."""
-
-    regions = {str(item["id"]): item for item in pi.regions}
-    instances = {str(item["id"]): item for item in pi.instances}
-    slots = {slot.name: slot for slot in c.slots}
-
-    def visible_from(instance_region: str, relation_region: str) -> bool:
-        current: str | None = relation_region
-        while current is not None:
-            if current == instance_region:
-                return True
-            parent = regions.get(current, {}).get("parent")
-            current = str(parent) if parent is not None else None
-        return False
-
-    for index, relation in enumerate(pi.physical_iterations):
-        base = f"pi.physical_iterations[{index}]"
-        region_ref = str(relation["region"])
-        region = regions.get(region_ref)
-        if region is None or region.get("placement") != "loop":
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_ITERATION_INVALID,
-                    f"{base}.region",
-                    "physical iteration requires one placement=loop region",
-                    region_ref,
-                )
-            )
-
-        body_instance_ref = str(relation["body_instance"])
-        body_instance = instances.get(body_instance_ref)
-        body_ref = (
-            str(body_instance.get("semantic_ref"))
-            if body_instance is not None
-            else ""
-        )
-        body_operation = node_operations.get(body_ref)
-        allowed_axes = _axis_refs_v1(j, body_ref, node_operations)
-        body_valid = (
-            body_instance is not None
-            and bool(allowed_axes)
-            and not (
-                body_operation is not None and body_operation.get("op") == "loop"
-            )
-            and visible_from(str(body_instance.get("region")), region_ref)
-        )
-        if not body_valid:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_ITERATION_INVALID,
-                    f"{base}.body_instance",
-                    "body_instance must visibly anchor one existing non-loop J "
-                    "reduce/contraction, boundary access, or domain with a closed "
-                    "dependent axis; the relation never creates a semantic J loop",
-                    body_instance_ref,
-                )
-            )
-
-        tile_instance_ref = str(relation["tile_instance"])
-        tile_instance = instances.get(tile_instance_ref)
-        tile_ref = (
-            str(tile_instance.get("semantic_ref"))
-            if tile_instance is not None
-            else ""
-        )
-        slot = slots.get(tile_ref)
-        value = c.values.get(tile_ref)
-        allowed_axes = allowed_axes if body_valid else frozenset()
-        tile_valid = (
-            tile_instance is not None
-            and visible_from(str(tile_instance.get("region")), region_ref)
-            and slot is not None
-            and slot.subject_ref == body_ref
-            and slot.axis_ref in allowed_axes
-            and slot.required
-            and slot.value_type.casefold()
-            in {"int", "integer", "i32", "i64", "u32", "u64"}
-            and isinstance(value, int)
-            and not isinstance(value, bool)
-            and value > 0
-        )
-        if not tile_valid:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_ITERATION_INVALID,
-                    f"{base}.tile_instance",
-                    "tile_instance must visibly anchor one required positive-integer "
-                    "C slot explicitly attached to the same J node and one of its "
-                    "closed reduced/contracted axes",
-                    tile_instance_ref,
-                )
-            )
 
 
-def _check_route_extent_transforms(
-    j: SemanticArchive,
-    c: ImplementationConfig,
-    pi: RealizationWitness,
-    node_operations: Mapping[str, Mapping[str, Any]],
-    instance_anchors: Mapping[str, _Anchor],
-    diagnostics: list[TypeCheckDiagnostic],
-) -> None:
-    """Check closed C-extent partitions on existing realization route slots."""
 
-    instances = {str(item["id"]): item for item in pi.instances}
-    slots = {slot.name: slot for slot in c.slots}
-    integer_types = {"int", "integer", "i32", "i64", "u32", "u64"}
-
-    for index, relation in enumerate(pi.route_extent_transforms):
-        base = f"pi.route_extent_transforms[{index}]"
-        source_id = str(relation["source"])
-        target_id = str(relation["target"])
-        source_instance = instances.get(source_id)
-        target_instance = instances.get(target_id)
-        source_anchor = instance_anchors.get(source_id)
-        target_anchor = instance_anchors.get(target_id)
-        source_ref = (
-            str(source_instance.get("semantic_ref"))
-            if source_instance is not None
-            else ""
-        )
-        target_ref = (
-            str(target_instance.get("semantic_ref"))
-            if target_instance is not None
-            else ""
-        )
-        c_slot = slots.get(source_ref)
-        c_value = c.values.get(source_ref)
-        source_valid = (
-            source_instance is not None
-            and source_instance.get("mechanism") == "realize"
-            and source_anchor is not None
-            and source_anchor.owner == "c"
-            and source_anchor.kind == "slot"
-            and c_slot is not None
-            and c_slot.required
-            and c_slot.value_type.casefold() in integer_types
-            and isinstance(c_value, int)
-            and not isinstance(c_value, bool)
-            and c_value > 0
-        )
-        if not source_valid:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.ROUTE_EXTENT_TRANSFORM_INVALID,
-                    f"{base}.source",
-                    "route extent transform source must be one realize instance "
-                    "anchored to a required positive-integer C slot",
-                    source_id,
-                )
-            )
-
-        allowed_axes = _axis_refs_v1(j, target_ref, node_operations)
-        target_valid = (
-            target_instance is not None
-            and target_instance.get("mechanism") == "realize"
-            and target_anchor is not None
-            and target_anchor.owner == "j"
-            and target_anchor.kind == "domain"
-            and c_slot is not None
-            and c_slot.subject_ref == target_ref
-            and c_slot.axis_ref is not None
-            and c_slot.axis_ref in allowed_axes
-        )
-        if not target_valid:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.ROUTE_EXTENT_TRANSFORM_INVALID,
-                    f"{base}.target",
-                    "route extent transform target must be one realize instance "
-                    "anchored to the J domain and axis attached by its source C slot",
-                    target_id,
-                )
-            )
-
-
-def _check_physical_loop_carriers(
-    pi: RealizationWitness,
-    node_operations: Mapping[str, Mapping[str, Any]],
-    instance_anchors: Mapping[str, _Anchor],
-    diagnostics: list[TypeCheckDiagnostic],
-) -> None:
-    """Check physical-only temporal carriers without inventing update semantics."""
-
-    regions = {str(item["id"]): item for item in pi.regions}
-    instances = {str(item["id"]): item for item in pi.instances}
-    physical_bodies = {
-        str(item["region"]): str(item["body_instance"])
-        for item in pi.physical_iterations
-    }
-    route_edges = {
-        (str(item["source"]), str(item["target"])) for item in pi.routes
-    }
-    observable_mechanisms = {
-        "transfer_direct",
-        "transfer_async",
-        "update_atomic",
-        "update_privatized",
-        "synchronize",
-    }
-    outgoing: dict[str, set[str]] = {instance_id: set() for instance_id in instances}
-    for source, target in route_edges:
-        outgoing.setdefault(source, set()).add(target)
-
-    def ancestor_regions(region_ref: str) -> tuple[str, ...]:
-        result: list[str] = []
-        parent = regions.get(region_ref, {}).get("parent")
-        while parent is not None:
-            parent_ref = str(parent)
-            result.append(parent_ref)
-            parent = regions.get(parent_ref, {}).get("parent")
-        return tuple(result)
-
-    def reaches_observable_consumer(state_instance: str) -> bool:
-        pending = list(outgoing.get(state_instance, ()))
-        visited: set[str] = set()
-        while pending:
-            current = pending.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            instance = instances.get(current)
-            if (
-                instance is not None
-                and instance.get("mechanism") in observable_mechanisms
-            ):
-                return True
-            pending.extend(outgoing.get(current, ()))
-        return False
-
-    allowed_kinds = {"signature", "tensor", "value", "node", "access"}
-    for index, relation in enumerate(pi.physical_loop_carriers):
-        base = f"pi.physical_loop_carriers[{index}]"
-        region_ref = str(relation["region"])
-        region = regions.get(region_ref)
-        ancestors = ancestor_regions(region_ref)
-        if (
-            region is None
-            or region.get("placement") != "loop"
-            or region_ref not in physical_bodies
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    f"{base}.region",
-                    "physical carrier requires one declared physical_iterations "
-                    "placement=loop region",
-                    region_ref,
-                )
-            )
-
-        role_ids = {
-            role: str(relation[role])
-            for role in ("init", "state", "next", "result")
-        }
-        role_instances = {role: instances.get(ref) for role, ref in role_ids.items()}
-        role_regions = {
-            role: (
-                str(instance.get("region")) if instance is not None else ""
-            )
-            for role, instance in role_instances.items()
-        }
-        direct_parent = (
-            str(region.get("parent"))
-            if region is not None and region.get("parent") is not None
-            else ""
-        )
-        if role_regions["init"] not in ancestors:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    f"{base}.init",
-                    "physical carrier init must be visible from a strict ancestor",
-                    role_ids["init"],
-                )
-            )
-        if (
-            role_regions["state"] != region_ref
-            or role_regions["next"] != region_ref
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    f"{base}.state",
-                    "physical carrier state and next must be in the exact loop region",
-                    f"{role_ids['state']}:{role_ids['next']}",
-                )
-            )
-        if not direct_parent or role_regions["result"] != direct_parent:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    f"{base}.result",
-                    "physical carrier result must be in the loop region's direct parent",
-                    role_ids["result"],
-                )
-            )
-
-        typed_keys: list[tuple[str, int, str]] = []
-        for role, instance_id in role_ids.items():
-            anchor = instance_anchors.get(instance_id)
-            if (
-                anchor is None
-                or anchor.owner != "j"
-                or anchor.kind not in allowed_kinds
-                or anchor.value_type is None
-                or anchor.carrier_class not in {"pointer", "value"}
-            ):
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                        f"{base}.{role}",
-                        "physical carrier roles must anchor typed J carriers; C, "
-                        "domain, scope, effect and absent carriers are forbidden",
-                        instance_id,
-                    )
-                )
-                continue
-            instance = role_instances[role]
-            semantic_ref = (
-                str(instance.get("semantic_ref")) if instance is not None else ""
-            )
-            if anchor.kind == "node":
-                operation = node_operations.get(semantic_ref)
-                if operation is None or len(
-                    _operation_results(operation.get("result"))
-                ) != 1:
-                    diagnostics.append(
-                        TypeCheckDiagnostic(
-                            TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                            f"{base}.{role}",
-                            "physical node-carrier roles require one unambiguous "
-                            "typed result",
-                            instance_id,
-                        )
-                    )
-                    continue
-            typed_keys.append(
-                (
-                    anchor.value_type.dtype.casefold(),
-                    anchor.value_type.rank,
-                    str(anchor.carrier_class),
-                )
-            )
-        if typed_keys and len(set(typed_keys)) != 1:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    base,
-                    "physical init/state/next/result dtype, rank, and carrier "
-                    "class must match",
-                    role_ids["state"],
-                )
-            )
-        if (role_ids["init"], role_ids["state"]) not in route_edges:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    f"{base}.init",
-                    "ordinary pi routes must contain physical init -> state",
-                    role_ids["init"],
-                )
-            )
-        if role_ids["state"] == role_ids["next"]:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    f"{base}.next",
-                    "physical state and next must be distinct temporal occurrences; "
-                    "they may still anchor the same J semantic value",
-                    role_ids["next"],
-                )
-            )
-        elif (role_ids["state"], role_ids["next"]) not in route_edges:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    f"{base}.next",
-                    "ordinary pi routes must contain physical state -> next",
-                    role_ids["next"],
-                )
-            )
-        if not reaches_observable_consumer(role_ids["state"]):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PHYSICAL_LOOP_CARRIER_INVALID,
-                    f"{base}.state",
-                    "physical state must reach an observable realization consumer",
-                    role_ids["state"],
-                )
-            )
 
 
 _CONSUMER_EXTENSION_OPS = frozenset(
@@ -4021,32 +5546,6 @@ def _same_closed_scalar(left: Any, right: Any) -> bool:
     )
 
 
-def _is_consumer_identity(fn: str, dtype: str, value: Any) -> bool:
-    if fn == "sum":
-        return value == "ZERO" or (
-            not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and float(value) == 0.0
-        )
-    if fn == "prod":
-        return (
-            not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and float(value) == 1.0
-        )
-    if fn == "any":
-        return value is False or value == "false"
-    if fn == "all":
-        return value is True or value == "true"
-    if not _floating_dtype(dtype):
-        return False
-    if fn == "max":
-        return isinstance(value, str) and value in {"NEG_INF", "-inf"}
-    if fn == "min":
-        return isinstance(value, str) and value in {"POS_INF", "+inf", "inf"}
-    return False
-
-
 def _consumer_dependency_path(
     j: SemanticArchive,
     *,
@@ -4061,10 +5560,9 @@ def _consumer_dependency_path(
     access, so a same-tensor sibling access cannot silently satisfy it.
     """
 
-    intent = j.intent.to_json()["intent_function"]
     path_to_ref = {path: ref for ref, path in j.node_ids.items()}
     producers: dict[str, tuple[str | None, Mapping[str, Any]]] = {}
-    for path, operation in _walk_operations(intent.get("body", [])):
+    for path, operation in _canonical_operation_items(j):
         for result in _operation_results(operation.get("result")):
             producers[result] = (path_to_ref.get(path), operation)
 
@@ -4114,48 +5612,6 @@ def _consumer_dependency_path(
     return visit(operand)
 
 
-def _consumer_extension_candidates(
-    j: SemanticArchive,
-    *,
-    operand: str,
-) -> tuple[
-    dict[str, tuple[Any, tuple[Mapping[str, Any], ...]]],
-    tuple[str, ...],
-]:
-    """Resolve access provenance, preferring exact access.node_ref evidence."""
-
-    by_tensor: dict[
-        str,
-        list[tuple[Any, tuple[Mapping[str, Any], ...]]],
-    ] = {}
-    for access in j.boundary.accesses:
-        if access.kind.value != "load" or access.predicate is None:
-            continue
-        found, path = _consumer_dependency_path(
-            j,
-            operand=operand,
-            access_node_ref=access.node_ref,
-            access_tensor=access.tensor,
-        )
-        if found:
-            by_tensor.setdefault(access.tensor, []).append((access, path))
-
-    selected: dict[str, tuple[Any, tuple[Mapping[str, Any], ...]]] = {}
-    ambiguous: list[str] = []
-    for tensor, candidates in by_tensor.items():
-        node_bound = [item for item in candidates if item[0].node_ref is not None]
-        if node_bound:
-            for access, path in node_bound:
-                selected[access.access_id] = (access, path)
-            continue
-        if len(candidates) != 1:
-            ambiguous.append(tensor)
-            continue
-        access, path = candidates[0]
-        selected[access.access_id] = (access, path)
-    return selected, tuple(sorted(ambiguous))
-
-
 def _validate_consumer_path(
     path_operations: tuple[Mapping[str, Any], ...],
     *,
@@ -4167,7 +5623,9 @@ def _validate_consumer_path(
         if op_name not in _CONSUMER_EXTENSION_OPS:
             return (
                 "consumer-domain provenance crosses unsupported J op "
-                f"{op_name!r}"
+                f"{op_name!r}; a node-bound access is consumer-local: "
+                "use node_ref=null for one shared physical load, or author "
+                "distinct access/effect rows for distinct Source loads"
             )
         if op_name != "pad":
             continue
@@ -4176,7 +5634,8 @@ def _validate_consumer_path(
         result_type = _explicit_type(operation)
         if (
             not isinstance(attrs, Mapping)
-            or set(attrs) != {"lo", "hi", "value"}
+            or not _PAD_REQUIRED_ATTRS.issubset(attrs)
+            or set(attrs) - _PAD_ATTRS
             or not isinstance(operands, list)
             or len(operands) != 1
             or result_type is None
@@ -4250,15 +5709,10 @@ def _check_consumer_extensions(
     node_operations: Mapping[str, Mapping[str, Any]],
     diagnostics: list[TypeCheckDiagnostic],
 ) -> None:
-    """Check v4's unique per-consumer outside-domain authority."""
+    """Check the unique per-consumer outside-domain authority."""
 
     value_types = j_elaboration(j).value_type_by_name
     accesses = {item.access_id: item for item in j.boundary.accesses}
-    legacy_masked_reductions = {
-        item.node_ref
-        for item in j.boundary.reductions
-        if item.masked_contribution is not None
-    }
     declared = {
         (item.consumer_ref, item.operand_index, item.access_ref): item
         for item in j.boundary.consumer_extensions
@@ -4326,6 +5780,8 @@ def _check_consumer_extensions(
         operand_type = value_types.get(operand)
         if (
             operand_type is None
+            or not operand_type.is_tensor
+            or operand_type.dtype is None
             or extension.outside.dtype.casefold() != operand_type.dtype.casefold()
         ):
             diagnostics.append(
@@ -4336,7 +5792,7 @@ def _check_consumer_extensions(
                     extension.outside.dtype,
                 )
             )
-        if not _is_consumer_identity(
+        if not is_consumer_reduction_identity(
             str(fn), extension.outside.dtype, extension.outside.value
         ):
             diagnostics.append(
@@ -4358,21 +5814,25 @@ def _check_consumer_extensions(
                 )
             )
             continue
-        candidates, ambiguous = _consumer_extension_candidates(j, operand=operand)
-        selected = candidates.get(extension.access_ref)
-        if selected is None or access.tensor in ambiguous:
+        found, selected_path = _consumer_dependency_path(
+            j,
+            operand=operand,
+            access_node_ref=access.node_ref,
+            access_tensor=access.tensor,
+        )
+        if not found:
             diagnostics.append(
                 TypeCheckDiagnostic(
                     TypeCheckErrorCode.CONSUMER_EXTENSION_INVALID,
                     f"{path}.access_ref",
-                    "access provenance does not unambiguously reach this "
-                    "consumer operand",
+                    "selected access provenance does not reach this consumer "
+                    "operand",
                     extension.access_ref,
                 )
             )
             continue
         path_issue = _validate_consumer_path(
-            selected[1],
+            selected_path,
             outside_value=extension.outside.value,
             outside_dtype=extension.outside.dtype,
         )
@@ -4383,16 +5843,6 @@ def _check_consumer_extensions(
                     f"{path}.access_ref",
                     path_issue,
                     extension.access_ref,
-                )
-            )
-        if extension.consumer_ref in legacy_masked_reductions:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.CONSUMER_EXTENSION_INVALID,
-                    path,
-                    "masked_contribution and consumer extension are duplicate "
-                    "authorities",
-                    extension.consumer_ref,
                 )
             )
 
@@ -4408,407 +5858,6 @@ def _check_consumer_extensions(
         )
 
 
-def _check_loop_carriers(
-    pi: RealizationWitness,
-    node_operations: Mapping[str, Mapping[str, Any]],
-    anchors: Mapping[str, _Anchor],
-    instance_anchors: Mapping[str, _Anchor],
-    diagnostics: list[TypeCheckDiagnostic],
-) -> None:
-    """Check explicit physical loop-carrier slots without temporal DAG edges."""
-
-    regions = {str(item["id"]): item for item in pi.regions}
-    instances = {str(item["id"]): item for item in pi.instances}
-    route_edges = {
-        (str(item["source"]), str(item["target"])) for item in pi.routes
-    }
-    iteration_by_region = {
-        str(item["region"]): str(item["loop_instance"])
-        for item in pi.iterations
-    }
-    observable_mechanisms = {
-        "transfer_direct",
-        "transfer_async",
-        "update_atomic",
-        "update_privatized",
-        "synchronize",
-    }
-    outgoing: dict[str, set[str]] = {instance_id: set() for instance_id in instances}
-    for source, target in route_edges:
-        outgoing.setdefault(source, set()).add(target)
-
-    def ancestor_regions(region_ref: str) -> tuple[str, ...]:
-        result: list[str] = []
-        parent = regions.get(region_ref, {}).get("parent")
-        while parent is not None:
-            parent_ref = str(parent)
-            result.append(parent_ref)
-            parent = regions.get(parent_ref, {}).get("parent")
-        return tuple(result)
-
-    def reaches_observable_consumer(state_instance: str) -> bool:
-        pending = list(outgoing.get(state_instance, ()))
-        visited: set[str] = set()
-        while pending:
-            current = pending.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            instance = instances.get(current)
-            if (
-                instance is not None
-                and instance.get("mechanism") in observable_mechanisms
-            ):
-                return True
-            pending.extend(outgoing.get(current, ()))
-        return False
-
-    carry_owner: dict[str, tuple[str, int, Mapping[str, Any]]] = {}
-    for loop_ref, operation in node_operations.items():
-        if not re.fullmatch(r"n[0-9]+", loop_ref) or operation.get("op") != "loop":
-            continue
-        raw_carries = operation.get("carry")
-        if not isinstance(raw_carries, list):
-            continue
-        carries = [item for item in raw_carries if isinstance(item, Mapping)]
-        for ordinal, carry in enumerate(carries):
-            for key in ("state_id", "body_argument", "next_value", "result_value"):
-                ref = carry.get(key)
-                if isinstance(ref, str):
-                    carry_owner[ref] = (loop_ref, ordinal, carry)
-
-    state_slots: set[str] = set()
-    result_slots: set[str] = set()
-    claimed_j_carries: set[tuple[str, int]] = set()
-    last_j_carry_ordinal: dict[tuple[str, str], int] = {}
-    allowed_kinds = {
-        "signature", "tensor", "loop_state", "value", "node", "access",
-    }
-
-    for ordinal, relation in enumerate(pi.loop_carriers):
-        base = f"pi.loop_carriers[{ordinal}]"
-        region_ref = str(relation["region"])
-        region = regions.get(region_ref)
-        ancestors = ancestor_regions(region_ref)
-        if region is None or region.get("placement") != "loop":
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.region",
-                    "loop carrier requires one placement=loop region",
-                    region_ref,
-                )
-            )
-
-        loop_instance_ref = str(relation["loop_instance"])
-        loop_instance = instances.get(loop_instance_ref)
-        loop_semantic_ref = (
-            str(loop_instance["semantic_ref"])
-            if loop_instance is not None
-            else ""
-        )
-        loop_operation = node_operations.get(loop_semantic_ref)
-        loop_region = str(loop_instance.get("region", "")) if loop_instance else ""
-        if (
-            loop_operation is None
-            or loop_operation.get("op") != "loop"
-            or loop_region not in {region_ref, *ancestors}
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.loop_instance",
-                    "loop_instance must visibly anchor one structured J loop",
-                    loop_instance_ref,
-                )
-            )
-        expected_iteration_loop = iteration_by_region.get(region_ref)
-        if (
-            expected_iteration_loop is not None
-            and expected_iteration_loop != loop_instance_ref
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.loop_instance",
-                    "loop carrier and iteration relation disagree for this region",
-                    loop_instance_ref,
-                )
-            )
-
-        role_ids = {
-            role: str(relation[role])
-            for role in ("init", "state", "next", "result")
-        }
-        state_id = role_ids["state"]
-        result_id = role_ids["result"]
-        if state_id in state_slots:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.state",
-                    "loop carrier state slots must be unique",
-                    state_id,
-                )
-            )
-        if result_id in result_slots:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.result",
-                    "loop carrier result slots must be unique",
-                    result_id,
-                )
-            )
-        state_slots.add(state_id)
-        result_slots.add(result_id)
-
-        role_instances = {role: instances.get(ref) for role, ref in role_ids.items()}
-        init_region = (
-            str(role_instances["init"].get("region"))
-            if role_instances["init"] is not None else ""
-        )
-        state_region = (
-            str(role_instances["state"].get("region"))
-            if role_instances["state"] is not None else ""
-        )
-        next_region = (
-            str(role_instances["next"].get("region"))
-            if role_instances["next"] is not None else ""
-        )
-        result_region = (
-            str(role_instances["result"].get("region"))
-            if role_instances["result"] is not None else ""
-        )
-        direct_parent = (
-            str(region.get("parent"))
-            if region and region.get("parent") is not None
-            else ""
-        )
-        if init_region not in ancestors:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.init",
-                    "init must be visible from a strict ancestor region",
-                    role_ids["init"],
-                )
-            )
-        if state_region != region_ref or next_region != region_ref:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.state",
-                    "state and next must be instances in the exact loop region",
-                    f"{role_ids['state']}:{role_ids['next']}",
-                )
-            )
-        if not direct_parent or result_region != direct_parent:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.result",
-                    "result must be an instance in the loop region's direct parent",
-                    role_ids["result"],
-                )
-            )
-
-        role_anchors = {
-            role: instance_anchors.get(ref) for role, ref in role_ids.items()
-        }
-        typed_keys: list[tuple[str, int, str]] = []
-        for role, anchor in role_anchors.items():
-            if (
-                anchor is None
-                or anchor.owner != "j"
-                or anchor.kind not in allowed_kinds
-                or anchor.value_type is None
-                or anchor.carrier_class not in {"pointer", "value"}
-            ):
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                        f"{base}.{role}",
-                        "carrier role must anchor a typed J carrier, not C/domain/"
-                        "scope/storage/effect/authorization/absent opaque",
-                        role_ids[role],
-                    )
-                )
-                continue
-            instance = role_instances[role]
-            semantic_ref = (
-                str(instance.get("semantic_ref")) if instance is not None else ""
-            )
-            if anchor.kind == "node":
-                operation = node_operations.get(semantic_ref)
-                if operation is None or len(
-                    _operation_results(operation.get("result"))
-                ) != 1:
-                    diagnostics.append(
-                        TypeCheckDiagnostic(
-                            TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                            f"{base}.{role}",
-                            "node carrier roles require one unambiguous typed result",
-                            role_ids[role],
-                        )
-                    )
-                    continue
-            typed_keys.append(
-                (
-                    anchor.value_type.dtype.casefold(),
-                    anchor.value_type.rank,
-                    anchor.carrier_class,
-                )
-            )
-        if typed_keys and len(set(typed_keys)) != 1:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    base,
-                    "init/state/next/result dtype, rank, and carrier class must match",
-                    state_id,
-                )
-            )
-
-        if (role_ids["init"], state_id) not in route_edges:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.init",
-                    "ordinary pi routes must contain init -> state",
-                    role_ids["init"],
-                )
-            )
-        if state_id == role_ids["next"]:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.next",
-                    "state and next must be distinct temporal occurrences; they may "
-                    "still anchor the same J semantic value",
-                    role_ids["next"],
-                )
-            )
-        elif (state_id, role_ids["next"]) not in route_edges:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.next",
-                    "ordinary pi routes must contain state -> next",
-                    role_ids["next"],
-                )
-            )
-        if not reaches_observable_consumer(state_id):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    f"{base}.state",
-                    "loop state must reach an observable realization consumer",
-                    state_id,
-                )
-            )
-
-        state_instance = role_instances["state"]
-        state_semantic_ref = (
-            str(state_instance.get("semantic_ref"))
-            if state_instance is not None else ""
-        )
-        carry_match = carry_owner.get(state_semantic_ref)
-        touched_carries = {
-            carry_owner[str(instance.get("semantic_ref"))][:2]
-            for instance in role_instances.values()
-            if instance is not None
-            and str(instance.get("semantic_ref")) in carry_owner
-        }
-        if carry_match is None and touched_carries:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                    base,
-                    "a relation touching J carry members must use that carry's "
-                    "state slot as its state role",
-                    state_id,
-                )
-            )
-        if carry_match is not None:
-            carry_loop_ref, carry_ordinal, carry = carry_match
-            claim = (carry_loop_ref, carry_ordinal)
-            if state_semantic_ref not in {
-                str(carry.get("state_id", "")),
-                str(carry.get("body_argument", "")),
-            }:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                        f"{base}.state",
-                        "state role may reuse only the J carry state slot or "
-                        "current-iteration body argument",
-                        state_semantic_ref,
-                    )
-                )
-            if carry_loop_ref != loop_semantic_ref:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                        f"{base}.state",
-                        "J carry state belongs to a different structured loop",
-                        state_semantic_ref,
-                    )
-                )
-            if claim in claimed_j_carries:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                        f"{base}.state",
-                        "one J carry ordinal cannot be duplicated as a second "
-                        "accumulator",
-                        state_semantic_ref,
-                    )
-                )
-            claimed_j_carries.add(claim)
-            ordinal_key = (region_ref, carry_loop_ref)
-            previous_ordinal = last_j_carry_ordinal.get(ordinal_key)
-            if previous_ordinal is not None and carry_ordinal <= previous_ordinal:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                        base,
-                        "declaration-ordered physical carrier ordinals must "
-                        "preserve J carry ordinal order",
-                        state_semantic_ref,
-                    )
-                )
-            last_j_carry_ordinal[ordinal_key] = carry_ordinal
-            role_semantics = {
-                role: (
-                    str(instance.get("semantic_ref"))
-                    if instance is not None else ""
-                )
-                for role, instance in role_instances.items()
-            }
-            init_value = carry.get("init_value")
-            expected_init = (
-                str(init_value)
-                if isinstance(init_value, str) and init_value in anchors
-                else str(carry.get("state_id", ""))
-            )
-            expected = {
-                "init": expected_init,
-                "next": str(carry.get("next_value", "")),
-                "result": str(carry.get("result_value", "")),
-            }
-            for role, expected_ref in expected.items():
-                if role_semantics[role] == expected_ref:
-                    continue
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.LOOP_CARRIER_INVALID,
-                        f"{base}.{role}",
-                        "physical slot must reuse the corresponding J carry "
-                        "init/next/result instead of encoding a second accumulator",
-                        role_ids[role],
-                    )
-                )
 
 
 def _check_signature_mode_partition(
@@ -4817,7 +5866,18 @@ def _check_signature_mode_partition(
     """Require the authored ABI mode to match J's logical boundary partition."""
 
     input_refs = {tensor.name for tensor in j.intent.inputs}
-    output_refs = {tensor.name for tensor in j.intent.outputs}
+    try:
+        output_refs = {
+            binding.output
+            for binding in j_elaboration(
+                canonicalize_semantic_archive(j)
+            ).output_bindings
+        }
+    except (TypeError, ValueError, IndexError, KeyError):
+        # This precheck runs before the main canonicalization pass.  A
+        # malformed surface archive may therefore only provide a diagnostic
+        # declaration view; strict admission remains owned by the later pass.
+        output_refs = {tensor.name for tensor in j.intent.outputs}
     diagnostics: list[TypeCheckDiagnostic] = []
     for index, parameter in enumerate(j.signature.parameters):
         ref = parameter.logical_ref
@@ -4860,8 +5920,18 @@ def _check_fresh_inout_boundary_closure(
     boundary effects.
     """
 
-    returns = {item.output for item in j.intent.returns}
-    mappings = {item.output for item in j.boundary.output_mappings}
+    try:
+        returns = {
+            binding.output
+            for binding in j_elaboration(
+                canonicalize_semantic_archive(j)
+            ).output_bindings
+        }
+    except (TypeError, ValueError, IndexError, KeyError):
+        # This check intentionally runs before canonicalization so it can
+        # report an authored inout omission.  The raw return names are only a
+        # diagnostic fallback for a surface J that cannot yet elaborate.
+        returns = {item.output for item in j.intent.returns}
     for index, parameter in enumerate(j.signature.parameters):
         logical_ref = parameter.logical_ref
         if parameter.mode is not ParameterMode.INOUT or logical_ref is None:
@@ -4901,8 +5971,8 @@ def _check_fresh_inout_boundary_closure(
             missing.append("post-state store")
         elif not write_effects:
             missing.append("store-bound write effect")
-        if logical_ref not in returns and logical_ref not in mappings:
-            missing.append("canonical output binding")
+        if logical_ref not in returns:
+            missing.append("canonical return binding")
         if not missing:
             continue
         diagnostics.append(
@@ -4916,74 +5986,6 @@ def _check_fresh_inout_boundary_closure(
         )
 
 
-def _check_transfer_address_routes(
-    j: SemanticArchive,
-    pi: RealizationWitness,
-    diagnostics: list[TypeCheckDiagnostic],
-) -> None:
-    """Require every direct/async access transfer to consume its tensor carrier.
-
-    This is a dependent reference check, not address synthesis.  It does not
-    choose address stages or their arithmetic; it only rejects a transfer whose
-    authored route graph is disconnected from every signature carrier bound to
-    that exact boundary tensor.
-    """
-
-    access_by_id = {item.access_id: item for item in j.boundary.accesses}
-    pointer_parameters_by_tensor: dict[str, set[str]] = {}
-    for parameter in j.signature.parameters:
-        if (
-            parameter.kind in {ParameterKind.POINTER, ParameterKind.TENSOR}
-            and isinstance(parameter.logical_ref, str)
-        ):
-            pointer_parameters_by_tensor.setdefault(
-                parameter.logical_ref, set()
-            ).add(parameter.name)
-
-    instances = {str(item["id"]): item for item in pi.instances}
-    adjacency: dict[str, set[str]] = {instance_id: set() for instance_id in instances}
-    for route in pi.routes:
-        adjacency.setdefault(str(route["source"]), set()).add(str(route["target"]))
-
-    def reaches(source: str, target: str) -> bool:
-        pending = [source]
-        visited: set[str] = set()
-        while pending:
-            current = pending.pop()
-            if current == target:
-                return True
-            if current in visited:
-                continue
-            visited.add(current)
-            pending.extend(adjacency.get(current, ()))
-        return False
-
-    for index, item in enumerate(pi.instances):
-        if item["mechanism"] not in {"transfer_direct", "transfer_async"}:
-            continue
-        access = access_by_id.get(str(item["semantic_ref"]))
-        if access is None:
-            continue
-        carrier_names = pointer_parameters_by_tensor.get(access.tensor, set())
-        carrier_instances = {
-            instance_id
-            for instance_id, instance in instances.items()
-            if str(instance["semantic_ref"]) in carrier_names
-        }
-        target = str(item["id"])
-        if carrier_instances and any(
-            reaches(source, target) for source in carrier_instances
-        ):
-            continue
-        diagnostics.append(
-            TypeCheckDiagnostic(
-                TypeCheckErrorCode.TRANSFER_ADDRESS_ROUTE_MISSING,
-                f"pi.instances[{index}]",
-                "direct/async boundary transfer requires an authored route path "
-                "from a pointer/tensor signature carrier bound to the same J tensor",
-                target,
-            )
-        )
 
 
 def _check_program_axes(
@@ -4993,144 +5995,41 @@ def _check_program_axes(
     *,
     required: bool,
 ) -> None:
-    """Check the closed pi domain-to-launch-axis realization identity."""
+    """Check the canonical pi domain-to-launch-axis mapping."""
 
-    domains = set(j.boundary.domains)
-    if pi.wire_schema == NORMALIZATION_WITNESS_SCHEMA:
-        for index, item in enumerate(pi.program_axes):
-            domain_ref = str(item["domain_ref"])
-            if domain_ref not in domains:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
-                        f"pi.program_axes[{index}].domain_ref",
-                        "compact program-axis binding must name a declared J boundary domain",
-                        domain_ref,
-                    )
-                )
-        # Compact pi is a normalization witness, not a complete realization
-        # graph.  Missing rows remain hard at Gate1; TypeCheck never invents
-        # them or requires a legacy instance/route proof.
-        return
-    regions = {
-        str(item["id"]): item for item in pi.regions
-    }
-    program_regions = {
-        region_id
-        for region_id, item in regions.items()
-        if item.get("placement") == "program"
-    }
-    instances = {
-        str(item["id"]): item for item in pi.instances
-    }
-    address_bases = {
-        instance_id
-        for instance_id, item in instances.items()
-        if item.get("mechanism") == "address_base"
-    }
-    branch_regions = {
-        region_id
-        for region_id, item in regions.items()
-        if item.get("placement") == "branch"
-    }
-
-    def region_is_within_branch(region_ref: str) -> bool:
-        current: str | None = region_ref
-        seen: set[str] = set()
-        while current is not None and current not in seen:
-            if current in branch_regions:
-                return True
-            seen.add(current)
-            parent = regions.get(current, {}).get("parent")
-            current = str(parent) if parent is not None else None
-        return False
-
-    outgoing: dict[str, set[str]] = {instance_id: set() for instance_id in instances}
-    program_domain_branch_sources: set[str] = set()
-    for route in pi.routes:
-        source = str(route["source"])
-        target = str(route["target"])
-        outgoing.setdefault(source, set()).add(target)
-        target_instance = instances.get(target)
-        source_instance = instances.get(source)
-        if (
-            not route["slots"]
-            and target_instance is not None
-            and source_instance is not None
-            and source_instance.get("mechanism") == "realize"
-            and source_instance.get("region") in program_regions
-            and source_instance.get("semantic_ref") in domains
-            and region_is_within_branch(str(target_instance.get("region")))
-        ):
-            program_domain_branch_sources.add(source)
-
-    def reaches_address_base(source: str) -> bool:
-        pending = [source]
-        visited: set[str] = set()
-        while pending:
-            current = pending.pop()
-            if current in address_bases:
-                return True
-            if current in visited:
-                continue
-            visited.add(current)
-            pending.extend(outgoing.get(current, ()))
-        return False
-
-    authorized = {
-        str(item["semantic_ref"])
-        for instance_id, item in instances.items()
-        if item.get("mechanism") == "realize"
-        and item.get("region") in program_regions
-        and item.get("semantic_ref") in domains
-        and (
-            reaches_address_base(instance_id)
-            or instance_id in program_domain_branch_sources
+    try:
+        projection = canonical_program_coordinate_projection(pi)
+    except ProgramCoordinateProjectionError as exc:
+        diagnostics.append(
+            TypeCheckDiagnostic(
+                TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
+                "pi.program_axes" if pi.program_axes else "pi.program_bindings",
+                f"canonical program mapping is invalid: {exc}",
+            )
         )
-    }
-    bound = {str(item["domain_ref"]) for item in pi.program_axes}
-    for index, item in enumerate(pi.program_axes):
-        domain_ref = str(item["domain_ref"])
-        if domain_ref not in domains:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
-                    f"pi.program_axes[{index}].domain_ref",
-                    "program-axis binding must name a declared J boundary domain",
-                    domain_ref,
-                )
+        return
+
+    declared_domains = set(j.boundary.domains)
+    bound_domains = {domain_ref for domain_ref, _axis in projection.domain_to_axis}
+    for domain_ref in sorted(bound_domains - declared_domains):
+        diagnostics.append(
+            TypeCheckDiagnostic(
+                TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
+                "pi.program_axes"
+                if projection.family == "program_axes"
+                else "pi.program_bindings",
+                "program mapping must name a declared J boundary domain",
+                domain_ref,
             )
-        elif domain_ref not in authorized:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
-                    f"pi.program_axes[{index}].domain_ref",
-                    "program-axis binding requires a program-region domain realize "
-                    "path that reaches address_base or controls a branch region",
-                    domain_ref,
-                )
+        )
+    if required and not bound_domains:
+        diagnostics.append(
+            TypeCheckDiagnostic(
+                TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
+                "pi.program_axes",
+                "the requested launch mapping has no bound J boundary domain",
             )
-    if required:
-        for domain_ref in sorted(authorized - bound):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
-                    "pi.program_axes",
-                    "every authored program-coordinate domain requires one explicit "
-                    "physical launch-axis binding",
-                    domain_ref,
-                )
-            )
-        for domain_ref in sorted(bound - authorized):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_AXIS_BINDING_INVALID,
-                    "pi.program_axes",
-                    "program-axis bindings must equal the authored program-coordinate "
-                    "domain set",
-                    domain_ref,
-                )
-            )
+        )
 
 
 def _check_normalization_bindings(
@@ -5151,15 +6050,120 @@ def _check_normalization_bindings(
     if pi.wire_schema != NORMALIZATION_WITNESS_SCHEMA:
         return
 
-    def reject(path: str, detail: str, ref: str | None = None) -> None:
+    elaboration = j_elaboration(j)
+    boundary_accesses = {
+        access.access_id: access for access in j.boundary.accesses
+    }
+    signature_parameters = {
+        parameter.name: parameter for parameter in j.signature.parameters
+    }
+    tensor_ranks = {
+        tensor.name: len(tensor.shape)
+        for tensor in [*j.intent.inputs, *j.intent.outputs]
+    }
+    logical_value_types = elaboration.value_type_by_name
+
+    def zero_lower_bound_coordinates(access_ref: str) -> frozenset[str]:
+        # π and Gate1 share this exact J-only dense-domain certificate.  The
+        # access predicate may carry only the upper mask; the zero lower bound
+        # is owned by its explicit canonical J domain.
+        return zero_lower_bound_coordinates_from_j(j, access_ref)
+
+    def reject(
+        path: str,
+        detail: str,
+        ref: str | None = None,
+        *,
+        code: TypeCheckErrorCode = TypeCheckErrorCode.PI_NORMALIZATION_BINDING_INVALID,
+    ) -> None:
         diagnostics.append(
             TypeCheckDiagnostic(
-                TypeCheckErrorCode.PI_NORMALIZATION_BINDING_INVALID,
+                code,
                 path,
                 detail,
                 ref,
             )
         )
+
+    seen_normalization_classes: set[str] = set()
+    for class_index, normalization_class in enumerate(pi.normalization_classes):
+        class_path = f"pi.normalization_classes[{class_index}]"
+        class_name = normalization_class.get("name")
+        class_scope = normalization_class.get("scope")
+        expected_scope = NORMALIZATION_CLASS_SCOPES.get(str(class_name))
+        if expected_scope is None:
+            reject(
+                f"{class_path}.name",
+                "normalization class is not in the closed Gate1 class set",
+                str(class_name),
+            )
+            continue
+        if class_name in seen_normalization_classes:
+            reject(
+                f"{class_path}.name",
+                "one normalization class may be declared only once",
+                str(class_name),
+            )
+        seen_normalization_classes.add(str(class_name))
+        if class_scope != expected_scope:
+            reject(
+                f"{class_path}.scope",
+                f"normalization class {class_name!r} requires scope "
+                f"{expected_scope!r}",
+                str(class_scope),
+            )
+            continue
+        if class_name == "default_zero_lower_bound":
+            predicated_accesses = {
+                access.access_id
+                for access in j.boundary.accesses
+                if access.predicate is not None
+            }
+            if not predicated_accesses:
+                reject(
+                    f"{class_path}.scope",
+                    "default_zero_lower_bound has no predicated J access to cover",
+                )
+                continue
+            uncovered = sorted(
+                access_ref
+                for access_ref in predicated_accesses
+                if not zero_lower_bound_coordinates(access_ref)
+            )
+            if uncovered:
+                reject(
+                    f"{class_path}.name",
+                    "default_zero_lower_bound must cover every predicated J "
+                    "access with a J-proven zero lower bound and finite upper "
+                    f"bound; uncovered accesses: {', '.join(uncovered)}",
+                    str(class_name),
+                )
+        elif class_name == "closed_consumer_identity":
+            extensions = closed_consumer_identity_extensions(j, pi)
+            expected = len(j.boundary.consumer_extensions)
+            if not expected:
+                reject(
+                    f"{class_path}.scope",
+                    "closed_consumer_identity has no consumer extension to cover",
+                    str(class_name),
+                )
+            elif len(extensions) != expected:
+                reject(
+                    f"{class_path}.name",
+                    "closed_consumer_identity must cover every consumer extension "
+                    "with a fixed J-proven producer mapping",
+                    str(class_name),
+                )
+        elif class_name == PER_PROGRAM_SCALAR_KEEPDIMS_CLASS:
+            reductions = per_program_scalar_keepdims_reductions(j, pi)
+            if not reductions:
+                reject(
+                    f"{class_path}.name",
+                    "per_program_scalar_keepdims requires every keepdims reduce "
+                    "to be the J-proven rank-2 rowwise form with one directly "
+                    "mapped retained program domain",
+                    str(class_name),
+                )
 
     def check_axis(subject_ref: str, axis_ref: int | str, path: str) -> bool:
         anchor = anchors.get(subject_ref)
@@ -5170,16 +6174,39 @@ def _check_normalization_bindings(
         if axis_ref not in allowed:
             reject(
                 path,
-                "pi axis_ref is outside AxisRefs_v1(J,subject_ref)",
+                "pi axis_ref is outside AxisRefs_v1(J,subject_ref); "
+                f"allowed axis_ref values are {sorted(allowed, key=lambda item: (str(type(item)), str(item)))}",
                 str(axis_ref),
             )
             return False
         return True
 
     claimed_program_axes: set[tuple[str, int | str]] = set()
+    claimed_physical_axes: set[int] = set()
+    physical_axis_by_domain: dict[str, int] = {}
     for binding_index, binding in enumerate(pi.program_bindings):
         relation = str(binding["relation"])
         axes = binding["logical_axes"]
+        physical_axis = binding.get("axis")
+        binding_path = f"pi.program_bindings[{binding_index}]"
+        if (
+            isinstance(physical_axis, bool)
+            or not isinstance(physical_axis, int)
+            or not 0 <= physical_axis <= 2
+        ):
+            reject(
+                f"{binding_path}.axis",
+                "program binding requires one physical launch axis in [0, 2]",
+                str(physical_axis),
+            )
+            continue
+        if physical_axis in claimed_physical_axes:
+            reject(
+                f"{binding_path}.axis",
+                "one program binding is permitted for each physical launch axis",
+                str(physical_axis),
+            )
+        claimed_physical_axes.add(physical_axis)
         if relation == "direct" and len(axes) != 1:
             reject(
                 f"pi.program_bindings[{binding_index}].logical_axes",
@@ -5206,8 +6233,18 @@ def _check_normalization_bindings(
             if key in claimed_program_axes:
                 reject(path, "one logical J axis cannot have two program bindings", domain_ref)
             claimed_program_axes.add(key)
+            previous_physical_axis = physical_axis_by_domain.setdefault(
+                domain_ref, physical_axis
+            )
+            if previous_physical_axis != physical_axis:
+                reject(
+                    path,
+                    "one J program domain cannot map to multiple physical launch axes",
+                    domain_ref,
+                )
 
     slots = {slot.name: slot for slot in c.slots}
+    iteration_tile_slot_refs: set[str] = set()
     for binding_index, binding in enumerate(pi.iteration_bindings):
         path = f"pi.iteration_bindings[{binding_index}]"
         relation = str(binding["relation"])
@@ -5219,6 +6256,14 @@ def _check_normalization_bindings(
             axis_path = f"{path}.logical_axes[{axis_index}]"
             if check_axis(subject_ref, axis_ref, f"{axis_path}.axis_ref"):
                 valid_axis_keys.add((subject_ref, axis_ref))
+                logical_axis_key = (subject_ref, axis_ref)
+                if logical_axis_key in claimed_program_axes:
+                    reject(
+                        axis_path,
+                        "one logical J axis cannot be both a direct program "
+                        "binding and a tiled iteration binding",
+                        f"{subject_ref}:{axis_ref}",
+                    )
             anchor = anchors.get(subject_ref)
             if relation == "tiled_domain" and (
                 anchor is None or anchor.kind != "domain"
@@ -5248,19 +6293,42 @@ def _check_normalization_bindings(
                     "iteration tile_slot must have a closed tile_extent role",
                     tile_slot_ref,
                 )
-            attachment = (tile_slot.subject_ref, tile_slot.axis_ref)
-            if attachment not in valid_axis_keys:
+            if tile_slot.kind is not ScheduleSlotKind.CONSTEXPR:
                 reject(
                     f"{path}.tile_slot",
-                    "iteration tile_slot must be attached to one authored logical axis",
+                    "iteration tile_slot must reference a constexpr C slot",
                     tile_slot_ref,
                 )
+            if tile_slot_ref in iteration_tile_slot_refs:
+                reject(
+                    f"{path}.tile_slot",
+                    "one C tile slot cannot be reused by multiple iteration bindings",
+                    tile_slot_ref,
+                )
+            iteration_tile_slot_refs.add(tile_slot_ref)
         mode_slot_ref = binding["mode_slot"]
         if mode_slot_ref is not None and str(mode_slot_ref) not in slots:
             reject(
                 f"{path}.mode_slot",
                 "iteration mode_slot is not declared by C",
                 str(mode_slot_ref),
+            )
+
+    for index, slot in enumerate(c.slots):
+        if slot.role not in _ITERATION_TILE_ROLES:
+            continue
+        path = f"c.slots[{index}]"
+        if slot.kind is not ScheduleSlotKind.CONSTEXPR:
+            reject(
+                f"{path}.kind",
+                "a C tile role must be declared on a constexpr slot",
+                slot.name,
+            )
+        if slot.name not in iteration_tile_slot_refs:
+            reject(
+                path,
+                "a C tile role must be consumed by pi.iteration_bindings",
+                slot.name,
             )
 
     for index, binding in enumerate(pi.control_bindings):
@@ -5291,8 +6359,11 @@ def _check_normalization_bindings(
                 value_ref,
             )
 
+    seen_access_axes: dict[tuple[str, int], str] = {}
+    seen_access_carriers: set[tuple[str, str, int]] = set()
     for index, binding in enumerate(pi.access_representation_bindings):
         access_ref = str(binding["access_ref"])
+        relation = str(binding["relation"])
         anchor = anchors.get(access_ref)
         if anchor is None or anchor.owner != "j" or anchor.kind != "access":
             reject(
@@ -5300,56 +6371,122 @@ def _check_normalization_bindings(
                 "access representation binding must name a declared J access",
                 access_ref,
             )
+            continue
+        access = boundary_accesses.get(access_ref)
+        if access is None:
+            # The anchor table and Boundary must agree, but retain an explicit
+            # fail-closed diagnostic if a malformed caller bypasses construction.
+            reject(
+                f"pi.access_representation_bindings[{index}].access_ref",
+                "access representation binding lacks its J boundary declaration",
+                access_ref,
+            )
+            continue
+        if relation == "guard_lower_bound_elided" and not zero_lower_bound_coordinates(
+            access_ref
+        ):
+            reject(
+                f"pi.access_representation_bindings[{index}].access_ref",
+                "guard_lower_bound_elided requires an exact access-local J "
+                "domain-coordinate lower bound of zero",
+                access_ref,
+            )
+        if relation == "boolean_storage_byte":
+            value_type = logical_value_types.get(access.tensor)
+            if (
+                value_type is None
+                or not value_type.is_tensor
+                or value_type.dtype is None
+                or value_type.dtype.casefold() not in {"bool", "i1"}
+            ):
+                reject(
+                    f"pi.access_representation_bindings[{index}].access_ref",
+                    "boolean_storage_byte requires a logical boolean J tensor",
+                    access_ref,
+                )
+        carrier_ref = binding.get("carrier_ref")
+        axis_ref = binding.get("axis_ref")
+        if relation in {"address_recomputed", "pointer_advanced"}:
+            if not isinstance(carrier_ref, str) or not re.fullmatch(
+                r"p[0-9]+", carrier_ref
+            ):
+                reject(
+                    f"pi.access_representation_bindings[{index}].carrier_ref",
+                    "address representation requires one p* ABI carrier",
+                    str(carrier_ref),
+                )
+            else:
+                parameter = signature_parameters.get(carrier_ref)
+                if (
+                    parameter is None
+                    or parameter.kind is not ParameterKind.SCALAR
+                    or parameter.mode is not ParameterMode.VALUE
+                    or parameter.logical_ref is not None
+                ):
+                    observed_binding = (
+                        "missing"
+                        if parameter is None
+                        else (
+                            f"kind={parameter.kind.value!r}, "
+                            f"mode={parameter.mode.value!r}, "
+                            f"logical_ref={parameter.logical_ref!r}"
+                        )
+                    )
+                    reject(
+                        f"pi.access_representation_bindings[{index}].carrier_ref",
+                        "address representation carrier must be a null-logical-ref "
+                        f"scalar parameter (actual {observed_binding})",
+                        carrier_ref,
+                    )
+            if (
+                isinstance(axis_ref, bool)
+                or not isinstance(axis_ref, int)
+                or axis_ref < 0
+            ):
+                reject(
+                    f"pi.access_representation_bindings[{index}].axis_ref",
+                    "address representation axis_ref must be a non-negative integer",
+                    str(axis_ref),
+                )
+            elif axis_ref >= tensor_ranks.get(access.tensor, 0):
+                reject(
+                    f"pi.access_representation_bindings[{index}].axis_ref",
+                    "address representation axis_ref exceeds the access tensor rank",
+                    str(axis_ref),
+                )
+            if isinstance(carrier_ref, str) and isinstance(axis_ref, int) and not isinstance(axis_ref, bool):
+                access_axis = (access_ref, axis_ref)
+                previous_carrier = seen_access_axes.get(access_axis)
+                if (
+                    previous_carrier is not None
+                    and previous_carrier != carrier_ref
+                ):
+                    reject(
+                        f"pi.access_representation_bindings[{index}]",
+                        "one J access axis cannot have conflicting representation "
+                        "carriers; preserve one Source-authored carrier or split "
+                        "the access occurrence before binding it",
+                        access_ref,
+                        code=TypeCheckErrorCode.ACCESS_REPRESENTATION_INVALID,
+                    )
+                else:
+                    seen_access_axes[access_axis] = carrier_ref
+                key = (access_ref, carrier_ref, axis_ref)
+                if key in seen_access_carriers:
+                    reject(
+                        f"pi.access_representation_bindings[{index}]",
+                        "one address carrier/axis occurrence may be bound only once",
+                        access_ref,
+                    )
+                seen_access_carriers.add(key)
+        elif carrier_ref is not None or axis_ref is not None:
+            reject(
+                f"pi.access_representation_bindings[{index}]",
+                "carrier_ref/axis_ref are only valid for address relations",
+                access_ref,
+            )
 
 
-def _check_program_coordinate_maps(
-    j: SemanticArchive,
-    pi: RealizationWitness,
-    diagnostics: list[TypeCheckDiagnostic],
-) -> None:
-    """Check closed mixed-radix and program-block realization relations."""
-
-    domains = set(j.boundary.domains)
-    dimensions = _declared_dimensions(j)
-    bound_domains = {str(item["domain_ref"]) for item in pi.program_axes}
-    for index, relation in enumerate(pi.program_linearizations):
-        base = f"pi.program_linearizations[{index}]"
-        domain_ref = str(relation["domain_ref"])
-        dimension_refs = tuple(str(item) for item in relation["dimension_refs"])
-        domain_dimensions = (
-            set(re.findall(r"x[0-9]+", str(j.boundary.domains[domain_ref])))
-            if domain_ref in domains
-            else set()
-        )
-        if domain_ref not in domains or domain_ref not in bound_domains:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_LINEARIZATION_INVALID,
-                    f"{base}.domain_ref",
-                    "program linearization requires one declared J domain with an "
-                    "explicit pi.program_axes binding",
-                    domain_ref,
-                )
-            )
-        if any(item not in dimensions for item in dimension_refs):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_LINEARIZATION_INVALID,
-                    f"{base}.dimension_refs",
-                    "program linearization may reference only declared J dimensions",
-                    ",".join(dimension_refs),
-                )
-            )
-        if domain_ref in domains and set(dimension_refs) != domain_dimensions:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.PROGRAM_LINEARIZATION_INVALID,
-                    f"{base}.dimension_refs",
-                    "mixed-radix dimensions must be exactly visible in the owning "
-                    "J domain rather than borrowed from an unrelated shape",
-                    ",".join(dimension_refs),
-                )
-            )
 
 def type_check(
     j: SemanticArchive,
@@ -5432,11 +6569,8 @@ def type_check(
     _check_rank_zero_logical_input_liveness(j, diagnostics)
     _check_boundary_value_dominance(j, diagnostics)
     _check_access_guard_relations(j, diagnostics)
-    program_domain_region_map = _program_domain_branch_regions(j, pi, diagnostics)
-    _check_program_domain_terminals(pi, program_domain_region_map, diagnostics)
-    program_domain_regions = set(program_domain_region_map)
-    _check_effect_conditionals(j, pi, diagnostics, program_domain_regions)
-    _check_value_conditionals(j, pi, diagnostics, program_domain_regions)
+    _check_effect_conditionals(j, diagnostics)
+    _check_value_conditionals(j, diagnostics)
     diagnostics.extend(
         TypeCheckDiagnostic(
             TypeCheckErrorCode.FUNCTIONAL_BOUNDARY_INCOMPLETE,
@@ -5485,7 +6619,9 @@ def type_check(
                 )
             )
 
-    expected_c = [f"c{index}" for index in range(len(c.slots))]
+    expected_c = list(
+        CanonicalHandleAllocator.canonical_names("c", len(c.slots))
+    )
     if [item.name for item in c.slots] != expected_c:
         diagnostics.append(
             TypeCheckDiagnostic(
@@ -5494,9 +6630,15 @@ def type_check(
                 "C slot ids must be declaration-order handles c0, c1, ...",
             )
         )
+    callable_names = {parameter.name for parameter in j.signature.parameters}
+    callable_names.update(
+        slot.name for slot in c.slots if slot.kind is ScheduleSlotKind.CONSTEXPR
+    )
+    compiler_roles: set[str] = set()
     for index, slot in enumerate(c.slots):
-        value = c.values.get(slot.name)
-        if slot.required and slot.name not in c.values:
+        has_value = slot.name in c.values
+        value = c.values[slot.name] if has_value else None
+        if slot.required and not has_value:
             diagnostics.append(
                 TypeCheckDiagnostic(
                     TypeCheckErrorCode.C_REQUIRED_VALUE_MISSING,
@@ -5505,7 +6647,7 @@ def type_check(
                     slot.name,
                 )
             )
-        if value is not None and not _c_value_matches(slot.value_type, value):
+        if has_value and not implementation_value_matches(slot.value_type, value):
             diagnostics.append(
                 TypeCheckDiagnostic(
                     TypeCheckErrorCode.C_VALUE_TYPE_MISMATCH,
@@ -5523,8 +6665,29 @@ def type_check(
                     slot.name,
                 )
             )
+        if slot.kind is ScheduleSlotKind.COMPILER:
+            if slot.role in callable_names:
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.INVALID_C_SLOT,
+                        f"c.slots[{index}].role",
+                        "compiler C role collides with a callable or constexpr handle",
+                        slot.role,
+                    )
+                )
+            if slot.role in compiler_roles:
+                diagnostics.append(
+                    TypeCheckDiagnostic(
+                        TypeCheckErrorCode.INVALID_C_SLOT,
+                        f"c.slots[{index}].role",
+                        "compiler C roles must be unique",
+                        slot.role,
+                    )
+                )
+            compiler_roles.add(slot.role)
 
     anchors, node_operations = _build_anchors(j, c, diagnostics)
+    _check_scatter_atomic_authorizations(j, diagnostics)
     _check_reduction_boundaries(j, node_operations, diagnostics)
     _check_consumer_extensions(j, node_operations, diagnostics)
     absent_signature_refs = {
@@ -5533,107 +6696,15 @@ def type_check(
         if parameter.kind is ParameterKind.OPAQUE and parameter.dtype == "none"
     }
     _check_result_relations(j, diagnostics)
-    c_subject_kinds = {"tensor", "node", "domain", "access", "scope", "storage"}
-    for index, slot in enumerate(c.slots):
-        if slot.kind is ScheduleSlotKind.COMPILER:
-            if slot.subject_ref is not None or slot.axis_ref is not None:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.INVALID_C_SLOT,
-                        f"c.slots[{index}]",
-                        "compiler C slot is an external compiler-invocation "
-                        "option and cannot attach to a J subject or axis",
-                        slot.name,
-                    )
-                )
-            continue
-        if slot.subject_ref is None:
-            continue
-        subject = anchors.get(slot.subject_ref)
-        if (
-            subject is None
-            or subject.owner != "j"
-            or subject.kind not in c_subject_kinds
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.C_SUBJECT_UNKNOWN,
-                    f"c.slots[{index}].subject_ref",
-                    "C subject_ref is not a declared schedule-addressable J subject",
-                    slot.subject_ref,
-                )
+    try:
+        validate_normalization_bindings_against_j(j, c, pi)
+    except RealizationWitnessError as exc:
+        diagnostics.append(
+            TypeCheckDiagnostic(
+                TypeCheckErrorCode.PI_NORMALIZATION_BINDING_INVALID,
+                "pi",
+                str(exc),
             )
-            continue
-        if slot.axis_ref is None:
-            continue
-        allowed_axes = _axis_refs_v1(j, slot.subject_ref, node_operations)
-        if slot.axis_ref not in allowed_axes:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.C_AXIS_INVALID,
-                    f"c.slots[{index}].axis_ref",
-                    "C axis_ref is outside AxisRefs_v1(J,subject_ref)",
-                    str(slot.axis_ref),
-                )
-            )
-    instances = {str(item["id"]): item for item in pi.instances}
-    instance_anchors: dict[str, _Anchor] = {}
-    compiler_slot_refs = {
-        slot.name for slot in c.slots
-        if slot.kind is ScheduleSlotKind.COMPILER
-    }
-    for index, item in enumerate(pi.instances):
-        ref = str(item["semantic_ref"])
-        if ref in compiler_slot_refs:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.INVALID_C_SLOT,
-                    f"pi.instances[{index}].semantic_ref",
-                    "compiler C slot is consumed only by the external compiler "
-                    "invocation and cannot own a pi realization instance",
-                    ref,
-                )
-            )
-            continue
-        if ref in absent_signature_refs:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.ABSENT_CARRIER_SEMANTIC_USE_FORBIDDEN,
-                    f"pi.instances[{index}].semantic_ref",
-                    "opaque(dtype=none) is an absent ABI carrier and cannot "
-                    "own a realization instance",
-                    ref,
-                )
-            )
-            continue
-        anchor = anchors.get(ref)
-        if anchor is None or anchor.kind == "authorization":
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.UNRESOLVED_ANCHOR,
-                    f"pi.instances[{index}].semantic_ref",
-                    f"pi anchor {ref!r} is not declared by J or C",
-                    ref,
-                )
-            )
-            continue
-        instance_anchors[str(item["id"])] = anchor
-
-    if pi.wire_schema != NORMALIZATION_WITNESS_SCHEMA:
-        _check_iteration_witness(j, c, pi, node_operations, diagnostics)
-        _check_physical_iteration_witness(j, c, pi, node_operations, diagnostics)
-        _check_route_extent_transforms(
-            j, c, pi, node_operations, instance_anchors, diagnostics
-        )
-        _check_loop_carriers(
-            pi,
-            node_operations,
-            anchors,
-            instance_anchors,
-            diagnostics,
-        )
-        _check_physical_loop_carriers(
-            pi, node_operations, instance_anchors, diagnostics
         )
     _check_normalization_bindings(
         j,
@@ -5649,116 +6720,6 @@ def type_check(
         diagnostics,
         required=require_program_axes,
     )
-    _check_program_coordinate_maps(
-        j,
-        pi,
-        diagnostics,
-    )
-
-    route_edges = {
-        (str(item["source"]), str(item["target"])) for item in pi.routes
-    }
-    order_edges = {
-        (str(item["before"]), str(item["after"])) for item in pi.order
-    }
-    if _has_cycle(set(instances), route_edges | order_edges):
-        diagnostics.append(
-            TypeCheckDiagnostic(
-                TypeCheckErrorCode.ROUTE_CYCLE,
-                "pi.routes/order",
-                "combined realization dependency graph must be acyclic",
-            )
-        )
-
-    _check_transfer_address_routes(j, pi, diagnostics)
-
-    for route_index, route in enumerate(pi.routes):
-        source_id = str(route["source"])
-        target_id = str(route["target"])
-        source = instance_anchors.get(source_id)
-        target = instance_anchors.get(target_id)
-        if source is None or target is None:
-            continue
-        # Operand ordinals are mechanically meaningful for J carrier nodes.
-        # Access/address and placement instances may also expose frontend
-        # representation inputs, whose arity is intentionally not invented by
-        # this thin checker.
-        if target.kind != "node":
-            continue
-        for slot in route["slots"]:
-            if slot >= len(target.operand_types):
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.ROUTE_SLOT_OUT_OF_RANGE,
-                        f"pi.routes[{route_index}].slots",
-                        f"slot {slot} exceeds target carrier arity "
-                        f"{len(target.operand_types)}",
-                        target_id,
-                    )
-                )
-                continue
-            expected = (
-                target.operand_types[slot]
-                if target.operand_types and slot < len(target.operand_types)
-                else None
-            )
-            if (
-                source.value_type is not None
-                and expected is not None
-                and source.value_type != expected
-            ):
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.ROUTE_TYPE_MISMATCH,
-                        f"pi.routes[{route_index}].slots[{slot}]",
-                        f"source carrier {source.value_type} is incompatible "
-                        f"with target operand {expected}",
-                        target_id,
-                    )
-                )
-
-    for index, sharing in enumerate(pi.sharing):
-        source = str(sharing["source"])
-        consumers = [str(item) for item in sharing["consumers"]]
-        if source in consumers or any(
-            (source, consumer) not in route_edges for consumer in consumers
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.INVALID_SHARING,
-                    f"pi.sharing[{index}]",
-                    "sharing consumers must have a direct route from the shared source",
-                    source,
-                )
-            )
-
-    observable_mechanisms = {
-        "transfer_direct",
-        "transfer_async",
-        "update_atomic",
-        "update_privatized",
-        "synchronize",
-    }
-    for index, item in enumerate(pi.instances):
-        if item["mechanism"] not in observable_mechanisms:
-            continue
-        anchor = instance_anchors.get(str(item["id"]))
-        if anchor is not None and not (
-            anchor.owner == "j" and anchor.kind in {"node", "access", "effect"}
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.OBSERVABLE_REQUIRES_J_ANCHOR,
-                    f"pi.instances[{index}].semantic_ref",
-                    "observable transfer/update/effect realization must anchor "
-                    "a J-owned node, access, or effect",
-                    str(item["semantic_ref"]),
-                )
-            )
-
-    authorizations = {
-        item.auth_id: item for item in j.boundary.realization_authorizations
-    }
     valid_subjects = {
         ref
         for ref, anchor in anchors.items()
@@ -5833,24 +6794,19 @@ def type_check(
             RefinementKind.SIGNED_WIDEN,
             RefinementKind.UNSIGNED_WIDEN,
         }:
-            source_match = _INTEGER_DTYPE.fullmatch(
-                authorization.source_dtype or ""
-            )
-            target_match = _INTEGER_DTYPE.fullmatch(
-                authorization.target_dtype or ""
-            )
+            source_info = _closed_integer_dtype_info(authorization.source_dtype)
+            target_info = _closed_integer_dtype_info(authorization.target_dtype)
             expected_signedness = (
                 "i"
                 if authorization.kind is RefinementKind.SIGNED_WIDEN
                 else "u"
             )
             valid_widen = (
-                source_match is not None
-                and target_match is not None
-                and source_match.group("signedness") == expected_signedness
-                and target_match.group("signedness") == expected_signedness
-                and int(target_match.group("bits"))
-                > int(source_match.group("bits"))
+                source_info is not None
+                and target_info is not None
+                and source_info[0] == expected_signedness
+                and target_info[0] == expected_signedness
+                and target_info[1] > source_info[1]
             )
             if not valid_widen:
                 diagnostics.append(
@@ -5873,141 +6829,13 @@ def type_check(
                 TypeCheckDiagnostic(
                     TypeCheckErrorCode.REFINEMENT_AUTH_TYPE_MISMATCH,
                     f"j.boundary.realization_authorizations[{index}].source_dtype",
-                    "authorization source dtype differs from its J carrier",
+                    (
+                        "authorization source dtype differs from its J carrier: "
+                        f"subject_ref={authorization.subject_ref!r}, "
+                        f"expected={subject.value_type.dtype!r}, "
+                        f"actual={authorization.source_dtype!r}"
+                    ),
                     authorization.auth_id,
-                )
-            )
-
-    refinements = {str(item["instance"]): item for item in pi.refinements}
-    mechanism_refinement = {
-        "update_atomic": RefinementKind.NATIVE_ATOMIC.value,
-        "update_privatized": RefinementKind.PRIVATIZED_UPDATE.value,
-    }
-    for instance_id, instance in instances.items():
-        expected_kind = mechanism_refinement.get(str(instance["mechanism"]))
-        if expected_kind is None:
-            continue
-        refinement = refinements.get(instance_id)
-        if refinement is None or refinement["kind"] != expected_kind:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.REFINEMENT_AUTH_MISSING,
-                    f"pi.instances[{instance_id}].mechanism",
-                    f"{instance['mechanism']} requires a {expected_kind} "
-                    "refinement with explicit J/B authorization",
-                    instance_id,
-                )
-            )
-
-    for index, refinement in enumerate(pi.refinements):
-        kind = str(refinement["kind"])
-        instance_id = str(refinement["instance"])
-        auth_ref = refinement["auth_ref"]
-        refined_instance = instances.get(instance_id)
-        if (
-            refined_instance is not None
-            and refined_instance["semantic_ref"] in absent_signature_refs
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.ABSENT_CARRIER_SEMANTIC_USE_FORBIDDEN,
-                    f"pi.refinements[{index}].instance",
-                    "opaque(dtype=none) is an absent ABI carrier and cannot "
-                    "serve as a refinement carrier",
-                    instance_id,
-                )
-            )
-            continue
-        if kind in GLOBAL_SAFE_REFINEMENTS:
-            if auth_ref is not None:
-                diagnostics.append(
-                    TypeCheckDiagnostic(
-                        TypeCheckErrorCode.GLOBAL_SAFE_AUTH_FORBIDDEN,
-                        f"pi.refinements[{index}].auth_ref",
-                        "global-safe representation materialization must not cite a "
-                        "candidate-defined authorization",
-                        str(auth_ref),
-                    )
-                )
-            if kind == "reduction_linearization":
-                outgoing = [
-                    route
-                    for route in pi.routes
-                    if str(route["source"]) == instance_id
-                ]
-                valid_route = False
-                if (
-                    refined_instance is not None
-                    and refined_instance.get("mechanism") == "realize"
-                    and len(outgoing) == 1
-                    and list(outgoing[0]["slots"]) == [0]
-                ):
-                    target = instances.get(str(outgoing[0]["target"]))
-                    target_ref = (
-                        str(target["semantic_ref"])
-                        if target is not None
-                        else ""
-                    )
-                    target_operation = node_operations.get(target_ref)
-                    valid_route = (
-                        target is not None
-                        and target.get("mechanism") == "realize"
-                        and target_operation is not None
-                        and target_operation.get("op") == "reduce"
-                    )
-                if not valid_route:
-                    diagnostics.append(
-                        TypeCheckDiagnostic(
-                            TypeCheckErrorCode.REFINEMENT_TOPOLOGY_INVALID,
-                            f"pi.refinements[{index}]",
-                            "reduction_linearization requires one refined realize "
-                            "stage with exactly one slot-0 route into one realize "
-                            "instance anchored to a J reduce",
-                            instance_id,
-                        )
-                    )
-            continue
-        if auth_ref is None:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.REFINEMENT_AUTH_MISSING,
-                    f"pi.refinements[{index}].auth_ref",
-                    "sensitive representation refinement requires J/B authorization",
-                    instance_id,
-                )
-            )
-            continue
-        authorization = authorizations.get(str(auth_ref))
-        if authorization is None:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.REFINEMENT_AUTH_UNKNOWN,
-                    f"pi.refinements[{index}].auth_ref",
-                    "refinement cites an unknown J/B authorization",
-                    str(auth_ref),
-                )
-            )
-            continue
-        if authorization.kind.value != kind:
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.REFINEMENT_AUTH_KIND_MISMATCH,
-                    f"pi.refinements[{index}].kind",
-                    "refinement kind differs from the cited authorization",
-                    str(auth_ref),
-                )
-            )
-        instance = instances.get(instance_id)
-        if (
-            instance is not None
-            and authorization.subject_ref != instance["semantic_ref"]
-        ):
-            diagnostics.append(
-                TypeCheckDiagnostic(
-                    TypeCheckErrorCode.REFINEMENT_AUTH_SUBJECT_MISMATCH,
-                    f"pi.refinements[{index}].auth_ref",
-                    "authorization subject differs from the refined instance anchor",
-                    str(auth_ref),
                 )
             )
 
@@ -6021,7 +6849,6 @@ def type_check(
 
 
 __all__ = [
-    "GLOBAL_SAFE_REFINEMENTS",
     "TYPECHECK_PROTOCOL",
     "TypeCheckDiagnostic",
     "TypeCheckErrorCode",

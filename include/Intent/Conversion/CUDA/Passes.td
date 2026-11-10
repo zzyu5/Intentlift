@@ -390,8 +390,9 @@ def ConvertIntentGatherToGPU
       (`along_axis`); `axis` selects which output coordinate the index replaces.
     * scatter (`along_axis`, reduce `none`/`add`): IN-PLACE on the (caller-cloned)
       `data` memref — one launch per `src`/`index` element does a data-dependent
-      `memref.store` (reduce `none`) or `memref.atomic_rmw addf` (reduce `add` =
-      scatter_add, -> `red.global.add.f32` on sm_120a). No output arg is appended.
+      `memref.store` (reduce `none`) or legacy `memref.atomic_rmw addf` (implicit
+      reduce `add`). An explicit atomic scatter uses the scoped LLVM/NVVM
+      operation and ordering fences, and no output arg is appended.
 
     Correctness-only (no bank-conflict-free guarantee needed): the index stream is
     exact so verification is bit-faithful (rel < 1e-3). Static shapes, cols % T ==
@@ -404,6 +405,7 @@ def ConvertIntentGatherToGPU
     "::mlir::memref::MemRefDialect",
     "::mlir::arith::ArithDialect",
     "::mlir::func::FuncDialect",
+    "::mlir::LLVM::LLVMDialect",
   ];
   let options = [
     Option<"blockThreads", "block-threads", "unsigned", "0",
@@ -414,6 +416,40 @@ def ConvertIntentGatherToGPU
            "compose the two runtime index maps and load only the final scalar. "
            "False keeps the deterministic eager first-gather row topology. "
            "This structural state is searched only by Full.">,
+  ];
+}
+
+def ConvertIntentRaggedToGPU
+    : Pass<"convert-intent-ragged-to-gpu", "::mlir::ModuleOp"> {
+  let summary = "Lower a local ragged outer/member query to one gpu.launch.";
+  let description = [{
+    Recognizes a straight-line function containing one `intent.ragged` followed
+    by either `intent.ragged_outer` or `intent.ragged_member`, with the queried
+    value returned directly.  Offsets and indices may be normal pointer
+    arguments or deterministic rank-one `arith.constant` carriers; a runtime
+    selector remains a pointer argument, while an authorized constexpr
+    selector is materialized as a device-side constant.
+    The tuple descriptor never crosses the target ABI.
+    `ragged_member` uses a destination-passing ranked memref whose allocation
+    size and dynamic extent are resolved by the host from the authored offsets
+    and selector.  The tuple is not an ABI value: after GPU lowering with
+    kernel-bare-ptr-calling-convention=false, the device receives the flattened
+    descriptor fields (allocated/aligned pointers, offset, size, and stride).
+    Every store is guarded by the runtime slice length.  Functions outside this
+    closed shape are left for another explicit lowering and are not silently
+    erased.
+  }];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "::mlir::func::FuncDialect",
+    "::mlir::gpu::GPUDialect",
+    "::mlir::memref::MemRefDialect",
+    "::mlir::scf::SCFDialect",
+    "::mlir::tensor::TensorDialect",
+  ];
+  let options = [
+    Option<"blockThreads", "block-threads", "unsigned", "256",
+           "Threads used by a ragged_member copy launch.">,
   ];
 }
 
@@ -633,24 +669,24 @@ def ConvertIntentPoolToGPU
 
 def ConvertIntentUpsampleToGPU
     : Pass<"convert-intent-upsample-to-gpu", "::mlir::ModuleOp"> {
-  let summary = "Lower a single intent.upsample (nearest) over NCHW to one "
-                "block-cooperative gpu.launch (affine floor index-remap).";
+  let summary = "Lower a single intent.upsample (nearest or bicubic) over NCHW "
+                "to one block-cooperative gpu.launch.";
   let description = [{
     The C7 interpolation pass. Recognizes a `func.func` whose body is exactly one
-    `intent.upsample{mode="nearest"}` over a rank-4 `[N,C,H,W]` f32 input producing
+    `intent.upsample{mode="nearest", scale=[sh,sw]}` or
+    `intent.upsample{mode="bicubic", scale=[sh,sw]}` over a rank-4
+    `[N,C,H,W]` f32 input producing
     `[N,C,OH,OW]`, and rewrites it in place to ONE block-cooperative `gpu.launch`:
-    grid = (N*C, OH, 1) (one block per output channel-plane row), block = (T,1,1)
-    threads over the OW output columns (K = OW/T each, unrolled).
+    a flat grid-stride launch over the complete output, with block size `T`.
 
-    Pure DATA MOVEMENT (C4-layout-like): each output element's SOURCE coord is an
-    affine `floor` of the output coord — `ih = min(floor(oh*IH/OH), IH-1)`,
-    `iw = min(floor(ow*IW/OW), IW-1)` computed with the reciprocal scale `IH/OH`
-    in f32 then truncated to int (matching flag_gems' `(oh*IH/OH).to(int32)`) —
-    followed by a `memref.load` at `(n,c,ih,iw)`. Destination-passing: the appended
-    `[N,C,OH,OW]` output memref is written; the input is a rank-4 memref.
+    For `nearest`, each output element's source coordinate is an affine `floor`
+    index-remap — `ih = min(floor(oh*IH/OH), IH-1)` and
+    `iw = min(floor(ow*IW/OW), IW-1)`. For `bicubic`, the pass evaluates the
+    closed four-by-four cubic-convolution neighborhood with `align_corners=False`.
+    Both modes use destination-passing: the appended `[N,C,OH,OW]` output memref
+    is written and the input is a rank-4 memref.
 
-    Correctness-only (bit-EXACT gather vs torch + flag_gems). Static shapes,
-    OW % T == 0. Run BEFORE `convert-intent-to-linalg`.
+    Correctness-only. Static shapes. Run BEFORE `convert-intent-to-linalg`.
   }];
   let dependentDialects = [
     "::mlir::gpu::GPUDialect",

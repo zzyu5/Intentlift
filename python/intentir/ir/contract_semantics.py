@@ -86,7 +86,9 @@ def infer_reference_sorts(
         elif expression.op == "not":
             result = ContractSort.BOOLEAN
             operand_requirements = (ContractSort.BOOLEAN,)
-        elif expression.op in {"add", "sub", "mul", "floordiv", "mod"}:
+        elif expression.op in {
+            "add", "sub", "mul", "floordiv", "mod", "left_shift", "right_shift"
+        }:
             result = ContractSort.INTEGER
             operand_requirements = (ContractSort.INTEGER, ContractSort.INTEGER)
         elif expression.op in {"lt", "le", "gt", "ge", "eq", "ne"}:
@@ -190,7 +192,9 @@ def _resolved_sort(
     elif expression.op == "not":
         expected = (ContractSort.BOOLEAN,)
         result = ContractSort.BOOLEAN
-    elif expression.op in {"add", "sub", "mul", "floordiv", "mod"}:
+    elif expression.op in {
+        "add", "sub", "mul", "floordiv", "mod", "left_shift", "right_shift"
+    }:
         expected = (ContractSort.INTEGER, ContractSort.INTEGER)
         result = ContractSort.INTEGER
     elif expression.op in {"lt", "le", "gt", "ge", "eq", "ne"}:
@@ -339,7 +343,9 @@ class TypedContractProgram:
                 return -_require_integer(values[0], context=path)
             if expression.op == "not":
                 return not _require_boolean(values[0], context=path)
-            if expression.op in {"add", "sub", "mul", "floordiv", "mod"}:
+            if expression.op in {
+                "add", "sub", "mul", "floordiv", "mod", "left_shift", "right_shift"
+            }:
                 left = _require_integer(values[0], context=path)
                 right = _require_integer(values[1], context=path)
                 if expression.op in {"floordiv", "mod"} and right == 0:
@@ -350,6 +356,8 @@ class TypedContractProgram:
                     "mul": lambda: left * right,
                     "floordiv": lambda: left // right,
                     "mod": lambda: left % right,
+                    "left_shift": lambda: left << right,
+                    "right_shift": lambda: left >> right,
                 }[expression.op]()
                 return result
             if expression.op in {"lt", "le", "gt", "ge", "eq", "ne"}:

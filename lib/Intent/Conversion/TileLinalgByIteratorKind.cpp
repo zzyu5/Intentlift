@@ -58,6 +58,18 @@ static bool hasLinalgConsumer(Operation *operation) {
   });
 }
 
+static int64_t existingScheduleAttr(ModuleOp module, StringRef name) {
+  if (auto attr = module->getAttrOfType<IntegerAttr>(name))
+    return attr.getInt();
+  return 0;
+}
+
+static void addScheduleAttr(ModuleOp module, Builder &builder, StringRef name,
+                            int64_t value) {
+  module->setAttr(name, builder.getI64IntegerAttr(
+                            existingScheduleAttr(module, name) + value));
+}
+
 struct TileLinalgByIteratorKindPass
     : ::intent::impl::TileLinalgByIteratorKindBase<
           TileLinalgByIteratorKindPass> {
@@ -66,8 +78,13 @@ struct TileLinalgByIteratorKindPass
   void runOnOperation() override {
     ModuleOp module = getOperation();
     if (parallelTile == 0 && reductionTile == 0) {
-      module->setAttr("intent.schedule.linalg_tiled_op_count",
-                      IntegerAttr::get(IntegerType::get(&getContext(), 64), 0));
+      // A split schedule may invoke this pass once per iterator kind.  A
+      // no-op invocation must not erase evidence produced by the preceding
+      // real stage.
+      if (!module->hasAttr("intent.schedule.linalg_tiled_op_count"))
+        module->setAttr(
+            "intent.schedule.linalg_tiled_op_count",
+            IntegerAttr::get(IntegerType::get(&getContext(), 64), 0));
       return;
     }
 
@@ -204,22 +221,38 @@ struct TileLinalgByIteratorKindPass
     }
 
     Builder builder(&getContext());
-    module->setAttr("intent.schedule.parallel_tile",
-                    builder.getI64IntegerAttr(parallelTileApplied ? parallelTile
-                                                                 : 0));
-    module->setAttr("intent.schedule.reduction_tile",
-                    builder.getI64IntegerAttr(
-                        reductionTileApplied ? reductionTile : 0));
-    module->setAttr("intent.schedule.linalg_tiled_op_count",
-                    builder.getI64IntegerAttr(tiledOpCount));
-    module->setAttr("intent.schedule.generated_loop_count",
-                    builder.getI64IntegerAttr(generatedLoopCount));
-    module->setAttr("intent.schedule.fused_producer_count",
-                    builder.getI64IntegerAttr(fusedProducerCount));
-    module->setAttr("intent.schedule.fusion_outer_parallel_only_count",
-                    builder.getI64IntegerAttr(fusionOuterParallelOnlyCount));
-    module->setAttr("intent.schedule.fusion_multi_use_rejection_count",
-                    builder.getI64IntegerAttr(fusionMultiUseRejectionCount));
+    // Preserve the other iterator kind when the caller deliberately splits a
+    // combined schedule into two real passes.  Counters are cumulative across
+    // those passes, so the final transformation record describes the actual
+    // composed compiler state rather than whichever pass ran last.
+    if (parallelTileApplied || module->hasAttr("intent.schedule.parallel_tile"))
+      module->setAttr(
+          "intent.schedule.parallel_tile",
+          builder.getI64IntegerAttr(parallelTileApplied
+                                        ? parallelTile
+                                        : existingScheduleAttr(
+                                              module,
+                                              "intent.schedule.parallel_tile")));
+    if (reductionTileApplied || module->hasAttr("intent.schedule.reduction_tile"))
+      module->setAttr(
+          "intent.schedule.reduction_tile",
+          builder.getI64IntegerAttr(reductionTileApplied
+                                        ? reductionTile
+                                        : existingScheduleAttr(
+                                              module,
+                                              "intent.schedule.reduction_tile")));
+    addScheduleAttr(module, builder, "intent.schedule.linalg_tiled_op_count",
+                    tiledOpCount);
+    addScheduleAttr(module, builder, "intent.schedule.generated_loop_count",
+                    generatedLoopCount);
+    addScheduleAttr(module, builder, "intent.schedule.fused_producer_count",
+                    fusedProducerCount);
+    addScheduleAttr(module, builder,
+                    "intent.schedule.fusion_outer_parallel_only_count",
+                    fusionOuterParallelOnlyCount);
+    addScheduleAttr(module, builder,
+                    "intent.schedule.fusion_multi_use_rejection_count",
+                    fusionMultiUseRejectionCount);
   }
 };
 

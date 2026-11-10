@@ -39,6 +39,8 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <limits>
+
 namespace intent {
 #define GEN_PASS_DEF_CONVERTINTENTUPSAMPLETOGPU
 #include "Intent/Conversion/CUDA/Passes.h.inc"
@@ -56,6 +58,7 @@ struct UpsampleLowering {
   UpsampleOp up;
   RankedTensorType inTy, outTy;
   int64_t N = 0, C = 0, H = 0, W = 0, OH = 0, OW = 0;
+  int64_t scaleH = 0, scaleW = 0;
   int64_t T = 0, G = 0, total = 0;
   bool bicubic = false;
 
@@ -84,6 +87,16 @@ struct UpsampleLowering {
     bicubic = up.getMode() == "bicubic";
     inTy = cast<RankedTensorType>(up.getInput().getType());
     outTy = cast<RankedTensorType>(up.getResult().getType());
+    auto scale = up.getScale();
+    if (scale.size() != 2)
+      return failure();
+    auto scaleHAttr = dyn_cast<IntegerAttr>(scale[0]);
+    auto scaleWAttr = dyn_cast<IntegerAttr>(scale[1]);
+    if (!scaleHAttr || !scaleWAttr || scaleHAttr.getInt() < 1 ||
+        scaleWAttr.getInt() < 1)
+      return failure();
+    scaleH = scaleHAttr.getInt();
+    scaleW = scaleWAttr.getInt();
     if (inTy.getRank() != 4 || outTy.getRank() != 4 || !inTy.hasStaticShape() ||
         !outTy.hasStaticShape() || !inTy.getElementType().isF32())
       return failure();
@@ -93,6 +106,10 @@ struct UpsampleLowering {
     W = inTy.getDimSize(3);
     OH = outTy.getDimSize(2);
     OW = outTy.getDimSize(3);
+    if (H > std::numeric_limits<int64_t>::max() / scaleH ||
+        W > std::numeric_limits<int64_t>::max() / scaleW ||
+        OH != H * scaleH || OW != W * scaleW)
+      return failure();
     // Flat grid-stride over the whole output (see MapEmit.h): full-width blocks
     // + tail-mask, replacing the old one-block-per-(N*C,OH)-row / T-over-OW map.
     T = flatThreads(blockThreads);

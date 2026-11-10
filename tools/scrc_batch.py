@@ -8,10 +8,11 @@ from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 from queue import Empty, Queue
+import re
 import sys
 from threading import BoundedSemaphore, Lock, Thread
 from time import monotonic
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Mapping, TextIO
 
 ROOT = Path(__file__).resolve().parents[1]
 PYTHON_ROOT = ROOT / "python"
@@ -22,10 +23,16 @@ from intentir.verify.scrc_batch import (
     SequentialSCRCBatchRunner,
     dry_run_executor,
 )
+from intentir.verify.candidate_fanout import (
+    DEFAULT_CANDIDATE_FANOUT,
+    MAX_CANDIDATE_FANOUT,
+)
+from intentir.verify.scrc_runner import MAX_LIFT_CALLS
 from intentir.verify.workload_manifest import build_workload_manifest
 
 
 SCRC_PROGRESS_PROTOCOL = "intentir.scrc.progress.v1"
+_SAFE_PROGRESS_TOKEN = re.compile(r"[A-Za-z0-9_.:-]{1,96}\Z")
 _PROGRESS_FIELDS = frozenset(
     {
         "protocol",
@@ -38,6 +45,7 @@ _PROGRESS_FIELDS = frozenset(
         "formal_round",
         "elapsed",
         "status",
+        "diagnostic",
     }
 )
 _PROGRESS_EVENTS = frozenset(
@@ -74,6 +82,82 @@ class _ProgressState:
     attempt: int | None
     formal_round: int | None
     status: str
+    diagnostic: Mapping[str, Any] | None = None
+
+
+_SAFE_PROGRESS_DIAGNOSTIC_KEYS = frozenset(
+    {
+        "phase",
+        "failure_class",
+        "candidate_present",
+        "candidate_check_started",
+        "typecheck_started",
+        "replay_started",
+        "gate1_started",
+        "gate2_started",
+    }
+)
+
+
+def _safe_progress_diagnostic(
+    details: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Keep live rejection diagnostics explicit and source-free.
+
+    The Lift runner already projects diagnostics before invoking this callback,
+    but the batch progress channel is an external boundary too.  Re-project
+    the bounded lifecycle fields here and flatten only rule/path pairs.  No
+    candidate, provider response, trajectory, or exception text is allowed to
+    cross this channel.
+    """
+
+    if not isinstance(details, Mapping):
+        return None
+    safe: dict[str, Any] = {}
+    for key in _SAFE_PROGRESS_DIAGNOSTIC_KEYS:
+        value = details.get(key)
+        if isinstance(value, bool) or (
+            key in {"phase", "failure_class"}
+            and isinstance(value, str)
+            and _SAFE_PROGRESS_TOKEN.fullmatch(value) is not None
+        ):
+            safe[key] = value
+
+    rules: list[dict[str, str]] = []
+    for source_key in ("candidate_check_feedback", "source_reconcile"):
+        source = details.get(source_key)
+        rows = source.get("diagnostics") if isinstance(source, Mapping) else None
+        if not isinstance(rows, list):
+            continue
+        for row in rows[:12]:
+            if not isinstance(row, Mapping):
+                continue
+            code = row.get("rule_code")
+            path = row.get("path")
+            if (
+                not isinstance(code, str)
+                or _SAFE_PROGRESS_TOKEN.fullmatch(code) is None
+            ):
+                continue
+            item = {"rule_code": code}
+            if (
+                isinstance(path, str)
+                and len(path) <= 128
+                and (
+                    path.startswith("j.")
+                    or path.startswith("pi.")
+                    or path in {"<candidate>", "<canonical-constructor>"}
+                )
+            ):
+                item["path"] = path
+            rules.append(item)
+            if len(rules) >= 12:
+                break
+        if len(rules) >= 12:
+            break
+    if rules:
+        safe["rules"] = rules
+    return safe or None
 
 
 class _LiveProgressEmitter:
@@ -172,6 +256,8 @@ class _LiveProgressEmitter:
             payload["attempt"] = state.attempt
         if state.formal_round is not None:
             payload["formal_round"] = state.formal_round
+        if state.diagnostic:
+            payload["diagnostic"] = dict(state.diagnostic)
         if not set(payload) <= _PROGRESS_FIELDS:
             raise AssertionError("progress payload escaped its closed field set")
         return payload
@@ -220,6 +306,7 @@ class _LiveProgressEmitter:
         attempt: int | None = None,
         formal_round: int | None = None,
         status: str,
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         def update(now: float) -> tuple[dict[str, Any], ...]:
             started = self._case_starts.setdefault(case_id, now)
@@ -231,6 +318,7 @@ class _LiveProgressEmitter:
                 attempt,
                 formal_round,
                 status,
+                _safe_progress_diagnostic(details),
             )
             self._active[(case_id, branch_id)] = state
             return (
@@ -248,7 +336,9 @@ class _LiveProgressEmitter:
         case_id: str,
         ordinal: int,
         branch_id: int,
-    ) -> Callable[[str, int | None, int | None, str], None] | None:
+    ) -> Callable[
+        [str, int | None, int | None, str, dict[str, Any] | None], None
+    ] | None:
         if not self.enabled:
             return None
 
@@ -257,6 +347,7 @@ class _LiveProgressEmitter:
             attempt: int | None,
             formal_round: int | None,
             status: str,
+            details: dict[str, Any] | None = None,
         ) -> None:
             self.stage_transition(
                 case_id,
@@ -266,6 +357,7 @@ class _LiveProgressEmitter:
                 attempt=attempt,
                 formal_round=formal_round,
                 status=status,
+                details=details,
             )
 
         return observe
@@ -457,6 +549,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--provider", default=None)
     parser.add_argument(
+        "--replay-provider",
+        default=None,
+        help=(
+            "independent source-blind Replay provider; defaults to the same "
+            "configured provider name as Lift without sharing agent state"
+        ),
+    )
+    parser.add_argument(
         "--model",
         default=None,
         help=(
@@ -480,15 +580,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lift-backend",
-        choices=("responses", "miniswe", "codex"),
-        default="responses",
-        help="candidate Lift implementation; independent from Replay backend",
+        choices=("miniswe",),
+        default="miniswe",
+        help="MCP Lift Agent; the only formal J authoring backend",
     )
     parser.add_argument(
         "--lift-workflow",
         choices=("single",),
         default="single",
-        help="one persistent source-aware Lift owner per candidate branch",
+        help="one fresh source-aware Lift owner per logical Lift invocation",
     )
     parser.add_argument(
         "--replay-backend",
@@ -508,8 +608,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--candidates",
         type=int,
-        default=1,
-        help="independent same-case Lift/Replay branches before one Gate2 winner",
+        default=DEFAULT_CANDIDATE_FANOUT,
+        help=(
+            "independent same-case Lift/Replay branches before one Gate2 "
+            f"winner (default: {DEFAULT_CANDIDATE_FANOUT})"
+        ),
     )
     parser.add_argument(
         "--case-workers",
@@ -520,7 +623,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-branch-workers",
         type=int,
-        default=8,
+        default=MAX_CANDIDATE_FANOUT,
         help=(
             "global bound G for case_workers * candidates * replay_width"
         ),
@@ -538,12 +641,21 @@ def _parser() -> argparse.ArgumentParser:
         help="bounded formal relift/Replay/Gate1 rounds per candidate branch",
     )
     parser.add_argument(
+        "--max-lift-calls",
+        type=int,
+        default=MAX_LIFT_CALLS,
+        help=(
+            "maximum logical Lift invocations per candidate branch "
+            f"(1-{MAX_LIFT_CALLS})"
+        ),
+    )
+    parser.add_argument(
         "--pre-replay-rejections",
         type=int,
         default=None,
         help=(
-            "optional pre-Replay rejection cap; default 0 (owner-time governed) "
-            "for persistent MiniSWE/Codex Lift and 3 for legacy writers"
+            "optional pre-Replay rejection cap; default 0 leaves every backend "
+            "governed by max-lift-calls, with a fresh owner for each invocation"
         ),
     )
     parser.add_argument("--skip-masked-j", action="store_true")
@@ -555,7 +667,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--run-root",
         type=Path,
-        default=Path("/tmp/intentir-scrc-task11"),
+        default=Path.home() / ".cache" / "intentir-scrc-task11",
         help="evidence root (defaults outside the repository)",
     )
     return parser
@@ -574,12 +686,7 @@ def main(argv: list[str] | None = None) -> int:
     argument_vector = list(sys.argv[1:] if argv is None else argv)
     args = _parser().parse_args(argument_vector)
     if args.pre_replay_rejections is None:
-        args.pre_replay_rejections = (
-            0
-            if args.lift_backend in {"miniswe", "codex"}
-            and args.lift_workflow == "single"
-            else 3
-        )
+        args.pre_replay_rejections = 0
     concurrency_options = (
         "--candidates",
         "--case-workers",
@@ -587,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
         "--gate2-workers",
         "--replay-width",
         "--gate1-rounds",
+        "--max-lift-calls",
         "--pre-replay-rejections",
     )
     explicitly_scheduled = any(
@@ -600,8 +708,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if not 1 <= args.candidates <= 5:
-        print("--candidates must be in [1, 5]", file=sys.stderr)
+    if not 1 <= args.candidates <= MAX_CANDIDATE_FANOUT:
+        print(
+            f"--candidates must be in [1, {MAX_CANDIDATE_FANOUT}]",
+            file=sys.stderr,
+        )
         return 2
     if not 1 <= args.replay_width <= 4:
         print("--replay-width must be in [1, 4]", file=sys.stderr)
@@ -618,14 +729,17 @@ def main(argv: list[str] | None = None) -> int:
     if not 1 <= args.gate1_rounds <= 12:
         print("--gate1-rounds must be in [1, 12]", file=sys.stderr)
         return 2
+    if not 1 <= args.max_lift_calls <= MAX_LIFT_CALLS:
+        print(
+            f"--max-lift-calls must be in [1, {MAX_LIFT_CALLS}]",
+            file=sys.stderr,
+        )
+        return 2
     if not 0 <= args.pre_replay_rejections <= 12:
         print(
             "--pre-replay-rejections must be in [0, 12]",
             file=sys.stderr,
         )
-        return 2
-    if args.candidates != 1 and not args.run:
-        print("--candidates > 1 is only valid with --run", file=sys.stderr)
         return 2
     if (
         args.run
@@ -729,9 +843,7 @@ def main(argv: list[str] | None = None) -> int:
             WorkloadExecution,
             classify_scrc_report,
             complete_prepared_workload_gate2,
-            gate2_exposes_logical_j_pass_implementation_failure,
             initialize_workload_evidence,
-            merge_fixed_artifact_replay_retry_execution,
             next_candidate_fanout_dir,
             next_workload_run_dir,
             save_candidate_fanout_report,
@@ -741,8 +853,9 @@ def main(argv: list[str] | None = None) -> int:
             scrc_gate1_search_diagnostic,
             scrc_report_diagnostic,
             search_prepared_workload_gate1,
-            retry_prepared_workload_gate1_fixed_artifact,
             save_workload_gate1_search,
+            safe_workload_failure_diagnostic,
+            safe_workload_failure_metadata,
             WorkloadExecutionError,
         )
         from intentir.verify.scrc_runner import MainStatus, SCRCRunReport
@@ -757,7 +870,9 @@ def main(argv: list[str] | None = None) -> int:
                 print("--model must be a non-empty model name", file=sys.stderr)
                 return 2
             provider = replace(provider, model=args.model.strip())
-        replay_provider = provider
+        replay_provider = get_provider(args.replay_provider or args.provider)
+        if args.replay_provider is None and args.model is not None:
+            replay_provider = replace(replay_provider, model=provider.model)
         if args.replay_model is not None:
             if (
                 not isinstance(args.replay_model, str)
@@ -777,6 +892,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_branch_workers": args.max_branch_workers,
             "gate2_workers": args.gate2_workers,
             "gate1_rounds": args.gate1_rounds,
+            "max_lift_calls": args.max_lift_calls,
             "pre_replay_rejections": args.pre_replay_rejections,
         }
         progress = _LiveProgressEmitter(
@@ -784,6 +900,28 @@ def main(argv: list[str] | None = None) -> int:
             stream=sys.stderr,
         )
         progress.start()
+
+        def public_failure_diagnostic(exc):
+            """Return an actionable, source-free failure receipt."""
+
+            runtime = exc if isinstance(exc, WorkloadExecutionError) else None
+            diagnostic = safe_workload_failure_diagnostic(exc)
+            evidence = safe_workload_failure_metadata(
+                runtime.evidence if runtime is not None else None
+            )
+            details = {
+                "failure_class": diagnostic["rule_code"],
+                "cause_class": diagnostic["cause_class"],
+            }
+            if evidence:
+                details["evidence"] = evidence
+            return (
+                "failure_class="
+                + diagnostic["rule_code"]
+                + "; cause_class="
+                + diagnostic["cause_class"],
+                details,
+            )
 
         def complete_gate2_with_progress(
             entry,
@@ -831,69 +969,10 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     return current_execution
 
-            execution = execute_gate2_once(search, formal_round)
-            base_execution = execution
-            gate2 = execution.report.gate2
-            if not gate2_exposes_logical_j_pass_implementation_failure(gate2):
-                return execution
-
-            accepted = [
-                attempt
-                for attempt in search.report.attempts
-                if attempt.formal_round == search.report.accepted_attempt
-            ]
-            if len(accepted) != 1 or accepted[0].artifact is None:
-                return execution
-            artifact = accepted[0].artifact
-            consumed_rounds = search.report.call_budget.formal_gate1_rounds
-            retry_searches = []
-            retry_executions = []
-            callback = progress.callback(
-                entry.case_id,
-                entry.ordinal,
-                branch_id,
-            )
-            next_round_offset = consumed_rounds
-            while next_round_offset < args.gate1_rounds:
-                retry_search = retry_prepared_workload_gate1_fixed_artifact(
-                    prepared,
-                    artifact,
-                    provider=provider,
-                    formal_round_offset=next_round_offset,
-                    effort=args.effort,
-                    replay_provider=replay_provider,
-                    replay_effort=replay_effort,
-                    run_masked_j=not args.skip_masked_j,
-                    lift_backend=args.lift_backend,
-                    lift_workflow=args.lift_workflow,
-                    replay_backend=args.replay_backend,
-                    replay_width=args.replay_width,
-                    progress_callback=callback,
-                )
-                retry_searches.append(retry_search)
-                replay_rounds = (
-                    retry_search.report.call_budget.formal_gate1_rounds
-                )
-                if replay_rounds == 0:
-                    break
-                next_round_offset += replay_rounds
-                if not retry_search.report.closed:
-                    continue
-                execution = execute_gate2_once(
-                    retry_search,
-                    retry_search.report.accepted_attempt,
-                )
-                retry_executions.append(execution)
-                if not gate2_exposes_logical_j_pass_implementation_failure(
-                    execution.report.gate2
-                ):
-                    break
-
-            return merge_fixed_artifact_replay_retry_execution(
-                base_execution,
-                tuple(retry_searches),
-                tuple(retry_executions),
-            )
+            # Gate2 is the final numeric verdict.  A failed Gate2 is returned
+            # immediately with its safe three-leg summary; only Gate1 may
+            # request another lifecycle round.
+            return execute_gate2_once(search, formal_round)
 
         def execution_result(
             entry,
@@ -950,15 +1029,16 @@ def main(argv: list[str] | None = None) -> int:
                 evidence=evidence if isinstance(evidence, dict) else None,
                 runtime=runtime,
             )
-            cause = runtime.cause if runtime is not None else exc
+            diagnostic, details = public_failure_diagnostic(exc)
             return BatchCaseResult(
                 entry.case_id,
                 entry.ordinal,
                 BatchClassification.INFRASTRUCTURE_FAILED,
                 entry.representative_tier,
-                diagnostic=f"{type(cause).__name__}: {cause}",
+                diagnostic=diagnostic,
                 source_file=prepared.source_location,
                 evidence_path=evidence_path,
+                details=details,
             )
 
         def single_candidate_executor(entry, prepared):
@@ -975,6 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
                 lift_backend=args.lift_backend,
                 lift_workflow=args.lift_workflow,
                 replay_backend=args.replay_backend,
+                max_lift_calls=args.max_lift_calls,
             )
             callback = progress.callback(entry.case_id, entry.ordinal, 1)
             try:
@@ -990,6 +1071,7 @@ def main(argv: list[str] | None = None) -> int:
                     replay_backend=args.replay_backend,
                     replay_width=args.replay_width,
                     max_gate1_rounds=args.gate1_rounds,
+                    max_lift_calls=args.max_lift_calls,
                     max_pre_replay_rejections=args.pre_replay_rejections,
                     progress_callback=callback,
                 )
@@ -1017,6 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
                             None,
                             None,
                             search.report.call_budget,
+                            stage_metrics=search.report.stage_metrics,
                         ),
                         search.lift,
                         search.replay_writers,
@@ -1058,37 +1141,27 @@ def main(argv: list[str] | None = None) -> int:
                 and item.runtime is not None
                 for item in fanout.branches
             )
+            diagnostics = [
+                f"branch {item.branch_id} {item.status.value}: "
+                f"{item.diagnostic or 'no diagnostic'}"
+                for item in fanout.branches
+            ]
             if not complete_no_closure:
-                diagnostics = [
-                    f"branch {item.branch_id} {item.status.value}: "
-                    f"{item.diagnostic or 'no diagnostic'}"
-                    for item in fanout.branches
-                    if item.status
-                    is not CandidateBranchStatus.NO_CLOSURE
-                    or item.runtime is None
-                ]
-                diagnostic = "; ".join(diagnostics) or (
-                    "candidate wave did not produce a complete NO_CLOSURE result"
-                )
                 return BatchCaseResult(
                     entry.case_id,
                     entry.ordinal,
                     BatchClassification.INFRASTRUCTURE_FAILED,
                     entry.representative_tier,
-                    diagnostic=diagnostic,
+                    diagnostic="; ".join(diagnostics)
+                    or "candidate wave did not produce a complete result",
                     source_file=prepared.source_location,
                     evidence_path=evidence_path,
-                    call_budget={},
+                    call_budget=fanout.aggregate_call_budget,
                     details={
                         **details,
                         "aggregate_call_budget_complete": False,
                     },
                 )
-            diagnostics = [
-                f"branch {item.branch_id}: {item.diagnostic}"
-                for item in fanout.branches
-                if item.diagnostic
-            ]
             observer_unsupported = all(
                 bool(item.diagnostic)
                 and item.diagnostic.startswith(
@@ -1135,11 +1208,13 @@ def main(argv: list[str] | None = None) -> int:
                     lift_backend=args.lift_backend,
                     lift_workflow=args.lift_workflow,
                     replay_backend=args.replay_backend,
+                    max_lift_calls=args.max_lift_calls,
                     search_metadata={
                         "protocol": CANDIDATE_FANOUT_PROTOCOL,
                         "branch_id": branch_id,
                         "candidate_count": args.candidates,
                         "replay_width": args.replay_width,
+                        "max_lift_calls": args.max_lift_calls,
                         "selection_rule": CANDIDATE_SELECTION_RULE,
                     },
                 )
@@ -1155,61 +1230,55 @@ def main(argv: list[str] | None = None) -> int:
                     branch_id,
                 )
                 try:
-                    search = search_prepared_workload_gate1(
-                        prepared,
-                        provider=provider,
-                        effort=args.effort,
-                        replay_provider=replay_provider,
-                        replay_effort=replay_effort,
-                        run_masked_j=not args.skip_masked_j,
-                        lift_backend=args.lift_backend,
-                        lift_workflow=args.lift_workflow,
-                        replay_backend=args.replay_backend,
-                        replay_width=args.replay_width,
-                        max_gate1_rounds=args.gate1_rounds,
-                        max_pre_replay_rejections=(
-                            args.pre_replay_rejections
-                        ),
-                        stop_requested=stop_requested,
-                        progress_callback=callback,
-                    )
-                except Exception as exc:
-                    runtime = (
-                        exc if isinstance(exc, WorkloadExecutionError) else None
-                    )
-                    evidence = getattr(exc, "evidence", None)
-                    save_workload_failure(
-                        branch_dir,
-                        exc,
-                        evidence=(evidence if isinstance(evidence, dict) else None),
-                        runtime=runtime,
-                    )
-                    cause = runtime.cause if runtime is not None else exc
-                    return CandidateBranchOutcome(
-                        branch_id,
-                        candidate_entry.case_id,
-                        candidate_entry.ordinal,
-                        CandidateBranchStatus.INFRASTRUCTURE_FAILED,
-                        diagnostic=f"{type(cause).__name__}: {cause}",
-                        evidence_path=evidence_path,
-                    )
-                finally:
-                    progress.finish_branch(candidate_entry.case_id, branch_id)
-                if search.report.superseded:
-                    status = CandidateBranchStatus.SUPERSEDED
-                elif search.report.closed:
-                    status = CandidateBranchStatus.GATE1_CLOSED
-                else:
-                    status = CandidateBranchStatus.NO_CLOSURE
-                return CandidateBranchOutcome(
-                    branch_id,
-                    candidate_entry.case_id,
-                    candidate_entry.ordinal,
-                    status,
-                    diagnostic=scrc_gate1_search_diagnostic(search.report),
-                    evidence_path=evidence_path,
-                    call_budget=search.report.call_budget.to_json(),
-                    details={
+                    try:
+                        search = search_prepared_workload_gate1(
+                            prepared,
+                            provider=provider,
+                            effort=args.effort,
+                            replay_provider=replay_provider,
+                            replay_effort=replay_effort,
+                            run_masked_j=not args.skip_masked_j,
+                            lift_backend=args.lift_backend,
+                            lift_workflow=args.lift_workflow,
+                            replay_backend=args.replay_backend,
+                            replay_width=args.replay_width,
+                            max_gate1_rounds=args.gate1_rounds,
+                            max_lift_calls=args.max_lift_calls,
+                            max_pre_replay_rejections=(
+                                args.pre_replay_rejections
+                            ),
+                            stop_requested=stop_requested,
+                            progress_callback=callback,
+                        )
+                    except Exception as exc:
+                        runtime = (
+                            exc
+                            if isinstance(exc, WorkloadExecutionError)
+                            else None
+                        )
+                        evidence = getattr(exc, "evidence", None)
+                        save_workload_failure(
+                            branch_dir,
+                            exc,
+                            evidence=(
+                                evidence
+                                if isinstance(evidence, dict)
+                                else None
+                            ),
+                            runtime=runtime,
+                        )
+                        diagnostic, failure_details = public_failure_diagnostic(exc)
+                        return CandidateBranchOutcome(
+                            branch_id,
+                            candidate_entry.case_id,
+                            candidate_entry.ordinal,
+                            CandidateBranchStatus.INFRASTRUCTURE_FAILED,
+                            diagnostic=diagnostic,
+                            evidence_path=evidence_path,
+                            details=failure_details,
+                        )
+
+                    search_details = {
                         "accepted_attempt": search.report.accepted_attempt,
                         "attempt_stage_counts": scrc_attempt_stage_counts(
                             search.report
@@ -1218,13 +1287,138 @@ def main(argv: list[str] | None = None) -> int:
                         "stop_reason": search.report.stop_reason,
                         "winner_branch_id": search.report.winner_branch_id,
                         "stop_observed_at": search.report.stop_observed_at,
-                    },
-                    formal_round=(
-                        search.report.accepted_attempt
-                        if search.report.closed else None
-                    ),
-                    runtime=(search, branch_dir),
-                )
+                    }
+                    if search.report.superseded:
+                        return CandidateBranchOutcome(
+                            branch_id,
+                            candidate_entry.case_id,
+                            candidate_entry.ordinal,
+                            CandidateBranchStatus.SUPERSEDED,
+                            diagnostic=scrc_gate1_search_diagnostic(
+                                search.report
+                            ),
+                            evidence_path=evidence_path,
+                            call_budget=search.report.call_budget.to_json(),
+                            details=search_details,
+                            runtime=(search, branch_dir),
+                        )
+                    if not search.report.closed:
+                        return CandidateBranchOutcome(
+                            branch_id,
+                            candidate_entry.case_id,
+                            candidate_entry.ordinal,
+                            CandidateBranchStatus.NO_CLOSURE,
+                            diagnostic=scrc_gate1_search_diagnostic(
+                                search.report
+                            ),
+                            evidence_path=evidence_path,
+                            call_budget=search.report.call_budget.to_json(),
+                            details=search_details,
+                            runtime=(search, branch_dir),
+                        )
+
+                    # Gate1 only makes this candidate eligible for the final
+                    # semantic check. A full winner is published only after
+                    # the candidate's own Gate2 has passed all three legs.
+                    if stop_requested() is not None:
+                        return CandidateBranchOutcome(
+                            branch_id,
+                            candidate_entry.case_id,
+                            candidate_entry.ordinal,
+                            CandidateBranchStatus.SUPERSEDED,
+                            diagnostic=(
+                                "candidate superseded after another candidate "
+                                "completed full Gate2 closure"
+                            ),
+                            evidence_path=evidence_path,
+                            call_budget=search.report.call_budget.to_json(),
+                            details=search_details,
+                            runtime=(search, branch_dir),
+                        )
+
+                    try:
+                        execution = complete_gate2_with_progress(
+                            entry,
+                            prepared,
+                            search,
+                            branch_id=branch_id,
+                            formal_round=search.report.accepted_attempt,
+                        )
+                        save_workload_execution(
+                            branch_dir, prepared, execution
+                        )
+                    except Exception as exc:
+                        runtime = (
+                            exc
+                            if isinstance(exc, WorkloadExecutionError)
+                            else None
+                        )
+                        evidence = getattr(exc, "evidence", None)
+                        save_workload_failure(
+                            branch_dir,
+                            exc,
+                            evidence=(
+                                evidence
+                                if isinstance(evidence, dict)
+                                else None
+                            ),
+                            runtime=runtime,
+                        )
+                        diagnostic, failure_details = public_failure_diagnostic(exc)
+                        return CandidateBranchOutcome(
+                            branch_id,
+                            candidate_entry.case_id,
+                            candidate_entry.ordinal,
+                            CandidateBranchStatus.INFRASTRUCTURE_FAILED,
+                            diagnostic=diagnostic,
+                            evidence_path=evidence_path,
+                            call_budget=search.report.call_budget.to_json(),
+                            details={**search_details, **failure_details},
+                            runtime=(search, branch_dir),
+                        )
+
+                    execution_details = {
+                        **search_details,
+                        "main_status": execution.report.main_status.value,
+                        "gate2_status_counts": (
+                            execution.report.gate2.status_counts
+                            if execution.report.gate2 is not None
+                            else {}
+                        ),
+                    }
+                    if execution.report.main_status is MainStatus.SCRC_CERTIFIED:
+                        status = CandidateBranchStatus.GATE2_CLOSED
+                    elif execution.report.main_status is MainStatus.GATE2_FAILED:
+                        status = CandidateBranchStatus.GATE2_FAILED
+                    else:
+                        return CandidateBranchOutcome(
+                            branch_id,
+                            candidate_entry.case_id,
+                            candidate_entry.ordinal,
+                            CandidateBranchStatus.INFRASTRUCTURE_FAILED,
+                            diagnostic=(
+                                "Gate2 completion returned unexpected main status: "
+                                f"{execution.report.main_status.value}"
+                            ),
+                            evidence_path=evidence_path,
+                            call_budget=execution.report.call_budget.to_json(),
+                            details=execution_details,
+                            runtime=(search, branch_dir, execution),
+                        )
+                    return CandidateBranchOutcome(
+                        branch_id,
+                        candidate_entry.case_id,
+                        candidate_entry.ordinal,
+                        status,
+                        diagnostic=scrc_report_diagnostic(execution.report),
+                        evidence_path=evidence_path,
+                        call_budget=execution.report.call_budget.to_json(),
+                        details=execution_details,
+                        formal_round=search.report.accepted_attempt,
+                        runtime=(search, branch_dir, execution),
+                    )
+                finally:
+                    progress.finish_branch(candidate_entry.case_id, branch_id)
 
             fanout = ConcurrentCandidateFanoutRunner().run(
                 entry,
@@ -1232,39 +1426,25 @@ def main(argv: list[str] | None = None) -> int:
                 candidates=args.candidates,
             )
             winner = fanout.winner
-            for branch in fanout.branches:
-                if branch.runtime is None or branch is winner:
-                    continue
-                search, branch_dir = branch.runtime
-                save_workload_gate1_search(
-                    branch_dir,
-                    prepared,
-                    search,
-                    selected_for_gate2=False,
-                )
-
             winner_result = None
             if winner is not None:
-                search, winner_dir = winner.runtime
-                evidence_path = winner.evidence_path
-                try:
-                    execution = complete_gate2_with_progress(
-                        entry,
-                        prepared,
-                        search,
-                        branch_id=winner.branch_id,
-                        formal_round=winner.formal_round,
-                    )
-                except Exception as exc:
-                    winner_result = failed_execution_result(
-                        entry,
-                        prepared,
-                        winner_dir,
-                        evidence_path,
-                        exc,
-                    )
-                    winner_result = replace(
-                        winner_result,
+                winner_runtime = winner.runtime
+                if (
+                    not isinstance(winner_runtime, tuple)
+                    or len(winner_runtime) != 3
+                    or winner_runtime[2] is None
+                ):
+                    winner_result = BatchCaseResult(
+                        entry.case_id,
+                        entry.ordinal,
+                        BatchClassification.INFRASTRUCTURE_FAILED,
+                        entry.representative_tier,
+                        diagnostic=(
+                            "full-closure winner omitted its completed Gate2 "
+                            "execution"
+                        ),
+                        source_file=prepared.source_location,
+                        evidence_path=winner.evidence_path,
                         call_budget={},
                         details={
                             **fanout_details(fanout),
@@ -1272,40 +1452,143 @@ def main(argv: list[str] | None = None) -> int:
                         },
                     )
                 else:
-                    save_workload_execution(winner_dir, prepared, execution)
+                    search, winner_dir, execution = winner_runtime
+                    del search
+                    del winner_dir
                     winner_result = execution_result(
                         entry,
                         prepared,
                         execution,
-                        evidence_path,
+                        winner.evidence_path,
                         extra_details=fanout_details(fanout),
                     )
                     details = dict(winner_result.details)
                     budget_complete = details["candidate_call_budget_complete"]
-                    aggregate_budget = {}
-                    if budget_complete:
-                        aggregate_budget = dict(fanout.aggregate_call_budget)
-                        for key, full_value in winner_result.call_budget.items():
-                            aggregate_budget[key] = (
-                                aggregate_budget.get(key, 0)
-                                + full_value
-                                - winner.call_budget.get(key, 0)
-                            )
                     winner_result = replace(
                         winner_result,
-                        call_budget=aggregate_budget,
+                        call_budget=(
+                            fanout.aggregate_call_budget
+                            if budget_complete
+                            else winner_result.call_budget
+                        ),
                         details={
                             **details,
                             "aggregate_call_budget_complete": budget_complete,
                         },
                     )
+
+            representative_result = winner_result
+            if representative_result is None:
+                failed_gate2 = next(
+                    (
+                        item
+                        for item in fanout.branches
+                        if item.status is CandidateBranchStatus.GATE2_FAILED
+                    ),
+                    None,
+                )
+                if failed_gate2 is not None:
+                    failed_runtime = failed_gate2.runtime
+                    if (
+                        isinstance(failed_runtime, tuple)
+                        and len(failed_runtime) == 3
+                        and failed_runtime[2] is not None
+                    ):
+                        representative_result = execution_result(
+                            entry,
+                            prepared,
+                            failed_runtime[2],
+                            failed_gate2.evidence_path,
+                            extra_details=fanout_details(fanout),
+                        )
+                        details = dict(representative_result.details)
+                        budget_complete = details[
+                            "candidate_call_budget_complete"
+                        ]
+                        representative_result = replace(
+                            representative_result,
+                            call_budget=(
+                                fanout.aggregate_call_budget
+                                if budget_complete
+                                else representative_result.call_budget
+                            ),
+                            details={
+                                **details,
+                                "aggregate_call_budget_complete": budget_complete,
+                                "representative_candidate_branch": (
+                                    failed_gate2.branch_id
+                                ),
+                            },
+                        )
+
+            # Persist non-winning candidate searches after all candidates have
+            # had the opportunity to reach their own Gate2. A branch that
+            # already completed Gate2 has already written its full execution;
+            # the remaining branches only need their Gate1 search receipt.
+            candidate_evidence_failures: list[str] = []
+            for branch in fanout.branches:
+                if branch.runtime is None or branch is winner:
+                    continue
+                branch_runtime = branch.runtime
+                if (
+                    not isinstance(branch_runtime, tuple)
+                    or len(branch_runtime) < 2
+                ):
+                    candidate_evidence_failures.append(
+                        f"branch {branch.branch_id} has malformed runtime receipt"
+                    )
+                    continue
+                search, branch_dir = branch_runtime[:2]
+                if len(branch_runtime) >= 3 and branch_runtime[2] is not None:
+                    continue
+                try:
+                    save_workload_gate1_search(
+                        branch_dir,
+                        prepared,
+                        search,
+                        selected_for_gate2=False,
+                    )
+                except Exception as exc:
+                    diagnostic = (
+                        f"branch {branch.branch_id} evidence persistence: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    candidate_evidence_failures.append(diagnostic)
+                    try:
+                        save_workload_failure(branch_dir, exc)
+                    except Exception as failure_exc:
+                        candidate_evidence_failures.append(
+                            f"branch {branch.branch_id} failure receipt persistence: "
+                            f"{type(failure_exc).__name__}: {failure_exc}"
+                        )
+
             case_result = (
-                winner_result
-                if winner_result is not None
+                representative_result
+                if representative_result is not None
                 else fanout_no_closure_result(
                     entry, prepared, fanout, fanout_dir
                 )
             )
+            if candidate_evidence_failures:
+                case_result = replace(
+                    case_result,
+                    diagnostic=(
+                        "; ".join(
+                            item
+                            for item in (
+                                case_result.diagnostic,
+                                *candidate_evidence_failures,
+                            )
+                            if item
+                        )
+                    ),
+                    details={
+                        **dict(case_result.details),
+                        "candidate_evidence_persistence_failures": (
+                            candidate_evidence_failures
+                        ),
+                    },
+                )
             save_candidate_fanout_report(
                 fanout_dir,
                 fanout,
@@ -1314,6 +1597,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 lift_backend=args.lift_backend,
                 replay_backend=args.replay_backend,
+                max_lift_calls=args.max_lift_calls,
             )
             return case_result
 
@@ -1341,7 +1625,14 @@ def main(argv: list[str] | None = None) -> int:
                         entry.ordinal,
                         BatchClassification.HARNESS_INVALID,
                         entry.representative_tier,
-                        diagnostic=f"{type(exc).__name__}: {exc}",
+                        diagnostic=(
+                            "failure_class=harness_preparation; cause_class="
+                            + type(exc).__name__
+                        ),
+                        details={
+                            "failure_class": "harness_preparation",
+                            "cause_class": type(exc).__name__,
+                        },
                     )
                     return result
                 progress.stage_transition(

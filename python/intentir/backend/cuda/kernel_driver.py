@@ -31,8 +31,16 @@ from pathlib import Path
 
 from intentir.backend.cuda.compile import (INTENT_OPT, _run,
                                        lower_memref_module_to_kernels)
-from intentir.backend.cuda.launch import (I64Arg, PtrArg, _driver, _marshal,
-                                      load_module)
+from intentir.backend.cuda.launch import (
+    I64Arg,
+    PtrArg,
+    U16Arg,
+    U32Arg,
+    U8Arg,
+    _driver,
+    _marshal,
+    load_module,
+)
 from intentir.backend.cuda.launch_config import single_launch_config
 from intentir.backend.cuda.orchestrate import (_host_func_text,
                                            _map_input_aligned_ptrs,
@@ -43,6 +51,32 @@ from intentir.frontend.emit_mlir import emit_module
 from intentir.ir.model import IntentFunction
 
 _REPO = Path(__file__).resolve().parents[4]
+
+
+def _scalar_arg(kind: str, value: int):
+    constructors = {
+        "i64": I64Arg,
+        "u8": U8Arg,
+        "u16": U16Arg,
+        "u32": U32Arg,
+    }
+    try:
+        return constructors[kind](value)
+    except KeyError as exc:
+        raise RuntimeError(f"unsupported scalar launch argument {kind!r}") from exc
+
+
+def _append_scalar_plan(plan, ty: str, consts, ssa: str, *, context: str) -> None:
+    kind = {
+        "i64": "i64",
+        "index": "i64",
+        "ui8": "u8",
+        "ui16": "u16",
+        "ui32": "u32",
+    }.get(ty)
+    if kind is None:
+        raise RuntimeError(f"{context}: unhandled launch-arg {ty}")
+    plan.append((kind, int(consts[ssa][0])))
 
 
 def _intent_mlir(name: str, dims: dict) -> str:
@@ -139,25 +173,29 @@ class RowReductionKernel:
                                 where=f"({name} {pass_name})")
             self.grid, self.block = plan.grid, plan.block
             self.shared = plan.smem
-        # plan: per launch arg, ("ptr", input_index) | ("i64", literal value).
-        # An i64 arg appears when -canonicalize hoists a constant out of the
+        # plan: per launch arg, ("ptr", input_index) or a typed scalar literal.
+        # Scalar args appear when -canonicalize hoists a constant out of the
         # launch region so the outliner captures it (e.g. a folded `1`).
         self.plan = []
         for op in site.args:
             if op.ty.startswith("!llvm.ptr"):
                 self.plan.append(("ptr", aligned[op.ssa]))
-            elif op.ty in ("i64", "index"):
-                self.plan.append(("i64", int(consts[op.ssa][0])))
             else:
-                raise RuntimeError(f"row_reduction: unhandled launch-arg {op.ty}")
+                _append_scalar_plan(
+                    self.plan, op.ty, consts, op.ssa, context="row_reduction"
+                )
         self._cuda = _driver()
 
     def thunk(self, tensors):
         """A zero-arg NO-SYNC launch closure binding `tensors` (kept alive)."""
         import torch
 
-        args = [PtrArg(tensors[i].data_ptr()) if kind == "ptr" else I64Arg(i)
-                for kind, i in self.plan]
+        args = [
+            PtrArg(tensors[i].data_ptr())
+            if kind == "ptr"
+            else _scalar_arg(kind, i)
+            for kind, i in self.plan
+        ]
         keep, argp = _marshal(args)
         cuda, func, grid, block = self._cuda, self.func, self.grid, self.block
         shared = self.shared
@@ -231,7 +269,12 @@ class CompactKernel:
 
         import torch
 
-        _dtype = {"i64": torch.int64, "i32": torch.int32, "f32": torch.float32}
+        _dtype = {
+            "i64": torch.int64,
+            "index": torch.int64,
+            "i32": torch.int32,
+            "f32": torch.float32,
+        }
         self._scratch: dict[str, "torch.Tensor"] = {}
         for m in re.finditer(r"(%\w+)\s*=\s*llvm\.call\s+@malloc\((%\w+)\)", ftext):
             res, size_ssa = m.group(1), m.group(2)
@@ -266,10 +309,10 @@ class CompactKernel:
                         raise RuntimeError(
                             f"compact: ptr operand {op.ssa} is neither input "
                             f"nor scratch")
-                elif op.ty in ("i64", "index"):
-                    plan.append(("i64", int(consts[op.ssa][0])))
                 else:
-                    raise RuntimeError(f"compact: unhandled launch-arg {op.ty}")
+                    _append_scalar_plan(
+                        plan, op.ty, consts, op.ssa, context="compact"
+                    )
             self._sites.append((func, grid, block, shared, plan))
         self._cuda = _driver()
 
@@ -290,7 +333,7 @@ class CompactKernel:
                 elif kind == "scratch":
                     args.append(PtrArg(self._scratch[v].data_ptr()))
                 else:
-                    args.append(I64Arg(v))
+                    args.append(_scalar_arg(kind, v))
             keep, argp = _marshal(args)
             packed.append((func, grid, block, shared, keep, argp,
                            int(ctypes.addressof(argp))))
@@ -400,18 +443,22 @@ class MatmulKernel:
         for op in site.args:
             if op.ty.startswith("!llvm.ptr"):
                 self.plan.append(("ptr", aligned[op.ssa]))
-            elif op.ty in ("i64", "index"):
-                self.plan.append(("i64", int(consts[op.ssa][0])))
             else:
-                raise RuntimeError(f"matmul: unhandled launch-arg {op.ty}")
+                _append_scalar_plan(
+                    self.plan, op.ty, consts, op.ssa, context="matmul"
+                )
         self._cuda = _driver()
 
     def thunk(self, tensors):
         """A zero-arg NO-SYNC launch closure binding `tensors` (kept alive)."""
         import torch
 
-        args = [PtrArg(tensors[i].data_ptr()) if kind == "ptr" else I64Arg(i)
-                for kind, i in self.plan]
+        args = [
+            PtrArg(tensors[i].data_ptr())
+            if kind == "ptr"
+            else _scalar_arg(kind, i)
+            for kind, i in self.plan
+        ]
         keep, argp = _marshal(args)
         cuda, func, grid, block = self._cuda, self.func, self.grid, self.block
         shared = self.shared
@@ -490,18 +537,22 @@ class ConvMMAKernel:
         for op in site.args:
             if op.ty.startswith("!llvm.ptr"):
                 self.plan.append(("ptr", aligned[op.ssa]))
-            elif op.ty in ("i64", "index"):
-                self.plan.append(("i64", int(consts[op.ssa][0])))
             else:
-                raise RuntimeError(f"conv-mma: unhandled launch-arg {op.ty}")
+                _append_scalar_plan(
+                    self.plan, op.ty, consts, op.ssa, context="conv-mma"
+                )
         self._cuda = _driver()
 
     def thunk(self, tensors):
         """A zero-arg NO-SYNC launch closure binding `tensors` (kept alive)."""
         import torch
 
-        args = [PtrArg(tensors[i].data_ptr()) if kind == "ptr" else I64Arg(i)
-                for kind, i in self.plan]
+        args = [
+            PtrArg(tensors[i].data_ptr())
+            if kind == "ptr"
+            else _scalar_arg(kind, i)
+            for kind, i in self.plan
+        ]
         keep, argp = _marshal(args)
         cuda, func, grid, block = self._cuda, self.func, self.grid, self.block
         shared = self.shared

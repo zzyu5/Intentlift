@@ -27,6 +27,13 @@ _DTYPE_ALIASES = {
     "int16": "i16",
     "int32": "i32",
     "int64": "i64",
+    "index": "i64",
+    "uint8": "u8",
+    "uint16": "u16",
+    "uint32": "u32",
+    "ui8": "u8",
+    "ui16": "u16",
+    "ui32": "u32",
 }
 
 
@@ -219,14 +226,20 @@ class ComparisonPolicy:
 
     def validate_j(self, j: SemanticArchive) -> None:
         explicit = {item.output: item for item in j.boundary.result_relations}
-        for output in j.intent.outputs:
-            relation = explicit.get(output.name)
+        output_bindings = j_elaboration(j).output_bindings
+        for binding in output_bindings:
+            relation = explicit.get(binding.output)
             kind = (
                 relation.kind
                 if relation is not None
                 else ResultRelationKind.EXACT
             )
-            self.rule_for_output(j, output.name, kind, output.dtype)
+            self.rule_for_output(
+                j,
+                binding.output,
+                kind,
+                binding.output_type.dtype,
+            )
 
     def rule_for_output(
         self,
@@ -303,6 +316,9 @@ def _operation_dependencies(operation: Mapping[str, Any]) -> tuple[str, ...]:
             if isinstance(arm, Mapping):
                 add(arm.get("yield_value"))
     if operation.get("op") == "loop":
+        trip = operation.get("trip")
+        if isinstance(trip, Mapping) and "upper_bound" in trip:
+            add(trip.get("upper_bound"))
         for item in operation.get("scan", ()):
             if isinstance(item, Mapping):
                 add(item.get("from"))
@@ -313,31 +329,6 @@ def _operation_dependencies(operation: Mapping[str, Any]) -> tuple[str, ...]:
         for value in operation.get("yield", ()):
             add(value)
     return tuple(result)
-
-
-def _walk_operations(
-    body: Any,
-    *,
-    prefix: str = "body",
-) -> Iterable[tuple[str, Mapping[str, Any]]]:
-    if not isinstance(body, list):
-        return
-    for index, operation in enumerate(body):
-        if not isinstance(operation, Mapping):
-            continue
-        path = f"{prefix}[{index}]"
-        yield path, operation
-        yield from _walk_operations(
-            operation.get("body"), prefix=f"{path}.body"
-        )
-        if operation.get("op") in {"effect_if", "value_if"}:
-            for polarity in ("positive", "negative"):
-                arm = operation.get(polarity)
-                if isinstance(arm, Mapping):
-                    yield from _walk_operations(
-                        arm.get("body"),
-                        prefix=f"{path}.{polarity}.body",
-                    )
 
 
 _FLOAT_PRECISION_RANK = {"bf16": 0, "f16": 1, "f32": 2, "f64": 3}
@@ -356,15 +347,28 @@ def _output_low_precision_compute_dtype(
     if output_rank is None:
         return None
 
-    intent = j.intent.to_json()["intent_function"]
-    operations = dict(_walk_operations(intent.get("body", [])))
-    path_to_node = {path: node for node, path in j.node_ids.items()}
-    nodes: dict[str, Mapping[str, Any]] = dict(operations)
+    # Use canonical J's one operation record stream.  The complete ``wire``
+    # column retains loop/conditional dependencies while the shared path/id
+    # columns keep node attachment deterministic; this consumer must not
+    # rescan ``intent.body`` and create a second operation interpretation.
+    operation_records = j_elaboration(j).operation_record_by_ref(j.node_ids)
+    if operation_records is None:
+        raise ComparisonPolicyError(
+            "Gate2 policy cannot materialize canonical operation references"
+        )
+    operations = {
+        path: record["wire"]
+        for path, record in operation_records.items()
+        if path.startswith("body[")
+        and isinstance(record.get("wire"), Mapping)
+    }
+    nodes: dict[str, Mapping[str, Any]] = {
+        ref: record["wire"]
+        for ref, record in operation_records.items()
+        if isinstance(record.get("wire"), Mapping)
+    }
     producers: dict[str, Mapping[str, Any]] = {}
     for path, operation in operations.items():
-        node = path_to_node.get(path)
-        if node is not None:
-            nodes[node] = operation
         for result in _operation_results(operation):
             producers[result] = operation
 
@@ -403,7 +407,11 @@ def _output_low_precision_compute_dtype(
             continue
         for operand in _operation_dependencies(operation):
             value_type = value_types.get(operand)
-            if value_type is None:
+            if (
+                value_type is None
+                or not value_type.is_tensor
+                or value_type.dtype is None
+            ):
                 continue
             operand_dtype = canonical_dtype(value_type.dtype)
             operand_rank = _FLOAT_PRECISION_RANK.get(operand_dtype)

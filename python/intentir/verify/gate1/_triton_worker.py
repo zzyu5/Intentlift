@@ -27,6 +27,7 @@ from intentir.verify.triton_compat import (
     TRITON_DOT_COMPAT_PROTOCOL as _TRITON_DOT_COMPAT_PROTOCOL,
     normalize_deprecated_triton_dot as _normalize_deprecated_triton_dot,
 )
+from intentir.verify.gate1.compiler import _compiled_external_math, _libdevice_snapshot
 
 _REQUEST_SCHEMA = 2
 
@@ -95,7 +96,35 @@ def _load_module(
     filename: str | None = None,
     trusted_source: bool = False,
     source_identity_code: str | None = None,
+    import_roots: tuple[str, ...] = (),
 ) -> ModuleType:
+    # This file is executed by path, so Python places its containing
+    # ``gate1`` directory ahead of the standard library on ``sys.path``.
+    # That directory contains the package module ``profile.py``; leaving it
+    # there makes a trusted Source import of Torch resolve ``import profile``
+    # to IntentIR's relative-import module instead of the stdlib module used
+    # by ``cProfile``.  Remove only this worker directory before importing
+    # external Source dependencies.  Package imports still use the repository
+    # ``python`` root and the explicitly supplied Source import roots.
+    worker_directory = Path(__file__).resolve().parent
+    cleaned_path: list[str] = []
+    for entry in sys.path:
+        try:
+            if Path(entry or ".").resolve() == worker_directory:
+                continue
+        except (OSError, RuntimeError, TypeError):
+            pass
+        cleaned_path.append(entry)
+    sys.path[:] = cleaned_path
+    if trusted_source:
+        for raw_root in import_roots:
+            root = Path(raw_root).expanduser().resolve()
+            if not root.is_dir():
+                raise ValueError(
+                    f"trusted Source import root is not a directory: {root}"
+                )
+            if str(root) not in sys.path:
+                sys.path.insert(0, str(root))
     digest = hashlib.sha256(code.encode("utf-8")).hexdigest()[:16]
     path: Path
     package_name: str | None = None
@@ -143,12 +172,15 @@ def _torch_dtype(torch: Any, name: str) -> Any:
     aliases = {
         "bool": torch.bool,
         "uint8": torch.uint8,
+        "uint16": torch.uint16,
+        "uint32": torch.uint32,
         "int8": torch.int8,
         "int16": torch.int16,
         "short": torch.int16,
         "int32": torch.int32,
         "int": torch.int32,
         "int64": torch.int64,
+        "index": torch.int64,
         "long": torch.int64,
         "float16": torch.float16,
         "half": torch.float16,
@@ -267,6 +299,54 @@ def _interface(kernel: Any) -> dict[str, Any]:
     }
 
 
+def _compiled_interface(kernel: Any, compiled: Any, ttir: str) -> dict[str, Any]:
+    """Bind surviving ABI slots to the compiler's actual ASTSource, not types.
+
+    This metadata stays host-side. Missing or nested argument metadata is not
+    approximated by ordinal/type alignment; Source observation will reject it.
+    """
+    interface = _interface(kernel)
+    source = getattr(compiled, "src", None)
+    signature = getattr(source, "signature", None)
+    constants = getattr(source, "constants", None)
+    names = interface["arg_names"]
+    if (
+        getattr(source, "fn", None) is not kernel
+        or not isinstance(signature, dict)
+        or set(signature) != set(names)
+        or not all(isinstance(value, str) for value in signature.values())
+        or not isinstance(constants, dict)
+        or any(
+            not isinstance(path, tuple) or len(path) != 1
+            or type(path[0]) is not int or not 0 <= path[0] < len(names)
+            for path in constants
+        )
+    ):
+        return interface
+    specialized = {path[0] for path in constants}
+    if not set(interface["constexpr_indices"]).issubset(specialized):
+        return interface
+    runtime = [name for index, name in enumerate(names) if index not in specialized]
+    interface.update({
+        "compiled_arg_names": runtime,
+        "compiled_arg_types": [signature[name] for name in runtime],
+        "specialized_arg_names": [names[index] for index in sorted(specialized)],
+        "compiled_entry_name": compiled.name,
+        "compiled_source_function": kernel.__name__,
+        "compiled_ttir_sha256": hashlib.sha256(ttir.encode("utf-8")).hexdigest(),
+        "compiled_source_file": kernel.fn.__code__.co_filename,
+    })
+    return interface
+
+
+class _EntryLookupError(AttributeError):
+    pass
+
+
+class _EntryTypeError(TypeError):
+    pass
+
+
 def _target_metadata(torch: Any, triton: Any, device: str) -> dict[str, Any]:
     target: dict[str, Any] = {}
     try:
@@ -316,6 +396,50 @@ def _compiler_metadata(torch: Any, triton: Any) -> dict[str, Any]:
     }
 
 
+def _closed_compile_failure_class(exc: BaseException) -> str:
+    """Classify frontend/compiler failures without exporting source or text."""
+
+    exception_type = type(exc).__name__
+    if isinstance(exc, _EntryLookupError):
+        return "triton_replay_entry_lookup_failed"
+    if isinstance(exc, _EntryTypeError):
+        return "triton_replay_entry_type_failed"
+    message = str(exc).casefold()
+    if "cuda is unavailable" in message:
+        return "triton_compile_cuda_unavailable"
+    if exception_type == "OutOfResources":
+        return "triton_compile_resources_exceeded"
+    if exception_type == "CompilationError":
+        if "broadcast" in message or "incompatible block" in message:
+            return "triton_frontend_broadcast_invalid"
+        if "reshape" in message:
+            return "triton_frontend_reshape_invalid"
+        if "constexpr" in message:
+            return "triton_frontend_constexpr_usage_invalid"
+        if "pointer" in message:
+            return "triton_frontend_pointer_expression_invalid"
+        if "index" in message or "subscript" in message:
+            return "triton_frontend_tensor_index_invalid"
+        if "invalid operand" in message or "incompatible type" in message:
+            return "triton_frontend_operand_type_invalid"
+        if "@triton.jit" in message:
+            return "triton_frontend_helper_jit_missing"
+        return "triton_frontend_compilation_failed"
+    if exception_type == "SyntaxError":
+        return "triton_replay_module_syntax_failed"
+    if exception_type == "AttributeError":
+        return "triton_compile_attribute_unavailable"
+    if exception_type == "TypeError":
+        return "triton_compile_type_incompatible"
+    if exception_type == "ValueError":
+        if "python interface" in message or "runtime arguments" in message:
+            return "triton_replay_callable_abi_failed"
+        return "triton_compile_value_validation_failed"
+    if exception_type == "RuntimeError":
+        return "triton_compile_runtime_failed"
+    return "triton_compile_worker_failed"
+
+
 def _compile(request: Mapping[str, Any]) -> dict[str, Any]:
     import torch
     import triton
@@ -343,12 +467,13 @@ def _compile(request: Mapping[str, Any]) -> dict[str, Any]:
             ),
             trusted_source=source.get("trust_role") == "trusted_source",
             source_identity_code=source_code,
+            import_roots=tuple(source.get("import_roots", ())),
         )
         kernel = getattr(module, function_name, None)
         if kernel is None:
-            raise AttributeError(f"Triton function {function_name!r} is missing")
+            raise _EntryLookupError(f"Triton function {function_name!r} is missing")
         if not hasattr(kernel, "warmup") or not hasattr(kernel, "arg_names"):
-            raise TypeError(f"{function_name!r} is not a Triton JIT function")
+            raise _EntryTypeError(f"{function_name!r} is not a Triton JIT function")
 
         interface = _interface(kernel)
         declared = set(interface["arg_names"])
@@ -374,6 +499,7 @@ def _compile(request: Mapping[str, Any]) -> dict[str, Any]:
         # already frozen, so compile the metadata-owning JITFunction directly;
         # invoking an outer autotuner would both run policy and conflict with C.
         compilable = _jit_metadata_owner(kernel)
+        library_before = _libdevice_snapshot(triton.__file__)
         warmup_result = compilable.warmup(grid=grid, **values)
         if warmup_result is None:
             raise RuntimeError("Triton warmup returned no compiled kernel")
@@ -397,10 +523,13 @@ def _compile(request: Mapping[str, Any]) -> dict[str, Any]:
             "ok": True,
             "ttir": ttir,
             "ttgir": ttgir,
-            "python_interface": interface,
+            "external_math": _compiled_external_math(compiled, ttir, library_before),
+            "python_interface": _compiled_interface(compilable, compiled, ttir),
             "compiler": compiler_metadata,
             "target": target,
             "diagnostic": "",
+            "failure_class": None,
+            "exception_type": None,
             "asm_keys": asm_keys,
         }
 
@@ -443,6 +572,8 @@ def main() -> int:
             "diagnostic": "".join(
                 traceback.format_exception(type(exc), exc, exc.__traceback__)
             ),
+            "failure_class": _closed_compile_failure_class(exc),
+            "exception_type": type(exc).__name__,
             "asm_keys": [],
         }
     result["elapsed_ms"] = (time.monotonic() - started) * 1000.0

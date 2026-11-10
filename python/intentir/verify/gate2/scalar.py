@@ -5,56 +5,32 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 import numpy as np
 
 from intentir.backend.cpu.abi import CPUABIValidationError, CPUBackendUnsupportedError
-from intentir.backend.cpu.contract_reference import (
-    ContractReferenceUnsupportedError,
-    execute_contract_reference,
-    project_contract_reference,
-)
 from intentir.backend.cpu.pipeline import execute_on_cpu_outputs
 from intentir.backend.cpu.structured_reference import (
     execute_structured_reference,
     requires_structured_reference,
 )
 from intentir.ir.canonical_j import (
-    ContractExpr,
-    ContractSort,
     canonical_broadcast_axes,
     elaborate_j,
     j_elaboration,
-    parse_contract_expr,
-    parse_index_expression,
 )
-from intentir.ir.contract_ir import project_contract_ir
 from intentir.ir.dim_expr import validate_dimension_instantiation
 from intentir.ir.dimension_relation import resolve_dimension_relations
 from intentir.ir.functional_boundary import (
-    access_predicates_are_logical_domain_total,
-    direct_logical_operand_sources,
-    explicit_inout_poststate_reload_value,
-    parse_direct_axes,
-    predicate_dominated_pointwise_load,
     project_functional_boundary,
-    project_functional_boundary_for_refeval,
-    project_predicate_text,
     static_index_bounds_status,
 )
 from intentir.ir.integer_range import proves_index_bounds
 from intentir.ir.value_dimension import validate_value_dimension_instantiation
-from intentir.ir.model import IntentOp
-from intentir.verify.gate1.model import (
-    AccessKind,
-    EffectKind,
-    ParameterKind,
-    ParameterMode,
-    SemanticArchive,
-)
+from intentir.verify.gate1.model import SemanticArchive
 
-from .model import ExecutionResult
+from .model import ExecutionResult, output_binding_digest, output_digest
 
 
 SCALAR_LOWERING_PROTOCOL = "j_scalar_cpu_mlir_v24"
@@ -92,761 +68,6 @@ def _canonical_str_mapping(value: Mapping[str, str]) -> tuple[tuple[str, str], .
     ):
         raise ValueError("scalar bindings must map non-empty names")
     return tuple(sorted(value.items()))
-
-
-def _walk_ops(body: Sequence[IntentOp]) -> tuple[IntentOp, ...]:
-    result: list[IntentOp] = []
-    for op in body:
-        result.append(op)
-        result.extend(_walk_ops(op.body))
-    return tuple(result)
-
-
-def _node_table(j: SemanticArchive) -> dict[str, IntentOp]:
-    by_path: dict[str, IntentOp] = {}
-
-    def visit(body: Sequence[IntentOp], prefix: str = "body") -> None:
-        for index, op in enumerate(body):
-            path = f"{prefix}[{index}]"
-            by_path[path] = op
-            visit(op.body, f"{path}.body")
-
-    visit(j.intent.body)
-    result: dict[str, IntentOp] = dict(by_path)
-    for node_id, path in j.node_ids.items():
-        if path in by_path:
-            result[node_id] = by_path[path]
-    return result
-
-
-def _result_names(op: IntentOp) -> tuple[str, ...]:
-    if isinstance(op.result, str):
-        return (op.result,)
-    if isinstance(op.result, list):
-        return tuple(op.result)
-    return ()
-
-
-def _parse_direct_index(expression: str) -> tuple[str, ...]:
-    """Compatibility helper; the shared projection owns interpretation."""
-
-    return parse_direct_axes(expression)
-
-
-def _flatten_conjunction(expression: ContractExpr) -> tuple[ContractExpr, ...]:
-    if expression.op != "and":
-        return (expression,)
-    result: list[ContractExpr] = []
-    for argument in expression.args:
-        result.extend(_flatten_conjunction(argument))
-    return tuple(result)
-
-
-def _reference(expression: ContractExpr) -> str | None:
-    if expression.op == "ref" and isinstance(expression.value, str):
-        return expression.value
-    return None
-
-
-def _bound_value(expression: ContractExpr) -> int | str | None:
-    if expression.op == "int" and isinstance(expression.value, int):
-        return expression.value
-    return _reference(expression)
-
-
-def _domain_predicate_contract(
-    expression: ContractExpr,
-    *,
-    logical_guards: frozenset[str] = frozenset(),
-) -> tuple[
-    frozenset[str],
-    frozenset[str],
-    tuple[tuple[str, int | str], ...],
-]:
-    """Project the typed AST onto the mask-erasure profile understood by E_J."""
-
-    lower: set[str] = set()
-    guards: set[str] = set()
-    upper: dict[str, int | str] = {}
-    for term in _flatten_conjunction(expression):
-        guard = _reference(term)
-        if guard is None and term.op == "not" and len(term.args) == 1:
-            guard = _reference(term.args[0])
-        if guard in logical_guards:
-            guards.add(guard)
-            continue
-
-        left, right = term.args if len(term.args) == 2 else (None, None)
-        lower_axis: str | None = None
-        if term.op == "le" and left is not None and right is not None:
-            if left.op == "int" and left.value == 0:
-                lower_axis = _reference(right)
-        elif term.op == "ge" and left is not None and right is not None:
-            if right.op == "int" and right.value == 0:
-                lower_axis = _reference(left)
-        if lower_axis is not None:
-            lower.add(lower_axis)
-            continue
-
-        upper_axis: str | None = None
-        extent: int | str | None = None
-        if term.op == "lt" and left is not None and right is not None:
-            upper_axis = _reference(left)
-            extent = _bound_value(right)
-        if upper_axis is None or extent is None:
-            raise NotImplementedError(
-                "E_J mask erasure supports only logical-domain bound predicates"
-            )
-        previous = upper.get(upper_axis)
-        if previous is not None and previous != extent:
-            raise ValueError(
-                f"E_J predicate axis {upper_axis!r} has conflicting extents"
-            )
-        upper[upper_axis] = extent
-    if not upper and not guards:
-        raise NotImplementedError(
-            "E_J mask erasure requires an upper logical-domain bound"
-        )
-    return (
-        frozenset(guards),
-        frozenset(lower),
-        tuple(sorted(upper.items())),
-    )
-
-
-def _parse_domain_predicate(
-    expression: str,
-    *,
-    logical_guards: frozenset[str] = frozenset(),
-) -> tuple[
-    frozenset[str],
-    frozenset[str],
-    tuple[tuple[str, int | str], ...],
-]:
-    projection = project_predicate_text(
-        expression,
-        logical_guards=logical_guards,
-    )
-    return (
-        projection.guards,
-        projection.lower_axes,
-        projection.upper_bounds,
-    )
-
-
-def _logical_scalar_inputs(j: SemanticArchive) -> frozenset[str]:
-    inputs = {item.name: item for item in j.intent.inputs}
-    return frozenset(
-        parameter.logical_ref
-        for parameter in j.signature.parameters
-        if parameter.kind in {ParameterKind.SCALAR, ParameterKind.CONSTEXPR}
-        and parameter.logical_ref in inputs
-        and not inputs[parameter.logical_ref].shape
-    )
-
-
-def _logical_boolean_guards(j: SemanticArchive) -> frozenset[str]:
-    inputs = {item.name: item for item in j.intent.inputs}
-    return frozenset(
-        name
-        for name in _logical_scalar_inputs(j)
-        if inputs[name].dtype in {"bool", "i1"}
-    )
-
-
-def _canonical_full_domains(j: SemanticArchive) -> dict[str, int | str]:
-    """Project the one accepted J onto complete logical axis bounds."""
-
-    elaboration = j_elaboration(j)
-    result: dict[str, int | str] = {}
-    logical_guards = _logical_boolean_guards(j)
-    for domain_id, expression in elaboration.domains:
-        try:
-            guards, lower, upper = _domain_predicate_contract(
-                expression, logical_guards=logical_guards
-            )
-        except NotImplementedError as exc:
-            raise NotImplementedError(
-                "E_J dense domain requires complete logical axis bounds; "
-                f"unsupported domain {domain_id!r}"
-            ) from exc
-        if guards and not upper:
-            continue
-        if set(axis for axis, _ in upper) - set(lower):
-            raise NotImplementedError(
-                f"E_J dense domain {domain_id!r} lacks a lower zero bound"
-            )
-        for axis, extent in upper:
-            previous = result.get(axis)
-            if previous is not None and previous != extent:
-                raise ValueError(
-                    f"E_J domain axis {axis!r} has conflicting extents"
-                )
-            result[axis] = extent
-    return result
-
-
-def _parse_full_domains(j: SemanticArchive) -> dict[str, int | str]:
-    """Compatibility API; consumers elaborate once and use the typed view."""
-
-    return _canonical_full_domains(elaborate_j(j))
-
-
-def _validate_masked_sum_reduction(
-    j: SemanticArchive,
-    *,
-    domains: Mapping[str, int | str],
-    axes_by_access: Mapping[str, tuple[str, ...]],
-    predicates_by_access: Mapping[
-        str,
-        tuple[
-            frozenset[str],
-            frozenset[str],
-            tuple[tuple[str, int | str], ...],
-        ]
-        | None,
-    ],
-) -> None:
-    """Validate the narrow padded single-axis sum projection supported by E_J."""
-
-    boundary = j.boundary
-    if (
-        len(j.intent.inputs) != 1
-        or len(j.intent.outputs) != 1
-        or len(boundary.reductions) != 1
-    ):
-        raise NotImplementedError(
-            "E_J padded reduction requires one input, output, and contract"
-        )
-    if (
-        boundary.aliases
-        or boundary.broadcasts
-        or boundary.index_bounds
-        or boundary.updates
-    ):
-        raise NotImplementedError(
-            "E_J padded reduction does not implement auxiliary boundary relations"
-        )
-    loads = [item for item in boundary.accesses if item.kind is AccessKind.LOAD]
-    stores = [item for item in boundary.accesses if item.kind is AccessKind.STORE]
-    if len(loads) != 1 or len(stores) != 1:
-        raise NotImplementedError(
-            "E_J padded reduction requires one dense load and one store"
-        )
-    load, store = loads[0], stores[0]
-    if load.tensor != j.intent.inputs[0].name or store.tensor != j.intent.outputs[0].name:
-        raise ValueError("E_J padded reduction access tensors differ from J ABI")
-    if (
-        isinstance(load.fill_value, bool)
-        or not isinstance(load.fill_value, (int, float))
-        or float(load.fill_value) != 0.0
-    ):
-        raise NotImplementedError(
-            "E_J padded sum requires an explicit zero masked-load fill"
-        )
-    if store.predicate is not None or store.fill_value is not None:
-        raise NotImplementedError(
-            "E_J padded reduction requires an unpredicated output store"
-        )
-
-    nodes = _node_table(j)
-    contract = boundary.reductions[0]
-    reduction = nodes.get(contract.node_ref)
-    if reduction is None or reduction.op != "reduce":
-        raise ValueError("E_J padded reduction contract does not target reduce")
-    if reduction.attrs.get("fn") != "sum":
-        raise NotImplementedError(
-            "E_J padded reduction currently supports sum only"
-        )
-    reduction_axes = reduction.attrs.get("axes")
-    if (
-        not isinstance(reduction_axes, list)
-        or len(reduction_axes) != 1
-        or isinstance(reduction_axes[0], bool)
-        or not isinstance(reduction_axes[0], int)
-    ):
-        raise NotImplementedError(
-            "E_J padded reduction requires one canonical integer axis"
-        )
-    reduced_axis = reduction_axes[0]
-    input_tensor = j.intent.inputs[0]
-    output_tensor = j.intent.outputs[0]
-    if input_tensor.dtype != output_tensor.dtype:
-        raise NotImplementedError(
-            "E_J padded sum currently requires equal input/output dtype"
-        )
-    if reduced_axis < 0 or reduced_axis >= len(input_tensor.shape):
-        raise ValueError("E_J padded reduction axis is outside input rank")
-    expected_output_shape = [
-        extent
-        for index, extent in enumerate(input_tensor.shape)
-        if index != reduced_axis
-    ]
-    if output_tensor.shape != expected_output_shape:
-        raise ValueError("E_J padded reduction output shape is not axis removal")
-
-    load_axes = axes_by_access[load.access_id]
-    store_axes = axes_by_access[store.access_id]
-    if set(domains) != set(load_axes):
-        raise NotImplementedError(
-            "E_J padded reduction requires a full domain for every input axis"
-        )
-    expected_store_axes = tuple(
-        axis for index, axis in enumerate(load_axes) if index != reduced_axis
-    )
-    if store_axes != expected_store_axes:
-        raise ValueError("E_J padded reduction store indices are not axis removal")
-    predicate = predicates_by_access[load.access_id]
-    if predicate is None:
-        raise NotImplementedError("E_J padded reduction requires a load predicate")
-    guards, lower_axes, upper_bounds = predicate
-    if guards:
-        raise NotImplementedError(
-            "E_J padded reduction does not consume logical guard predicates"
-        )
-    reduced_index = load_axes[reduced_axis]
-    expected_bound = (reduced_index, input_tensor.shape[reduced_axis])
-    if upper_bounds != (expected_bound,) or not lower_axes.issubset({reduced_index}):
-        raise ValueError(
-            "E_J padded reduction predicate does not bind the reduced axis"
-        )
-    if predicates_by_access[store.access_id] is not None:
-        raise NotImplementedError(
-            "E_J padded reduction output store must be unpredicated"
-        )
-    if store.node_ref is None or nodes.get(store.node_ref) is not reduction:
-        raise ValueError("E_J padded reduction store does not target reduce result")
-    if not isinstance(reduction.result, str):
-        raise NotImplementedError("E_J padded reduction requires one result")
-    output_values = {
-        item.output: item.value for item in j_elaboration(j).output_bindings
-    }
-    if output_values != {output_tensor.name: reduction.result}:
-        raise ValueError("E_J padded reduction result is not the J output")
-
-    body = j.intent.body
-    if not body or body[-1] is not reduction or any(op.body for op in body):
-        raise NotImplementedError(
-            "E_J padded reduction requires one flat graph ending in reduction"
-        )
-    if sum(op.op == "reduce" for op in body) != 1:
-        raise NotImplementedError(
-            "E_J padded reduction requires exactly one reduction node"
-        )
-    if len(reduction.operands) != 1:
-        raise NotImplementedError(
-            "E_J padded reduction requires one reduced value"
-        )
-    producers: dict[str, IntentOp] = {}
-    for op in body:
-        results = _result_names(op)
-        if len(results) != 1:
-            raise NotImplementedError(
-                "E_J padded reduction requires single-result value nodes"
-            )
-        producers[results[0]] = op
-    required_prefix: set[int] = set()
-    pending = list(reduction.operands)
-    while pending:
-        value = pending.pop()
-        producer = producers.get(value)
-        if producer is None:
-            if value != input_tensor.name:
-                raise ValueError(
-                    "E_J padded reduction dataflow has a non-input leaf"
-                )
-            continue
-        if producer is reduction:
-            raise ValueError("E_J padded reduction dataflow is cyclic")
-        marker = id(producer)
-        if marker in required_prefix:
-            continue
-        required_prefix.add(marker)
-        pending.extend(producer.operands)
-    if required_prefix != {id(op) for op in body[:-1]}:
-        raise NotImplementedError(
-            "E_J padded reduction requires every prefix node to feed reduction"
-        )
-    load_owner = nodes.get(load.node_ref) if load.node_ref is not None else None
-    if load_owner is not reduction and id(load_owner) not in required_prefix:
-        raise ValueError(
-            "E_J padded reduction load does not feed the reduction slice"
-        )
-    for op in body[:-1]:
-        if (
-            op.type is None
-            or op.type.get("dtype") != input_tensor.dtype
-            or op.type.get("shape") != input_tensor.shape
-        ):
-            raise NotImplementedError(
-                "E_J padded reduction prefix must preserve input dtype and shape"
-            )
-    padded_values: dict[str, float] = {
-        input_tensor.name: float(load.fill_value),
-    }
-    for op in body[:-1]:
-        operands = [padded_values.get(value) for value in op.operands]
-        if any(value is None for value in operands):
-            raise NotImplementedError(
-                "E_J cannot prove the padded contribution through this dataflow"
-            )
-        if (
-            op.op == "map_binary"
-            and op.attrs.get("fn") == "mul"
-            and len(operands) == 2
-        ):
-            padded_result = float(operands[0]) * float(operands[1])
-        elif (
-            op.op == "map_unary"
-            and op.attrs.get("fn") == "identity"
-            and len(operands) == 1
-        ):
-            padded_result = float(operands[0])
-        else:
-            raise NotImplementedError(
-                "E_J padded reduction supports only a zero-stable identity/mul prefix"
-            )
-        padded_values[_result_names(op)[0]] = padded_result
-    padded_contribution = padded_values.get(reduction.operands[0])
-    if padded_contribution != 0.0:
-        raise NotImplementedError(
-            "E_J padded reduction prefix does not map fill to sum identity"
-        )
-    if (
-        reduction.type is None
-        or reduction.type.get("dtype") != output_tensor.dtype
-        or reduction.type.get("shape") != output_tensor.shape
-    ):
-        raise ValueError(
-            "E_J padded reduction result type differs from the output ABI"
-        )
-
-    if contract.tile_axis != 0:
-        raise NotImplementedError(
-            "E_J padded reduction requires the single physical tile axis 0"
-        )
-    for name, value in (
-        ("identity", contract.identity),
-        ("masked_contribution", contract.masked_contribution),
-    ):
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or float(value) != 0.0
-        ):
-            raise NotImplementedError(
-                f"E_J padded sum requires explicit neutral {name}=0"
-            )
-
-
-def _validate_dense_functional_boundary(j: SemanticArchive) -> None:
-    """Consume the dense access/effect projection represented by pure J values.
-
-    ``IntentFunction`` evaluates complete logical tensors.  Therefore an
-    explicit memory boundary can be projected to that evaluator only when it
-    proves a full, direct, unpredicated tensor access and its effects agree
-    exactly with the functional inputs/outputs.  Anything more expressive is
-    rejected rather than silently ignored.
-    """
-
-    elaboration = j_elaboration(j)
-    boundary = j.boundary
-    if any(
-        parameter.alias_of is not None
-        for parameter in j.signature.parameters
-    ):
-        raise NotImplementedError(
-            "E_J dense functional boundary does not implement physical alias ABI"
-        )
-    if not boundary.accesses:
-        if boundary.domains or boundary.effects:
-            raise ValueError(
-                "E_J boundary domains/effects require explicit access relations"
-            )
-        return
-
-    domains = _canonical_full_domains(j)
-    has_predicate_or_fill = any(
-        access.predicate is not None or access.fill_value is not None
-        for access in boundary.accesses
-    )
-    masked_reduction = has_predicate_or_fill and bool(boundary.reductions)
-    if has_predicate_or_fill and boundary.updates:
-        raise NotImplementedError(
-            "E_J mask erasure does not implement update padding"
-        )
-    nodes = _node_table(j)
-    tensors = {
-        item.name: item for item in [*j.intent.inputs, *j.intent.outputs]
-    }
-    input_names = {item.name for item in j.intent.inputs}
-    output_names = {item.name for item in j.intent.outputs}
-    canonical_output_bindings = {
-        item.output: item for item in j_elaboration(j).output_bindings
-    }
-    output_values = {
-        output: item.value
-        for output, item in canonical_output_bindings.items()
-    }
-    graph_operands = {
-        operand
-        for operation in _node_table(j).values()
-        for operand in operation.operands
-    }
-    loads_by_tensor: dict[str, list[Any]] = {}
-    for access in boundary.accesses:
-        if access.kind is AccessKind.LOAD:
-            loads_by_tensor.setdefault(access.tensor, []).append(access)
-    logical_scalar_inputs = _logical_scalar_inputs(j)
-    logical_guards = _logical_boolean_guards(j)
-    access_ids = [item.access_id for item in boundary.accesses]
-    if len(access_ids) != len(set(access_ids)):
-        raise ValueError("E_J dense functional boundary has duplicate access ids")
-    effect_ids = [item.effect_id for item in boundary.effects]
-    if len(effect_ids) != len(set(effect_ids)):
-        raise ValueError("E_J dense functional boundary has duplicate effect ids")
-    effects_by_access: dict[str, list[Any]] = {}
-    for effect in boundary.effects:
-        if effect.access_ref is None:
-            raise NotImplementedError(
-                "E_J dense functional boundary requires access-bound effects"
-            )
-        effects_by_access.setdefault(effect.access_ref, []).append(effect)
-
-    consumed_domain_axes: set[str] = set()
-    inferred_axis_extents: dict[str, int | str] = dict(domains)
-    predicate_contracts: dict[
-        str,
-        tuple[
-            frozenset[str],
-            frozenset[str],
-            tuple[tuple[str, int | str], ...],
-        ]
-        | None
-    ] = {}
-    axes_by_access: dict[str, tuple[str, ...]] = {}
-    loaded: set[str] = set()
-    store_counts = {name: 0 for name in output_names}
-    expected_effect = {
-        AccessKind.LOAD: EffectKind.READ,
-        AccessKind.STORE: EffectKind.WRITE,
-    }
-    canonical_accesses = elaboration.access_by_id
-    for access in boundary.accesses:
-        if access.kind is AccessKind.UPDATE:
-            raise NotImplementedError(
-                "E_J dense functional boundary does not implement update access"
-            )
-        op = nodes.get(access.node_ref) if access.node_ref is not None else None
-        if access.node_ref is not None and op is None:
-            raise ValueError(
-                f"E_J access {access.access_id!r} references an unknown J node"
-            )
-        tensor = tensors.get(access.tensor)
-        if tensor is None:
-            raise ValueError(
-                f"E_J access {access.access_id!r} references an unknown tensor"
-            )
-        canonical_access = canonical_accesses[access.access_id]
-        axes = canonical_access.index.direct_axes
-        if axes is None:
-            raise NotImplementedError(
-                "E_J dense access requires a direct ordered axis vector"
-            )
-        if len(set(axes)) != len(axes):
-            raise ValueError("E_J dense access axes must be unique")
-        axes_by_access[access.access_id] = axes
-        if len(axes) != len(tensor.shape):
-            raise ValueError(
-                f"E_J access {access.access_id!r} rank differs from J tensor"
-            )
-        for axis, declared_extent in zip(axes, tensor.shape, strict=True):
-            if axis == "0" and declared_extent != 1:
-                raise ValueError(
-                    "E_J constant zero index is valid only for a singleton axis"
-                )
-            # A direct axis over a typed J tensor is already bounded by that
-            # tensor's logical shape.  When B also spells out a domain, consume
-            # it and require exact agreement instead of treating it as an
-            # alternative source of extent information.
-            actual_extent = inferred_axis_extents.get(axis, declared_extent)
-            if actual_extent != declared_extent:
-                raise ValueError(
-                    f"E_J access axis {axis!r} extent {actual_extent!r} differs "
-                    f"from J tensor extent {declared_extent!r}"
-                )
-            inferred_axis_extents.setdefault(axis, declared_extent)
-            if axis in domains:
-                consumed_domain_axes.add(axis)
-
-        predicate_contract = (
-            _domain_predicate_contract(
-                canonical_access.predicate,
-                logical_guards=logical_guards,
-            )
-            if canonical_access.predicate is not None else None
-        )
-        predicate_contracts[access.access_id] = predicate_contract
-        if predicate_contract is not None:
-            guards, lower_axes, upper_bounds = predicate_contract
-            graph_operands = {
-                operand for node in j.intent.body for operand in node.operands
-            }
-            if not guards.issubset(graph_operands):
-                raise ValueError(
-                    "E_J access guard is absent from J value dataflow"
-                )
-            if not lower_axes.issubset(set(axes)):
-                raise ValueError("E_J predicate lower bound uses a non-index axis")
-            for axis, extent in upper_bounds:
-                if axis not in axes:
-                    raise ValueError(
-                        "E_J predicate upper bound uses a non-index axis"
-                    )
-                if domains.get(axis) != extent:
-                    raise ValueError(
-                        "E_J access predicate differs from the full logical domain"
-                    )
-            if (
-                upper_bounds
-                and access.kind is AccessKind.LOAD
-                and access.fill_value is None
-            ):
-                if not predicate_dominated_pointwise_load(j, access.access_id):
-                    raise NotImplementedError(
-                        "E_J mask erasure requires an explicit masked-load fill"
-                    )
-        elif access.fill_value is not None:
-            raise ValueError("E_J unpredicated access must not declare fill")
-        if access.kind is not AccessKind.LOAD and access.fill_value is not None:
-            raise ValueError("E_J store/update access must not declare fill")
-
-        matching_effects = effects_by_access.get(access.access_id, [])
-        if len(matching_effects) != 1:
-            raise ValueError(
-                f"E_J access {access.access_id!r} requires exactly one effect"
-            )
-        effect = matching_effects[0]
-        if (
-            effect.kind is not expected_effect[access.kind]
-            or effect.target != access.tensor
-            or effect.node_ref != access.node_ref
-        ):
-            raise ValueError(
-                f"E_J access {access.access_id!r} disagrees with its effect"
-            )
-
-        if access.kind is AccessKind.LOAD:
-            if access.tensor not in input_names:
-                raise ValueError(
-                    f"E_J load {access.access_id!r} is not a J input"
-                )
-            if (
-                op is not None
-                and access.tensor not in direct_logical_operand_sources(j, op)
-            ):
-                if explicit_inout_poststate_reload_value(
-                    j, access.access_id
-                ) is None:
-                    raise ValueError(
-                        f"E_J load {access.access_id!r} is not a direct J operand"
-                    )
-            if op is None:
-                if len(loads_by_tensor[access.tensor]) != 1:
-                    raise ValueError(
-                        "E_J node-less input load must be the sole load for its "
-                        "J tensor"
-                    )
-                if (
-                    access.tensor not in graph_operands
-                    and (
-                        j.intent.body
-                        or access.tensor not in set(output_values.values())
-                    )
-                ):
-                    raise ValueError(
-                        "E_J node-less input load is absent from J value dataflow"
-                    )
-            loaded.add(access.tensor)
-            continue
-
-        if access.tensor not in output_names:
-            raise ValueError(
-                f"E_J store {access.access_id!r} does not target a J output"
-            )
-        observable_value = output_values.get(access.tensor, access.tensor)
-        output_binding = canonical_output_bindings.get(access.tensor)
-        if (
-            output_binding is not None
-            and output_binding.node_ref is not None
-            and nodes.get(output_binding.node_ref) is not op
-        ):
-            raise ValueError(
-                f"E_J store {access.access_id!r} disagrees with output mapping"
-            )
-        if op is not None:
-            if observable_value not in _result_names(op):
-                raise ValueError(
-                    f"E_J store {access.access_id!r} is not produced by its J node"
-                )
-            if has_predicate_or_fill and not masked_reduction and (
-                op.type is None
-                or op.type.get("dtype") != tensor.dtype
-                or op.type.get("shape") != tensor.shape
-            ):
-                raise ValueError(
-                    "E_J store producer type differs from the output tensor"
-                )
-        elif (
-            j.intent.body
-            or output_binding is None
-            or output_binding.node_ref is not None
-            or observable_value not in input_names
-        ):
-            raise NotImplementedError(
-                "E_J node-less store is supported only for direct identity J"
-            )
-        store_counts[access.tensor] += 1
-
-    if set(effects_by_access) != {item.access_id for item in boundary.accesses}:
-        raise ValueError("E_J contains an effect for an unknown access")
-    if loaded != input_names - set(logical_scalar_inputs):
-        raise NotImplementedError(
-            "E_J dense functional boundary must cover every logical input"
-        )
-    if any(count != 1 for count in store_counts.values()):
-        raise NotImplementedError(
-            "E_J dense functional boundary requires exactly one store per "
-            "logical output"
-        )
-    if consumed_domain_axes != set(domains):
-        raise NotImplementedError(
-            "E_J dense functional boundary contains an unconsumed domain axis"
-        )
-    concrete_predicates = [item for item in predicate_contracts.values() if item]
-    if masked_reduction:
-        _validate_masked_sum_reduction(
-            j,
-            domains=domains,
-            axes_by_access=axes_by_access,
-            predicates_by_access=predicate_contracts,
-        )
-    elif concrete_predicates:
-        masked_axes = {
-            axis
-            for _guards, _lower, upper in concrete_predicates
-            for axis, _extent in upper
-        }
-        for access in boundary.accesses:
-            axes = axes_by_access[access.access_id]
-            contract = predicate_contracts[access.access_id]
-            upper = dict(contract[2]) if contract is not None else {}
-            for axis in masked_axes.intersection(axes):
-                if upper.get(axis) != domains.get(axis):
-                    raise NotImplementedError(
-                        "E_J mask erasure requires the same predicate on every "
-                        "access of a masked axis"
-                    )
 
 
 def _validate_complete_boundary(j: SemanticArchive) -> str:
@@ -906,135 +127,6 @@ def scalar_broadcast_axes(
     return project_functional_boundary(j).emitter_broadcast_axes()
 
 
-def _contract_ir_indexed_graph_fallback(j: SemanticArchive) -> bool:
-    """Recognize one relation capability class, never an index formula shape.
-
-    This migration slice covers flat, pure indexed A graphs whose physical
-    predicates are completely authored and whose non-direct internal loads are
-    guarded by already-validated J index-bounds relations.  Stateful, padded
-    reduction, runtime-guard, alias, and update semantics retain their dedicated
-    consumers until they move to ContractIR as typed relations.
-    """
-
-    boundary = j.boundary
-    if (
-        not boundary.index_bounds
-        or boundary.aliases
-        or boundary.reductions
-        or boundary.updates
-        or boundary.consumer_extensions
-        or boundary.access_guard_relations
-        or any(item.alias_of is not None for item in j.signature.parameters)
-    ):
-        return False
-
-    def walk(body: Sequence[IntentOp]):
-        for operation in body:
-            yield operation
-            yield from walk(operation.body)
-            for arm in (operation.positive, operation.negative):
-                if arm is not None:
-                    yield from walk(arm.body)
-
-    if any(
-        operation.op in {
-            "arg_reduce", "effect_if", "loop", "reduce", "scan", "value_if",
-        }
-        for operation in walk(j.intent.body)
-    ):
-        return False
-    if not boundary.accesses or any(
-        access.predicate is None for access in boundary.accesses
-    ):
-        return False
-    if any(
-        access.kind is AccessKind.LOAD and access.fill_value is None
-        for access in boundary.accesses
-    ):
-        return False
-
-    scalar_inputs = {
-        item.name for item in j.intent.inputs if not item.shape
-    }
-    elaboration = j_elaboration(j)
-    authored_expressions = [
-        *elaboration.domain_by_id.values(),
-        *(
-            access.predicate
-            for access in elaboration.accesses
-            if access.predicate is not None
-        ),
-    ]
-    if any(
-        expression.references.intersection(scalar_inputs)
-        for expression in authored_expressions
-    ):
-        return False
-
-    effects_by_access: dict[str, list[Any]] = {}
-    for effect in boundary.effects:
-        if effect.access_ref is None:
-            return False
-        effects_by_access.setdefault(effect.access_ref, []).append(effect)
-    expected_effect = {
-        AccessKind.LOAD: EffectKind.READ,
-        AccessKind.STORE: EffectKind.WRITE,
-    }
-    accesses = {item.access_id: item for item in boundary.accesses}
-    if set(effects_by_access) != set(accesses):
-        return False
-    for access in boundary.accesses:
-        matches = effects_by_access[access.access_id]
-        if (
-            access.kind not in expected_effect
-            or len(matches) != 1
-            or matches[0].kind is not expected_effect[access.kind]
-            or matches[0].target != access.tensor
-            or matches[0].node_ref != access.node_ref
-        ):
-            return False
-
-    bounded_nodes = {item.node_ref for item in boundary.index_bounds}
-    parsed = elaboration.access_by_id
-    return all(
-        access.kind is not AccessKind.LOAD
-        or parsed[access.access_id].index.direct_coordinates is not None
-        or access.node_ref in bounded_nodes
-        for access in boundary.accesses
-    )
-
-
-def _structured_indexed_update_fallback(j: SemanticArchive) -> bool:
-    """Recognize closed gather/scatter J graphs for structured J-only execution."""
-
-    boundary = j.boundary
-    if (
-        not boundary.updates
-        or boundary.aliases
-        or boundary.reductions
-        or boundary.consumer_extensions
-        or boundary.access_guard_relations
-        or any(item.alias_of is not None for item in j.signature.parameters)
-        or not access_predicates_are_logical_domain_total(j)
-    ):
-        return False
-    # Canonical J keeps authored node handles in ``j.node_ids``.  IntentOp
-    # objects need not retain the pre-canonical ``node_id`` field, so looking at
-    # the operation alone silently loses every scatter handle.  Resolve the
-    # authored handles through the same canonical node table used by the other
-    # boundary consumers.
-    nodes = _node_table(j)
-    scatter_refs = {
-        node_ref
-        for node_ref in j.node_ids
-        if (operation := nodes.get(node_ref)) is not None
-        and operation.op == "scatter"
-    }
-    return bool(scatter_refs) and scatter_refs == {
-        item.node_ref for item in boundary.updates
-    }
-
-
 @dataclass(frozen=True)
 class ScalarLoweringSpec:
     """Invocation request holding the one elaborated J used by all consumers."""
@@ -1055,7 +147,10 @@ class ScalarLoweringSpec:
         object.__setattr__(self, "output_bindings", _canonical_str_mapping(outputs))
         validate_dimension_instantiation(self.j, dims)
         expected_inputs = {item.name for item in self.j.intent.inputs}
-        expected_outputs = {item.name for item in self.j.intent.outputs}
+        expected_outputs = {
+            binding.output
+            for binding in j_elaboration(self.j).output_bindings
+        }
         if set(inputs) != expected_inputs:
             raise ValueError("scalar input bindings differ from J inputs")
         if set(outputs) != expected_outputs:
@@ -1154,6 +249,200 @@ class ScalarLoweringUnavailable:
 ScalarLoweringRequest = ScalarLoweringSpec | ScalarLoweringUnavailable
 
 
+_REFERENCE_UNSUPPORTED_FAILURE_PREFIXES = (
+    (
+        "functional dense access requires",
+        "j_reference_dense_access_projection_unsupported",
+    ),
+    (
+        "functional bounded gather",
+        "j_reference_bounded_gather_projection_unsupported",
+    ),
+    (
+        "functional constant access",
+        "j_reference_constant_access_projection_unsupported",
+    ),
+    (
+        "functional constant load partition",
+        "j_reference_constant_load_partition_unsupported",
+    ),
+    (
+        "functional constant gather",
+        "j_reference_constant_gather_projection_unsupported",
+    ),
+    (
+        "functional mask projection does not implement update padding",
+        "j_reference_mask_update_padding_unsupported",
+    ),
+    (
+        "functional mask projection does not implement guard-bearing access "
+        "predicates",
+        "j_reference_mask_guard_predicate_unsupported",
+    ),
+    (
+        "functional mask projection does not implement cross-axis logical "
+        "access predicates",
+        "j_reference_mask_cross_axis_predicate_unsupported",
+    ),
+    (
+        "functional mask projection requires a complete logical domain",
+        "j_reference_mask_domain_incomplete",
+    ),
+    (
+        "functional mask projection requires an explicit masked-load fill",
+        "j_reference_masked_load_fill_missing",
+    ),
+    (
+        "functional mask projection",
+        "j_reference_mask_projection_unsupported",
+    ),
+    (
+        "functional guarded load requires an explicit fill",
+        "j_reference_guarded_load_fill_missing",
+    ),
+    (
+        "functional guarded load consumer extension requires one single-result consumer",
+        "j_reference_guarded_load_extension_consumer_result_unsupported",
+    ),
+    (
+        "functional guarded load consumer extension requires one direct operand edge",
+        "j_reference_guarded_load_extension_operand_unsupported",
+    ),
+    (
+        "functional guarded load consumer extension has no access-to-operand provenance",
+        "j_reference_guarded_load_extension_provenance_missing",
+    ),
+    (
+        "functional guarded load requires one single-result consumer",
+        "j_reference_guarded_load_consumer_result_unsupported",
+    ),
+    (
+        "functional guarded load requires one unambiguous direct consumer operand",
+        "j_reference_guarded_load_consumer_operand_ambiguous",
+    ),
+    (
+        "functional guarded load requires an explicit consumer node or consumer extension",
+        "j_reference_guarded_load_consumer_binding_missing",
+    ),
+    (
+        "functional guarded load consumer edges must be unique",
+        "j_reference_guarded_load_consumer_edge_duplicate",
+    ),
+    (
+        "functional guarded load conflicts with another broadcast mapping",
+        "j_reference_guarded_load_broadcast_conflict",
+    ),
+    (
+        "functional guarded load",
+        "j_reference_guarded_load_projection_unsupported",
+    ),
+    (
+        "functional guarded store",
+        "j_reference_guarded_store_projection_unsupported",
+    ),
+    (
+        "functional output-only guarded store",
+        "j_reference_output_only_guarded_store_unsupported",
+    ),
+    (
+        "functional boundary requires exactly one full store",
+        "j_reference_full_output_store_projection_unsupported",
+    ),
+    (
+        "functional boundary requires exactly one store",
+        "j_reference_output_store_projection_unsupported",
+    ),
+    (
+        "functional boundary must cover every live logical tensor input",
+        "j_reference_input_access_projection_unsupported",
+    ),
+    (
+        "predicate-bearing reduce/scan operand requires",
+        "j_reference_consumer_extension_unsupported",
+    ),
+    (
+        "functional padded reduce/scan requires",
+        "j_reference_reduction_padding_projection_unsupported",
+    ),
+    (
+        "functional projection has no closed reduction neutral element",
+        "j_reference_reduction_identity_unsupported",
+    ),
+    (
+        "node-less store is supported only",
+        "j_reference_node_less_store_unsupported",
+    ),
+    (
+        "structured reference graph contains IntentOp(s) outside",
+        "j_reference_operation_capability_unsupported",
+    ),
+    (
+        "structured reference requires a structured op",
+        "j_reference_structured_dispatch_unsupported",
+    ),
+    (
+        "structured ",
+        "j_reference_structured_execution_unsupported",
+    ),
+)
+
+
+def _reference_failure_class(
+    exc: BaseException,
+    *,
+    unsupported: bool = False,
+) -> str:
+    """Map one E_J failure to a bounded, source-free rule class.
+
+    The text is used only inside the process to select a stable category.  The
+    category deliberately does not include node ids, authored expressions,
+    candidate text, or values.  Unknown failures remain execution failures.
+    """
+
+    if unsupported:
+        return _reference_unsupported_failure_class(exc)
+    if isinstance(exc, CPUABIValidationError):
+        return "j_reference_cpu_abi_failure"
+    message = str(exc).casefold()
+    if "predicate" in message or "effect" in message:
+        return "j_reference_predicate_effect_mismatch"
+    if "dtype" in message or "shape" in message or "typed" in message:
+        return "j_reference_typed_relation_mismatch"
+    if "input" in message or "binding" in message or "output" in message:
+        return "j_reference_binding_mismatch"
+    if isinstance(exc, (KeyError, TypeError, ValueError)):
+        return "j_reference_validation_failed"
+    return "j_reference_execution_error"
+
+
+def _reference_failure_metadata(
+    exc: BaseException,
+    *,
+    unsupported: bool = False,
+) -> dict[str, str]:
+    """Return only fixed metadata safe for Gate2 summaries."""
+
+    return {
+        "phase": "reference_execution",
+        "failure_class": _reference_failure_class(
+            exc, unsupported=unsupported
+        ),
+        "exception_type": type(exc).__name__,
+    }
+
+
+def _reference_unsupported_failure_class(exc: BaseException) -> str:
+    """Classify RefEval capability gaps without exporting diagnostic text."""
+
+    message = str(exc)
+    for prefix, failure_class in _REFERENCE_UNSUPPORTED_FAILURE_PREFIXES:
+        if message.startswith(prefix):
+            return failure_class
+    if isinstance(exc, CPUBackendUnsupportedError):
+        return "j_reference_cpu_backend_unsupported"
+    return "j_reference_capability_unsupported"
+
+
 class ScalarLoweringRunner:
     def run(self, spec: ScalarLoweringSpec, values: Mapping[str, Any]) -> ExecutionResult:
         try:
@@ -1191,83 +480,44 @@ class ScalarLoweringRunner:
                 inputs_by_ref,
                 spec.dims_map,
             )
-            projection = None
-            contract_reference_plan = None
-            structured_update_fallback = False
+            # Gate2 is the numeric execution judge.  It consumes the already
+            # accepted canonical J and its public ABI/output bindings; it does
+            # not rerun Source owner authorization, update-padding theorems, or
+            # physical-store partition proofs. Those remain ingress and
+            # canonical-construction responsibilities. The execution backend
+            # still validates typed inputs, index bounds, operation results,
+            # declared output dtype/shape, and complete observable outputs.
             try:
-                projection = project_functional_boundary_for_refeval(
-                    spec.j,
-                    inputs_by_ref,
-                    spec.dims_map,
-                )
-            except NotImplementedError as capability_error:
-                try:
-                    contract_reference_plan = project_contract_reference(spec.j)
-                except ContractReferenceUnsupportedError:
-                    # A capability-shaped formula must not become a second J
-                    # membership test.  Preserve the complete typed contract and
-                    # retain the older pure indexed-A fallback for its already
-                    # closed capability class.
-                    indexed_graph_fallback = _contract_ir_indexed_graph_fallback(
-                        spec.j
-                    )
-                    structured_update_fallback = _structured_indexed_update_fallback(
-                        spec.j
-                    )
-                    if not indexed_graph_fallback and not structured_update_fallback:
-                        raise capability_error
-                    contract_ir = project_contract_ir(spec.j)
-                    boundary_digest = contract_ir.digest
-                    broadcast_axes = canonical_broadcast_axes(spec.j)
-                    guarded_loads = ()
-                    proven_index_bounds = frozenset(
-                        spec.j.node_ids.get(item.node_ref, item.node_ref)
-                        for item in spec.j.boundary.index_bounds
-                    )
-                    boundary_profile = (
-                        "canonical_contract_ir_indexed_updates_v1"
-                        if structured_update_fallback
-                        else "canonical_contract_ir_a_graph_v1"
-                    )
-                    boundary_projection_record = {
-                        **contract_ir.to_json(),
-                        "fallback_from": str(capability_error),
-                    }
-                    predicated_access_count = sum(
-                        item.predicate is not None
-                        for item in spec.j.boundary.accesses
-                    )
-                    erased_fill_count = 0
-                    runtime_predicate_proof_count = 0
-                else:
-                    boundary_projection_record = contract_reference_plan.to_json()
-                    boundary_digest = boundary_projection_record["plan_digest"]
-                    broadcast_axes = contract_reference_plan.broadcast_map
-                    guarded_loads = ()
-                    proven_index_bounds = frozenset()
-                    boundary_profile = str(boundary_projection_record["profile"])
-                    predicated_access_count = sum(
-                        item.predicate is not None
-                        for item in spec.j.boundary.accesses
-                    )
-                    erased_fill_count = 0
-                    runtime_predicate_proof_count = 0
-            else:
-                boundary_digest = projection.boundary_digest
-                broadcast_axes = projection.emitter_broadcast_axes()
-                guarded_loads = tuple(
-                    item
-                    for item in projection.access_guard_relations
-                    if item.access_kind == "load"
-                )
-                proven_index_bounds = projection.proven_index_bounds
-                boundary_profile = projection.profile
-                boundary_projection_record = projection.to_json()
-                predicated_access_count = projection.predicated_access_count
-                erased_fill_count = projection.erased_fill_count
-                runtime_predicate_proof_count = len(
-                    projection.runtime_predicate_proofs
-                )
+                broadcast_axes = canonical_broadcast_axes(spec.j)
+            except (NotImplementedError, ValueError):
+                broadcast_axes = {}
+            guarded_loads = tuple(
+                item
+                for item in spec.j.boundary.access_guard_relations
+                if item.access_kind == "load"
+            )
+            consumer_extensions = tuple(spec.j.boundary.consumer_extensions)
+            proven_index_bounds = frozenset(
+                spec.j.node_ids.get(item.node_ref, item.node_ref)
+                for item in spec.j.boundary.index_bounds
+                if static_index_bounds_status(spec.j, item) is True
+            )
+            boundary_profile = "canonical_j_numeric_execution_v1"
+            boundary_projection_record = {
+                "profile": boundary_profile,
+                "mode": "numeric_execution_only",
+                "physical_partition_proof": "not_consumed_by_gate2",
+                "update_padding_proof": "not_consumed_by_gate2",
+                "owner_authorization": "not_repeated_by_gate2",
+                "output_bindings": sorted(spec.output_binding_map.items()),
+            }
+            boundary_digest = _digest(boundary_projection_record)
+            predicated_access_count = sum(
+                item.predicate is not None
+                for item in spec.j.boundary.accesses
+            )
+            erased_fill_count = 0
+            runtime_predicate_proof_count = 0
             deferred_index_bounds = any(
                 item.data not in inputs_by_ref or item.indices not in inputs_by_ref
                 for item in spec.j.boundary.index_bounds
@@ -1279,23 +529,13 @@ class ScalarLoweringRunner:
                 or deferred_index_bounds
             )
             execution = (
-                execute_contract_reference(
-                    spec.j,
-                    spec.dims_map,
-                    inputs,
-                    plan=contract_reference_plan,
-                )
-                if contract_reference_plan is not None
-                else execute_structured_reference(
+                execute_structured_reference(
                     spec.j,
                     spec.dims_map,
                     inputs,
                     broadcast_axes=broadcast_axes,
                     access_guard_relations=guarded_loads,
-                    conditional_effect_stores=(
-                        projection.conditional_effect_stores
-                        if projection is not None else ()
-                    ),
+                    consumer_extensions=consumer_extensions,
                 )
                 if structured
                 else execute_on_cpu_outputs(
@@ -1320,9 +560,7 @@ class ScalarLoweringRunner:
                 metadata={
                     "protocol": SCALAR_LOWERING_PROTOCOL,
                     "path": (
-                        "canonical J -> ContractIR -> indexed CPU reference"
-                        if contract_reference_plan is not None
-                        else "canonical J -> typed structured CPU reference"
+                        "canonical J -> typed structured CPU reference"
                         if structured
                         else "canonical J -> intent MLIR -> scalar CPU"
                     ),
@@ -1344,6 +582,8 @@ class ScalarLoweringRunner:
                         spec.j.boundary.result_relations
                     ),
                     "execution_evidence": dict(execution.metadata),
+                    "output_digest": output_digest(outputs),
+                    "output_binding_digest": output_binding_digest(outputs),
                 },
             )
         except (CPUBackendUnsupportedError, NotImplementedError) as exc:
@@ -1356,6 +596,7 @@ class ScalarLoweringRunner:
                     "protocol": SCALAR_LOWERING_PROTOCOL,
                     "j_digest": spec.j_digest,
                     "scalar_spec_digest": spec.spec_digest,
+                    **_reference_failure_metadata(exc, unsupported=True),
                 },
             )
         except CPUABIValidationError as exc:
@@ -1363,11 +604,24 @@ class ScalarLoweringRunner:
                 "j",
                 False,
                 error=f"{type(exc).__name__}: {exc}",
-                metadata={"failure_class": "physical_cpu_abi"},
+                metadata={
+                    "protocol": SCALAR_LOWERING_PROTOCOL,
+                    "j_digest": spec.j_digest,
+                    "scalar_spec_digest": spec.spec_digest,
+                    **_reference_failure_metadata(exc),
+                },
             )
         except Exception as exc:
             return ExecutionResult(
-                "j", False, error=f"{type(exc).__name__}: {exc}"
+                "j",
+                False,
+                error=f"{type(exc).__name__}: {exc}",
+                metadata={
+                    "protocol": SCALAR_LOWERING_PROTOCOL,
+                    "j_digest": spec.j_digest,
+                    "scalar_spec_digest": spec.spec_digest,
+                    **_reference_failure_metadata(exc),
+                },
             )
 
 

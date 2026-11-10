@@ -25,6 +25,25 @@ def normalize_deprecated_triton_dot(code: str) -> tuple[str, dict[str, Any]]:
                 if alias.name == "language":
                     language_aliases.add(alias.asname or alias.name)
 
+    # An imported name is not enough: a parameter, assignment, nested import
+    # or declaration may shadow it. Only the uniquely bound language module
+    # can issue a compatibility rewrite.
+    language_aliases = {
+        name for name in language_aliases
+        if sum(
+            isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) == name
+            or isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, (ast.Store, ast.Del))
+            or isinstance(node, ast.arg) and node.arg == name
+            or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == name
+            for node in ast.walk(tree)
+        ) == 1
+        and not any(
+            isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del))
+            and any(isinstance(part, ast.Name) and part.id == name for part in ast.walk(node))
+            for node in ast.walk(tree)
+        )
+    }
+
     class Normalizer(ast.NodeTransformer):
         def __init__(self) -> None:
             self.count = 0

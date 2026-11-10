@@ -49,11 +49,17 @@ class FrontendGate1Capability:
             raise TypeError(
                 f"{self.frontend.value} requires {self.compiler_type.__name__}"
             )
+        runner_kwargs: dict[str, Any] = {
+            "compiler": compiler,
+            "writer": writer,
+            "config": config,
+        }
+        if self.frontend in {Frontend.CUDA, Frontend.TILELANG}:
+            runner_kwargs["masked_writer"] = masked_writer
+        elif masked_writer is not None:
+            raise ValueError("Triton Gate1 owns masked Replay on its normal writer")
         return self.runner_type(
-            compiler=compiler,
-            writer=writer,
-            masked_writer=masked_writer,
-            config=config,
+            **runner_kwargs,
         )
 
 
@@ -93,7 +99,6 @@ def frontend_gate1_capability(
 
 def active_gate1_frontends() -> tuple[Frontend, ...]:
     return tuple(_ACTIVE)
-
 
 __all__ = [
     "FrontendGate1Capability",

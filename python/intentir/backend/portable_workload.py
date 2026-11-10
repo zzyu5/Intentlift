@@ -37,6 +37,16 @@ def _numpy_dtype(dtype: str) -> np.dtype[Any]:
         "i16": np.int16,
         "i32": np.int32,
         "i64": np.int64,
+        "index": np.int64,
+        "u8": np.uint8,
+        "u16": np.uint16,
+        "u32": np.uint32,
+        "uint8": np.uint8,
+        "uint16": np.uint16,
+        "uint32": np.uint32,
+        "ui8": np.uint8,
+        "ui16": np.uint16,
+        "ui32": np.uint32,
         "f16": np.float16,
         "f32": np.float32,
         "f64": np.float64,
@@ -163,7 +173,8 @@ def decode_workload_recipe(value: Mapping[str, Any]) -> dict[str, Any]:
             if dtype.kind == "b":
                 generated = rng.integers(0, 2, size=shape).astype(dtype)
             elif dtype.kind in {"i", "u"}:
-                generated = rng.integers(-3, 4, size=shape).astype(dtype)
+                low = 0 if dtype.kind == "u" else -3
+                generated = rng.integers(low, 4, size=shape).astype(dtype)
             else:
                 generated = rng.normal(0.0, 0.25, size=shape).astype(dtype)
         else:

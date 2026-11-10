@@ -1,4 +1,4 @@
-"""Isolated compile-only CuTe DSL frontend for strict Gate1 observation."""
+"""Isolated compile-only CuTe frontend for strict Gate1 observation."""
 
 from __future__ import annotations
 
@@ -20,6 +20,15 @@ from .compiler import RuntimeArgument
 
 _CACHE_SCHEMA_VERSION = 1
 _WORKER = Path(__file__).with_name("_cute_worker.py")
+# The compiler needs toolchain/device settings, not parent provider credentials.
+# This is environment minimization, not an OS security sandbox.
+_WORKER_ENV_KEYS = frozenset({
+    "PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "CPLUS_INCLUDE_PATH",
+    "CUDA_HOME", "CUDA_PATH", "CUDA_VISIBLE_DEVICES", "CUDA_MODULE_LOADING",
+    "CUDA_DEVICE_ORDER", "CUDA_CACHE_DISABLE", "CUDA_CACHE_PATH",
+    "NVIDIA_VISIBLE_DEVICES", "NVIDIA_DRIVER_CAPABILITIES",
+    "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "SYSTEMROOT",
+})
 
 
 @dataclass(frozen=True)
@@ -353,10 +362,14 @@ class CuteCompiler:
             request_path.write_text(
                 json.dumps(worker_request, sort_keys=True), encoding="utf-8"
             )
-            environment = dict(os.environ)
-            environment.update(self.extra_env)
+            environment = {
+                key: value
+                for key, value in {**os.environ, **self.extra_env}.items()
+                if key in _WORKER_ENV_KEYS
+            }
             environment.update(
                 {
+                    "XDG_CACHE_HOME": str(work / "cache"),
                     "CUTE_DSL_ARCH": self.arch,
                     "CUTE_DSL_KEEP_IR": "1",
                     "CUTE_DSL_KEEP_PTX": "1",
@@ -380,6 +393,7 @@ class CuteCompiler:
                     command,
                     capture_output=True,
                     text=True,
+                    cwd=work,
                     env=environment,
                     timeout=self.timeout,
                     check=False,

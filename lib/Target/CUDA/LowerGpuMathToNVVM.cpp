@@ -436,6 +436,153 @@ struct UnaryToNVVMApprox : OpRewritePattern<MathOp> {
   StringRef intrinsic;
 };
 
+/// Expand the less common scalar math operations into the already supported
+/// native-ex2/log2/atan paths.  This keeps the CUDA elementwise lowering
+/// independent of unresolved libdevice symbols while preserving the declared
+/// f32 result type.
+struct ExpM1ToExpSubOne : OpRewritePattern<math::ExpM1Op> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::ExpM1Op op,
+                                PatternRewriter &rewriter) const override {
+    auto f32 = dyn_cast<Float32Type>(op.getOperand().getType());
+    if (!f32)
+      return rewriter.notifyMatchFailure(op, "operand is not scalar f32");
+    Value exponential = rewriter.create<math::ExpOp>(op.getLoc(), op.getOperand());
+    Value one = rewriter.create<arith::ConstantOp>(
+        op.getLoc(), rewriter.getF32FloatAttr(1.0));
+    rewriter.replaceOpWithNewOp<arith::SubFOp>(op, exponential, one);
+    return success();
+  }
+};
+
+struct Log1pToLogOnePlus : OpRewritePattern<math::Log1pOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::Log1pOp op,
+                                PatternRewriter &rewriter) const override {
+    auto f32 = dyn_cast<Float32Type>(op.getOperand().getType());
+    if (!f32)
+      return rewriter.notifyMatchFailure(op, "operand is not scalar f32");
+    Value one = rewriter.create<arith::ConstantOp>(
+        op.getLoc(), rewriter.getF32FloatAttr(1.0));
+    Value sum = rewriter.create<arith::AddFOp>(op.getLoc(), one, op.getOperand());
+    rewriter.replaceOpWithNewOp<math::LogOp>(op, sum);
+    return success();
+  }
+};
+
+struct Log10ToLogScale : OpRewritePattern<math::Log10Op> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::Log10Op op,
+                                PatternRewriter &rewriter) const override {
+    auto f32 = dyn_cast<Float32Type>(op.getOperand().getType());
+    if (!f32)
+      return rewriter.notifyMatchFailure(op, "operand is not scalar f32");
+    Value log = rewriter.create<math::LogOp>(op.getLoc(), op.getOperand());
+    Value inverseLn10 = rewriter.create<arith::ConstantOp>(
+        op.getLoc(), rewriter.getF32FloatAttr(0.4342944819032518));
+    rewriter.replaceOpWithNewOp<arith::MulFOp>(op, log, inverseLn10);
+    return success();
+  }
+};
+
+static Value emitAsinApprox(PatternRewriter &rewriter, Location loc, Value x) {
+  Value one = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getF32FloatAttr(1.0));
+  Value square = rewriter.create<arith::MulFOp>(loc, x, x);
+  Value underRoot = rewriter.create<arith::SubFOp>(loc, one, square);
+  Value root = rewriter.create<math::SqrtOp>(loc, underRoot);
+  Value ratio = rewriter.create<arith::DivFOp>(loc, x, root);
+  return rewriter.create<math::AtanOp>(loc, ratio);
+}
+
+struct AsinToAtanApprox : OpRewritePattern<math::AsinOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::AsinOp op,
+                                PatternRewriter &rewriter) const override {
+    auto f32 = dyn_cast<Float32Type>(op.getOperand().getType());
+    if (!f32)
+      return rewriter.notifyMatchFailure(op, "operand is not scalar f32");
+    rewriter.replaceOp(op, emitAsinApprox(rewriter, op.getLoc(), op.getOperand()));
+    return success();
+  }
+};
+
+struct AcosToAtanApprox : OpRewritePattern<math::AcosOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::AcosOp op,
+                                PatternRewriter &rewriter) const override {
+    auto f32 = dyn_cast<Float32Type>(op.getOperand().getType());
+    if (!f32)
+      return rewriter.notifyMatchFailure(op, "operand is not scalar f32");
+    Value asin = emitAsinApprox(rewriter, op.getLoc(), op.getOperand());
+    Value halfPi = rewriter.create<arith::ConstantOp>(
+        op.getLoc(), rewriter.getF32FloatAttr(1.5707963267948966));
+    rewriter.replaceOpWithNewOp<arith::SubFOp>(op, halfPi, asin);
+    return success();
+  }
+};
+
+struct CbrtToExpLog : OpRewritePattern<math::CbrtOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::CbrtOp op,
+                                PatternRewriter &rewriter) const override {
+    auto f32 = dyn_cast<Float32Type>(op.getOperand().getType());
+    if (!f32)
+      return rewriter.notifyMatchFailure(op, "operand is not scalar f32");
+    Location loc = op.getLoc();
+    Value magnitude = rewriter.create<math::AbsFOp>(loc, op.getOperand());
+    Value logarithm = rewriter.create<math::LogOp>(loc, magnitude);
+    Value oneThird = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getF32FloatAttr(1.0 / 3.0));
+    Value scaled = rewriter.create<arith::MulFOp>(loc, logarithm, oneThird);
+    Value root = rewriter.create<math::ExpOp>(loc, scaled);
+    rewriter.replaceOpWithNewOp<math::CopySignOp>(op, root, op.getOperand());
+    return success();
+  }
+};
+
+template <typename MathOp>
+struct UnaryToLLVMIntrinsic : OpRewritePattern<MathOp> {
+  UnaryToLLVMIntrinsic(MLIRContext *ctx, StringRef intrinsic)
+      : OpRewritePattern<MathOp>(ctx), intrinsic(intrinsic) {}
+
+  LogicalResult matchAndRewrite(MathOp op,
+                                PatternRewriter &rewriter) const override {
+    auto f32 = dyn_cast<Float32Type>(op.getOperand().getType());
+    if (!f32)
+      return rewriter.notifyMatchFailure(op, "operand is not scalar f32");
+    auto lowered = rewriter.create<LLVM::CallIntrinsicOp>(
+        op.getLoc(), f32, rewriter.getStringAttr(intrinsic),
+        ValueRange{op.getOperand()});
+    rewriter.replaceOp(op, lowered.getResults());
+    return success();
+  }
+
+  StringRef intrinsic;
+};
+
+struct CopySignToLLVMIntrinsic : OpRewritePattern<math::CopySignOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(math::CopySignOp op,
+                                PatternRewriter &rewriter) const override {
+    auto f32 = dyn_cast<Float32Type>(op.getLhs().getType());
+    if (!f32 || op.getRhs().getType() != f32)
+      return rewriter.notifyMatchFailure(op, "operands are not scalar f32");
+    auto lowered = rewriter.create<LLVM::CallIntrinsicOp>(
+        op.getLoc(), f32, rewriter.getStringAttr("llvm.copysign"),
+        ValueRange{op.getLhs(), op.getRhs()});
+    rewriter.replaceOp(op, lowered.getResults());
+    return success();
+  }
+};
+
 /// `math.exp2 %x : f32` -> `ex2.approx.ftz.f32(%x)`. exp2 IS the native 2^x
 /// hardware op with NO change-of-base prescale (unlike exp, which multiplies by
 /// log2(e) first). The stock GpuToNVVM path routes math.exp2 to a `__nv_exp2f`
@@ -1119,9 +1266,28 @@ struct LowerGpuMathToNVVM
                  PromoteHalfUnaryMath<math::Exp2Op>,
                  PromoteHalfUnaryMath<math::AtanOp>,
                  PromoteHalfUnaryMath<math::ErfOp>,
+                 PromoteHalfUnaryMath<math::AcosOp>,
+                 PromoteHalfUnaryMath<math::AsinOp>,
+                 PromoteHalfUnaryMath<math::CbrtOp>,
+                 PromoteHalfUnaryMath<math::CeilOp>,
+                 PromoteHalfUnaryMath<math::FloorOp>,
+                 PromoteHalfUnaryMath<math::RoundOp>,
+                 PromoteHalfUnaryMath<math::RoundEvenOp>,
+                 PromoteHalfUnaryMath<math::TruncOp>,
+                 PromoteHalfUnaryMath<math::Log10Op>,
+                 PromoteHalfUnaryMath<math::Log1pOp>,
+                 PromoteHalfUnaryMath<math::ExpM1Op>,
                  PromoteHalfBinaryMath<math::PowFOp>,
+                 PromoteHalfBinaryMath<math::CopySignOp>,
                  PromoteHalfBinaryMath<math::Atan2Op>, PromoteHalfFma>(
         &getContext());
+    patterns.add<ExpM1ToExpSubOne>(&getContext());
+    patterns.add<Log1pToLogOnePlus>(&getContext());
+    patterns.add<Log10ToLogScale>(&getContext());
+    patterns.add<AsinToAtanApprox>(&getContext());
+    patterns.add<AcosToAtanApprox>(&getContext());
+    patterns.add<CbrtToExpLog>(&getContext());
+    patterns.add<CopySignToLLVMIntrinsic>(&getContext());
     patterns.add<LogSubToLg2Fma>(&getContext());
     patterns.add<ExpToEx2Approx>(&getContext());
     patterns.add<MarkedDivToNVVMApprox>(&getContext());
@@ -1147,6 +1313,16 @@ struct LowerGpuMathToNVVM
                                                  "llvm.nvvm.sin.approx.f");
     patterns.add<UnaryToNVVMApprox<math::CosOp>>(&getContext(),
                                                  "llvm.nvvm.cos.approx.f");
+    patterns.add<UnaryToLLVMIntrinsic<math::CeilOp>>(&getContext(),
+                                                     "llvm.ceil");
+    patterns.add<UnaryToLLVMIntrinsic<math::FloorOp>>(&getContext(),
+                                                      "llvm.floor");
+    patterns.add<UnaryToLLVMIntrinsic<math::RoundOp>>(&getContext(),
+                                                      "llvm.round");
+    patterns.add<UnaryToLLVMIntrinsic<math::RoundEvenOp>>(&getContext(),
+                                                          "llvm.roundeven");
+    patterns.add<UnaryToLLVMIntrinsic<math::TruncOp>>(&getContext(),
+                                                      "llvm.trunc");
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
       signalPassFailure();
   }

@@ -8,6 +8,8 @@ import numpy as np
 
 from intentir.ir.functional_boundary import static_index_bounds_status
 from intentir.ir.integer_range import proves_index_bounds
+from intentir.ir.value_dimension import validate_ragged_runtime_invocation
+from intentir.ir.canonical_j import j_elaboration
 
 from intentir.verify.gate1.model import (
     DuplicatePolicy,
@@ -29,6 +31,13 @@ _DTYPE_ALIASES = {
     "int16": "i16",
     "int32": "i32",
     "int64": "i64",
+    "index": "i64",
+    "uint8": "u8",
+    "uint16": "u16",
+    "uint32": "u32",
+    "ui8": "u8",
+    "ui16": "u16",
+    "ui32": "u32",
     "float16": "f16",
     "bfloat16": "bf16",
     "float32": "f32",
@@ -221,6 +230,11 @@ def validate_j_inputs(
     j_inputs, dimension_extents = _j_inputs_and_dimensions(
         j, input_bindings, values
     )
+    validate_ragged_runtime_invocation(
+        j.intent,
+        j_inputs,
+        dims=dimension_extents,
+    )
     for item in j.boundary.index_bounds:
         static_status = static_index_bounds_status(j, item)
         if static_status is True:
@@ -282,15 +296,16 @@ def compare_outputs(
 ) -> PairwiseAgreement:
     """Compare two observations using J's class and external policy Q."""
 
-    expected_outputs = {item.name for item in j.intent.outputs}
+    output_records = j_elaboration(j).output_bindings
+    expected_outputs = {item.output for item in output_records}
     if set(output_bindings) != expected_outputs:
         raise ValueError("Gate2 output bindings differ from canonical J outputs")
     explicit = {item.output: item for item in j.boundary.result_relations}
-    _j_inputs(j, input_bindings, inputs)
+    validate_j_inputs(j, input_bindings, inputs)
     observations: list[OutputAgreement] = []
 
-    for output in j.intent.outputs:
-        logical_key = output.name
+    for output in output_records:
+        logical_key = output.output
         runtime_key = output_bindings[logical_key]
         relation = explicit.get(
             logical_key,
@@ -300,7 +315,7 @@ def compare_outputs(
             j,
             logical_key,
             relation.kind,
-            output.dtype,
+            output.output_type.dtype,
         )
         missing = []
         if runtime_key not in left:
@@ -335,7 +350,7 @@ def compare_outputs(
 
         lhs = np.asarray(left[runtime_key])
         rhs = np.asarray(right[runtime_key])
-        expected_dtype = _dtype_key(output.dtype)
+        expected_dtype = _dtype_key(output.output_type.dtype)
         observed_dtypes = (_dtype_key(lhs.dtype.name), _dtype_key(rhs.dtype.name))
         if observed_dtypes != (expected_dtype, expected_dtype):
             observations.append(

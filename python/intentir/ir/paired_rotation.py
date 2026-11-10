@@ -47,20 +47,33 @@ def _op_results(operation: IntentOp) -> tuple[str, ...]:
 def _top_level_node_operations(
     j: SemanticArchive,
 ) -> tuple[dict[str, IntentOp], dict[str, str]] | None:
+    typed_by_ref = j_elaboration(j).construction_records.typed_operation_by_ref(j.node_ids)
+    if typed_by_ref is None:
+        return None
     by_node: dict[str, IntentOp] = {}
     result_nodes: dict[str, str] = {}
     for node_ref, path in j.node_ids.items():
         matched = re.fullmatch(r"body\[([0-9]+)\]", path)
         if matched is None:
             return None
-        index = int(matched.group(1))
-        if index >= len(j.intent.body):
+        operation = typed_by_ref.get(node_ref)
+        if operation is None:
             return None
-        operation = j.intent.body[index]
         by_node[node_ref] = operation
         for result in _op_results(operation):
             result_nodes[result] = node_ref
     return by_node, result_nodes
+
+
+def _top_level_operations(j: SemanticArchive) -> tuple[IntentOp, ...] | None:
+    typed_rows = j_elaboration(j).typed_operation_rows
+    if typed_rows is None:
+        return None
+    return tuple(
+        operation
+        for path, operation in typed_rows
+        if re.fullmatch(r"body\[\d+\]", path)
+    )
 
 
 def _fn(operation: IntentOp, name: str) -> bool:
@@ -234,7 +247,8 @@ def _interleaved_rotation_view(
     selected by a kernel identifier or Source path.
     """
 
-    if len(j.intent.body) != 38:
+    body = _top_level_operations(j)
+    if body is None or len(body) != 38:
         return None
     tensor_map = {item.name: item for item in j.intent.inputs}
     q_shape = _shape(tensor_map[inout[0]].shape, concrete_extents)
@@ -269,16 +283,16 @@ def _interleaved_rotation_view(
 
     results = {
         result: operation
-        for operation in j.intent.body
+        for operation in body
         for result in _op_results(operation)
     }
-    iotas = [operation for operation in j.intent.body if operation.op == "iota"]
+    iotas = [operation for operation in body if operation.op == "iota"]
     if len(iotas) != 1 or not isinstance(iotas[0].result, str):
         return None
     pair = iotas[0].result
     even_candidates = [
         operation
-        for operation in j.intent.body
+        for operation in body
         if _commutative_operands(
             operation,
             "mul",
@@ -301,7 +315,7 @@ def _interleaved_rotation_view(
     }
     odd_candidates = [
         operation
-        for operation in j.intent.body
+        for operation in body
         if isinstance(operation.result, str)
         and operation.op == "map_binary"
         and operation.attrs.get("fn") == "add"
@@ -316,7 +330,7 @@ def _interleaved_rotation_view(
 
     angle_gathers = [
         operation
-        for operation in j.intent.body
+        for operation in body
         if operation.op == "gather"
         and operation.operands
         and operation.operands[0] == angle
@@ -339,7 +353,7 @@ def _interleaved_rotation_view(
         return None
     sine_casts = [
         operation
-        for operation in j.intent.body
+        for operation in body
         if operation.op == "cast"
         and operation.operands == [sine_raw]
         and operation.attrs.get("to_dtype") == "f32"
@@ -348,7 +362,7 @@ def _interleaved_rotation_view(
         return None
     sine_scaled_candidates = [
         operation
-        for operation in j.intent.body
+        for operation in body
         if _commutative_operands(operation, "mul", sine_casts[0].result, sign)
     ]
     if len(sine_scaled_candidates) != 1 or not isinstance(
@@ -362,7 +376,7 @@ def _interleaved_rotation_view(
     for data_ref in inout:
         data_gathers = [
             operation
-            for operation in j.intent.body
+            for operation in body
             if operation.op == "gather"
             and operation.operands
             and operation.operands[0] == data_ref
@@ -380,21 +394,21 @@ def _interleaved_rotation_view(
             return None
         even_casts = [
             operation
-            for operation in j.intent.body
+            for operation in body
             if operation.op == "cast"
             and operation.operands == [even_value]
             and operation.attrs.get("to_dtype") == "f32"
         ]
         odd_casts = [
             operation
-            for operation in j.intent.body
+            for operation in body
             if operation.op == "cast"
             and operation.operands == [odd_value]
             and operation.attrs.get("to_dtype") == "f32"
         ]
         cosine_casts = [
             operation
-            for operation in j.intent.body
+            for operation in body
             if operation.op == "cast"
             and operation.operands == [cosine]
             and operation.attrs.get("to_dtype") == "f32"
@@ -414,7 +428,7 @@ def _interleaved_rotation_view(
         low_cos = next(
             (
                 operation.result
-                for operation in j.intent.body
+                for operation in body
                 if any(
                     _commutative_operands(operation, "mul", even_f32, cosine_f32)
                     for cosine_f32 in cosine_f32_values
@@ -425,7 +439,7 @@ def _interleaved_rotation_view(
         high_sin = next(
             (
                 operation.result
-                for operation in j.intent.body
+                for operation in body
                 if _commutative_operands(operation, "mul", odd_f32, sine_scaled)
             ),
             None,
@@ -433,7 +447,7 @@ def _interleaved_rotation_view(
         high_cos = next(
             (
                 operation.result
-                for operation in j.intent.body
+                for operation in body
                 if _commutative_operands(operation, "mul", odd_value, cosine)
             ),
             None,
@@ -441,7 +455,7 @@ def _interleaved_rotation_view(
         low_sin = next(
             (
                 operation.result
-                for operation in j.intent.body
+                for operation in body
                 if _commutative_operands(operation, "mul", even_f32, sine_scaled)
             ),
             None,
@@ -450,7 +464,7 @@ def _interleaved_rotation_view(
             return None
         high_cos_casts = [
             operation.result
-            for operation in j.intent.body
+            for operation in body
             if operation.op == "cast"
             and operation.operands == [high_cos]
             and operation.attrs.get("to_dtype") == "f32"
@@ -458,14 +472,14 @@ def _interleaved_rotation_view(
         ]
         low_outputs = [
             operation
-            for operation in j.intent.body
+            for operation in body
             if operation.op == "map_binary"
             and operation.attrs.get("fn") == "sub"
             and _binary_inputs(operation) == (low_cos, high_sin)
         ]
         high_outputs = [
             operation
-            for operation in j.intent.body
+            for operation in body
             if operation.op == "map_binary"
             and operation.attrs.get("fn") == "add"
             and isinstance(operation.result, str)
@@ -479,7 +493,7 @@ def _interleaved_rotation_view(
         low_cast = next(
             (
                 operation
-                for operation in j.intent.body
+                for operation in body
                 if operation.op == "cast"
                 and operation.operands == [low_outputs[0].result]
                 and operation.attrs.get("to_dtype") == tensor_map[data_ref].dtype
@@ -489,7 +503,7 @@ def _interleaved_rotation_view(
         high_cast = next(
             (
                 operation
-                for operation in j.intent.body
+                for operation in body
                 if operation.op == "cast"
                 and operation.operands == [high_outputs[0].result]
                 and operation.attrs.get("to_dtype") == tensor_map[data_ref].dtype
@@ -595,9 +609,12 @@ def derive_paired_rotation_view(
     if node_maps is None:
         return None
     node_operations, result_nodes = node_maps
+    body = _top_level_operations(j)
+    if body is None:
+        return None
     operations = {
         result: operation
-        for operation in j.intent.body
+        for operation in body
         for result in _op_results(operation)
     }
     tensors = {item.name: item for item in j.intent.inputs}

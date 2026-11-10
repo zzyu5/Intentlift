@@ -163,6 +163,10 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     payload_root = args.bundle.resolve().parent
+    entry = {
+        **entry,
+        "output_specs": runner._resolve_runtime_output_specs(entry, payload_root),
+    }
     argument_sets, keepalive, output_sets = runner._argument_replicas(
         entry, 1, payload_root
     )

@@ -33,8 +33,9 @@ So we parse, against this LLVM-dialect form:
 
 * the **host llvm.func** signature -> input tensor names (from the *intent*
   source) and the flattened memref-descriptor block-arg layout (per memref:
-  allocated-ptr, *aligned-ptr*, offset, sizes..., strides...; kernels receive the
-  **aligned** = 2nd pointer of each descriptor group);
+  allocated-ptr, *aligned-ptr*, offset, sizes..., strides...; the launcher
+  resolves both pointer fields and supplies the complete descriptor scalar
+  fields to kernels);
 * every ``llvm.mlir.constant(V : ty) : i64`` -> a literal value (grid/block/scalar);
 * every ``llvm.call @malloc`` -> one buffer, identified in launch args by its
   ``llvm.inttoptr`` aligned-pointer result, shape from the descriptor's
@@ -51,20 +52,20 @@ Kernel<->cubin matching: in a multi-kernel program the *gpu.func* name can repea
 name (``mm_kernel`` vs ``mm_kernel_0``) is unique. We match each launch site by the
 token before ``::`` against ``CompiledKernel.binary_name``.
 
-Dynamic-shape output (C8 nonzero / masked_select): the compaction kernel's output
-extent ``nnz`` is data-dependent (unknown at compile time), but this parser only
-ever sees CONCRETE leading dims — because the runtime extent is resolved on the
-HOST before the launch, never as a dynamically-sized device allocation. Two flows,
-both compatible with the static-buffer machinery here:
+Dynamic-shape output (C8 nonzero / masked_select / Ragged member): the kernel's
+output extent is data-dependent (unknown at compile time), but this parser only
+ever launches a concrete host-allocated descriptor. The runtime extent is
+resolved on the HOST before the launch, and the complete flattened descriptor
+(allocated pointer, aligned pointer, offset, sizes, and strides) is passed to the
+device. Two flows, both compatible with the static-buffer machinery here:
   * two-step: reduce the mask to ``nnz`` on the host (``mask.sum()``), allocate the
     exact ``[nnz, ndim]`` / ``[nnz]`` output, then run the single compaction launch;
   * max-buffer + count: allocate a ``[Ntotal, *]`` upper-bound buffer, launch the
     compaction (the last thread writes the total ``nnz`` into a ``[1] i64`` count
     buffer), read ``count`` on the host and slice ``out[:nnz]``.
 Either way the kernel writes only its valid slots and the destination leading dim
-handed to ``run_program`` is a plain constant, so nothing dynamic flows through the
-LLVM-descriptor parsing below. (The C8 PK harness drives this directly via
-``RowReductionKernel``; ``run_program`` needs no dynamic-extent special-casing.)
+handed to ``run_program`` is concrete before launch. Ragged member uses the same
+descriptor machinery; it is not a bare-pointer exception.
 
 f32 scalar args: ``launch.py``'s ``_marshal`` only handles i32/i64/pointer; a float
 would silently fall through to ``c_void_p`` (a null-ish pointer) and corrupt the
@@ -77,6 +78,7 @@ this module reimplements the marshal + ``cuLaunchKernel`` locally with a
 from __future__ import annotations
 
 import ctypes
+import numpy as np
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,6 +86,19 @@ from typing import TYPE_CHECKING
 
 from intentir.backend.cuda.compile import CompiledKernel, compile_all_kernels
 from intentir.backend.cuda.launch import ensure_context, load_module
+from intentir.ir.value_dimension import (
+    RaggedRuntimeError,
+    ragged_member_length,
+    validate_ragged_runtime_carrier,
+)
+
+
+# MLIR permits dotted/dollar-bearing symbols and also prints unnamed SSA values
+# as numeric names (``%0``).  All host/source parsers in this module use these
+# grammar-level patterns so a name accepted by MLIR cannot become an
+# orchestration-only parse failure.
+_MLIR_SSA_RE = r"%(?:[0-9]+|[A-Za-z_][A-Za-z0-9_.$]*)"
+_MLIR_SYMBOL_RE = r"[A-Za-z_][A-Za-z0-9_.$]*"
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch
@@ -102,6 +117,18 @@ class _I64Arg(int):
 
 class _I32Arg(int):
     """Kernel arg passed by value as a 32-bit integer."""
+
+
+class _U8Arg(int):
+    """Kernel arg passed by value as an 8-bit unsigned integer."""
+
+
+class _U16Arg(int):
+    """Kernel arg passed by value as a 16-bit unsigned integer."""
+
+
+class _U32Arg(int):
+    """Kernel arg passed by value as a 32-bit unsigned integer."""
 
 
 class _F16Arg(int):
@@ -176,6 +203,12 @@ def _marshal(args):
             cvals.append(ctypes.c_uint16(int(a)))
         elif isinstance(a, _I32Arg):
             cvals.append(ctypes.c_int32(int(a)))
+        elif isinstance(a, _U8Arg):
+            cvals.append(ctypes.c_uint8(int(a)))
+        elif isinstance(a, _U16Arg):
+            cvals.append(ctypes.c_uint16(int(a)))
+        elif isinstance(a, _U32Arg):
+            cvals.append(ctypes.c_uint32(int(a)))
         elif isinstance(a, _I64Arg):
             cvals.append(ctypes.c_int64(int(a)))
         else:  # _PtrArg or plain int -> device pointer
@@ -283,11 +316,20 @@ class PreparedLauncher:
                 self._cells.append(ctypes.c_int64(int(entry[1])))
             elif kind == "i32":
                 self._cells.append(ctypes.c_int32(int(entry[1])))
+            elif kind == "u8":
+                self._cells.append(ctypes.c_uint8(int(entry[1])))
+            elif kind == "u16":
+                self._cells.append(ctypes.c_uint16(int(entry[1])))
+            elif kind == "u32":
+                self._cells.append(ctypes.c_uint32(int(entry[1])))
             elif kind.startswith("input_"):
                 scalar_kind = kind.removeprefix("input_")
                 cells = {
                     "i32": ctypes.c_int32,
                     "i64": ctypes.c_int64,
+                    "ui8": ctypes.c_uint8,
+                    "ui16": ctypes.c_uint16,
+                    "ui32": ctypes.c_uint32,
                     "f16": ctypes.c_uint16,
                     "bf16": ctypes.c_uint16,
                     "f32": ctypes.c_float,
@@ -400,11 +442,23 @@ def _torch_dtype(elem: str):
         "f16": torch.float16,
         "bf16": torch.bfloat16,
         "f64": torch.float64,
+        # ``index`` is a logical dtype; CUDA host/device launch storage uses
+        # the same signed 64-bit carrier as the MLIR emitter and CPU ABI.
+        "index": torch.int64,
         "i64": torch.int64,
         "i32": torch.int32,
         "i16": torch.int16,
         "i8": torch.int8,
         "i1": torch.bool,
+        "ui8": torch.uint8,
+        "ui16": torch.uint16,
+        "ui32": torch.uint32,
+        "u8": torch.uint8,
+        "u16": torch.uint16,
+        "u32": torch.uint32,
+        "uint8": torch.uint8,
+        "uint16": torch.uint16,
+        "uint32": torch.uint32,
     }
     if elem not in table:
         raise NotImplementedError(
@@ -423,13 +477,30 @@ class _IntentInput:
     dtype_str: str
 
 
+@dataclass(frozen=True)
+class _IntentConstant:
+    """One integer ``arith.constant`` tensor in the authored Intent module.
+
+    Ragged carriers may be deterministic constants rather than function
+    arguments.  Keep their exact static shape, dtype, and element sequence so
+    host-side result-shape resolution uses the same carrier contract as the
+    C++ lowering and the structured CPU reference.
+    """
+
+    shape: tuple[int, ...]
+    dtype_str: str
+    values: tuple[int, ...]
+
+
 def _parse_intent_signature(intent_src: str) -> list[_IntentInput]:
     """Parse ``func.func @name(%a: tensor<8x16xf32>, ...) -> ...`` from intent IR.
 
     Returns inputs in positional order. Used only to recover *names* (so callers
     can key the ``inputs`` dict by name) and to sanity-check shapes/dtypes.
     """
-    m = re.search(r"func\.func\s+@\w+\s*\(([^)]*)\)", intent_src)
+    m = re.search(
+        rf"func\.func\s+@{_MLIR_SYMBOL_RE}\s*\(([^)]*)\)", intent_src
+    )
     if not m:
         raise ValueError("orchestrate: could not find a func.func signature in intent IR")
     arglist = m.group(1).strip()
@@ -442,17 +513,20 @@ def _parse_intent_signature(intent_src: str) -> list[_IntentInput]:
         if not piece:
             continue
         am = re.match(
-            r"%(\w+)\s*:\s*tensor<([0-9x]*)x?([a-z0-9]+)>", piece
+            rf"({_MLIR_SSA_RE})\s*:\s*tensor<([0-9x]*)x?([a-z0-9]+)>",
+            piece,
         )
         if not am:
-            am2 = re.match(r"%(\w+)\s*:\s*tensor<([a-z0-9]+)>", piece)
+            am2 = re.match(
+                rf"({_MLIR_SSA_RE})\s*:\s*tensor<([a-z0-9]+)>", piece
+            )
             if am2:  # 0-d tensor
-                inputs.append(_IntentInput(am2.group(1), (), am2.group(2)))
+                inputs.append(_IntentInput(am2.group(1)[1:], (), am2.group(2)))
                 continue
             raise NotImplementedError(
                 f"orchestrate: unhandled intent arg type in {piece!r}"
             )
-        name = am.group(1)
+        name = am.group(1)[1:]
         dims_str = am.group(2)
         elem = am.group(3)
         dims = tuple(int(d) for d in dims_str.split("x") if d != "")
@@ -460,7 +534,9 @@ def _parse_intent_signature(intent_src: str) -> list[_IntentInput]:
     return inputs
 
 
-def _parse_intent_results(intent_src: str) -> list[tuple[tuple[int, ...], str]]:
+def _parse_intent_results(
+    intent_src: str,
+) -> list[tuple[tuple[int | None, ...], str]]:
     """Recover declared result shapes/dtypes from one emitted ``func.func``.
 
     Generic bufferization may return a tensor through a loose flat malloc even
@@ -470,7 +546,7 @@ def _parse_intent_results(intent_src: str) -> list[tuple[tuple[int, ...], str]]:
     """
 
     match = re.search(
-        r"func\.func\s+@\w+\s*\([^)]*\)\s*->\s*"
+        rf"func\.func\s+@{_MLIR_SYMBOL_RE}\s*\([^)]*\)\s*->\s*"
         r"(\([^)]*\)|tensor<[^>]+>)",
         intent_src,
     )
@@ -482,22 +558,224 @@ def _parse_intent_results(intent_src: str) -> list[tuple[tuple[int, ...], str]]:
         if result_text.startswith("(")
         else [result_text]
     )
-    results: list[tuple[tuple[int, ...], str]] = []
+    results: list[tuple[tuple[int | None, ...], str]] = []
     for piece in pieces:
         tensor_match = re.fullmatch(
-            r"tensor<(?:(\d+(?:x\d+)*)x)?([A-Za-z0-9]+)>", piece.strip()
+            r"tensor<(?:(?P<dims>(?:\d+|\?)(?:x(?:\d+|\?))*)x)?"
+            r"(?P<elem>[A-Za-z0-9]+)>",
+            piece.strip(),
         )
         if tensor_match is None:
             raise NotImplementedError(
                 f"orchestrate: unhandled intent result type {piece.strip()!r}"
             )
+        dims_text = tensor_match.group("dims")
         dims = (
-            tuple(int(dim) for dim in tensor_match.group(1).split("x"))
-            if tensor_match.group(1)
+            tuple(None if dim == "?" else int(dim) for dim in dims_text.split("x"))
+            if dims_text
             else ()
         )
-        results.append((dims, tensor_match.group(2)))
+        results.append((dims, tensor_match.group("elem")))
     return results
+
+
+def _parse_intent_constant_tensors(
+    intent_src: str,
+) -> dict[str, _IntentConstant]:
+    """Recover static integer tensor constants from the authored Intent IR.
+
+    ``emit_mlir`` uses ``dense<[...]>`` for explicit vectors and ``dense<V>``
+    for splats.  This parser is intentionally limited to the closed integer
+    carrier types used by Ragged; a different constant kind must not silently
+    become a runtime carrier.
+    """
+
+    constants: dict[str, _IntentConstant] = {}
+    pattern = re.compile(
+        rf"({_MLIR_SSA_RE})\s*=\s*arith\.constant\s+dense<"
+        r"(?P<values>[^>]+)>\s*:\s*tensor<"
+        r"(?:(?P<dims>\d+(?:x\d+)*)x)?"
+        r"(?P<dtype>ui\d+|i\d+|index)>"
+    )
+    dtype_map = {
+        "i8": np.int8,
+        "i16": np.int16,
+        "i32": np.int32,
+        "i64": np.int64,
+        "ui8": np.uint8,
+        "ui16": np.uint16,
+        "ui32": np.uint32,
+        "index": np.int64,
+    }
+    for match in pattern.finditer(intent_src):
+        dtype = match.group("dtype")
+        if dtype not in dtype_map:
+            continue
+        dims_text = match.group("dims")
+        shape = tuple(int(dim) for dim in dims_text.split("x")) if dims_text else ()
+        raw = match.group("values").strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            items = [item.strip() for item in raw[1:-1].split(",") if item.strip()]
+        else:
+            items = [raw]
+        try:
+            values = tuple(
+                1 if item == "true" else 0 if item == "false" else int(item, 0)
+                for item in items
+            )
+        except ValueError as exc:
+            raise NotImplementedError(
+                "orchestrate: Ragged constant carrier has a non-integer dense value"
+            ) from exc
+        expected = int(np.prod(shape, dtype=np.int64)) if shape else 1
+        if len(values) == 1 and expected > 1:
+            values = values * expected
+        if len(values) != expected:
+            raise ValueError(
+                "orchestrate: Ragged constant carrier dense element count does not "
+                f"match its declared shape {shape}"
+            )
+        # Materialize once here to reject a value that cannot be represented by
+        # the authored carrier width, before any CUDA launch is prepared.
+        np.asarray(values, dtype=dtype_map[dtype])
+        constants[match.group(1)] = _IntentConstant(shape, dtype, values)
+    return constants
+
+
+def _resolve_intent_result_shapes(
+    intent_src: str,
+    intent_inputs: list[_IntentInput],
+    declared: list[tuple[tuple[int | None, ...], str]],
+    input_tensor_by_index,
+) -> list[tuple[tuple[int, ...], str]]:
+    """Resolve the host allocation extent for a direct ragged_member result.
+
+    The CUDA C++ pass deliberately keeps the member result dynamic in the
+    source contract but emits a destination-passing output pointer.  Offsets,
+    indices, and selector values may be direct input tensors or deterministic
+    constant tensors; the exact allocation can be established before the
+    launch without putting a tuple or a dynamic memref descriptor in the device
+    ABI.
+    """
+
+    input_indices = {f"%{item.name}": index for index, item in enumerate(intent_inputs)}
+    ragged_producers = {
+        result: (offsets, indices)
+        for result, offsets, indices in re.findall(
+            rf"({_MLIR_SSA_RE})\s*=\s*intent\.ragged\s+"
+            rf"({_MLIR_SSA_RE})\s*,\s*({_MLIR_SSA_RE})",
+            intent_src,
+        )
+    }
+    member_producers = {
+        result: (descriptor, selector)
+        for result, descriptor, selector in re.findall(
+            rf"({_MLIR_SSA_RE})\s*=\s*intent\.ragged_member\s+"
+            rf"({_MLIR_SSA_RE})\s*,\s*({_MLIR_SSA_RE})",
+            intent_src,
+        )
+    }
+    constant_tensors = _parse_intent_constant_tensors(intent_src)
+
+    def input_tensor(name: str, *, role: str):
+        if name not in input_indices:
+            constant = constant_tensors.get(name)
+            if constant is not None:
+                dtype_map = {
+                    "i8": np.int8,
+                    "i16": np.int16,
+                    "i32": np.int32,
+                    "i64": np.int64,
+                    "ui8": np.uint8,
+                    "ui16": np.uint16,
+                    "ui32": np.uint32,
+                    "index": np.int64,
+                }
+                return np.asarray(
+                    constant.values,
+                    dtype=dtype_map[constant.dtype_str],
+                ).reshape(constant.shape)
+            raise NotImplementedError(
+                "CUDA Ragged host ABI requires "
+                f"{role} to be a function input or a static arith.constant carrier"
+            )
+        try:
+            return input_tensor_by_index[input_indices[name]]
+        except KeyError as exc:
+            raise NotImplementedError(
+                "CUDA Ragged host ABI could not bind "
+                f"{role} input {name}"
+            ) from exc
+
+    # Validate every descriptor before inspecting result shapes.  In
+    # particular, ragged_outer has a statically ranked scalar result and would
+    # otherwise bypass the dynamic-output branch below, allowing CUDA host
+    # orchestration to accept a carrier that CPU/Reference reject.
+    for descriptor, (offsets_name, indices_name) in ragged_producers.items():
+        offsets = input_tensor(offsets_name, role="offsets")
+        indices = input_tensor(indices_name, role="indices")
+        try:
+            validate_ragged_runtime_carrier(
+                offsets,
+                indices,
+                context=f"CUDA {descriptor} Ragged carrier",
+            )
+        except RaggedRuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+    member_lengths: dict[str, int] = {}
+    for result, (descriptor, selector_name) in member_producers.items():
+        carrier = ragged_producers.get(descriptor)
+        if carrier is None:
+            continue
+        offsets_name, indices_name = carrier
+        offsets = input_tensor(offsets_name, role="offsets")
+        indices = input_tensor(indices_name, role="indices")
+        selector = input_tensor(selector_name, role="selector")
+        try:
+            member_lengths[result] = ragged_member_length(
+                offsets,
+                indices,
+                selector,
+                context=f"CUDA {result} Ragged member",
+            )
+        except RaggedRuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+    if not any(None in shape for shape, _elem in declared):
+        return [(tuple(int(dim) for dim in shape), elem) for shape, elem in declared]
+    return_match = re.search(r"\breturn\s+([^:\n]+)\s*:", intent_src)
+    returned = (
+        [item.strip() for item in return_match.group(1).split(",")]
+        if return_match is not None
+        else []
+    )
+
+    resolved: list[tuple[tuple[int, ...], str]] = []
+    for result_index, (shape, elem) in enumerate(declared):
+        if None not in shape:
+            resolved.append((tuple(int(dim) for dim in shape), elem))
+            continue
+        if len(shape) != 1 or shape[0] is not None:
+            raise NotImplementedError(
+                "CUDA dynamic output is only implemented for a rank-1 "
+                "ragged_member result"
+            )
+        if result_index >= len(returned) or returned[result_index] not in member_producers:
+            raise NotImplementedError(
+                "CUDA dynamic output is not a direct ragged_member return"
+            )
+        descriptor, _selector = member_producers[returned[result_index]]
+        if descriptor not in ragged_producers:
+            raise NotImplementedError(
+                "CUDA ragged_member output has no local ragged producer"
+            )
+        try:
+            length = member_lengths[returned[result_index]]
+        except KeyError as exc:
+            raise NotImplementedError(
+                "CUDA dynamic output is not a closed Ragged member carrier"
+            ) from exc
+        resolved.append(((length,), elem))
+    return resolved
 
 
 def _parse_intent_inplace(
@@ -544,11 +822,45 @@ class _LaunchSite:
 
 
 @dataclass(frozen=True)
+class _MemRefDescriptor:
+    """One flattened ranked-memref descriptor in the host LLVM ABI.
+
+    ``convert-gpu-to-nvvm`` with the bare-pointer convention disabled expands a
+    ranked memref to allocated/aligned pointers followed by offset, sizes, and
+    strides.  The descriptor is kept as one object here so launch parsing,
+    allocation, and output collection cannot disagree about field ownership.
+    ``value_index`` is an input index for an input descriptor and a result index
+    for a destination descriptor.
+    """
+
+    ordinal: int
+    role: str
+    value_index: int
+    rank: int
+    allocated_ssa: str
+    aligned_ssa: str
+    offset_ssa: str
+    size_ssas: tuple[str, ...]
+    stride_ssas: tuple[str, ...]
+
+    @property
+    def scalar_fields(self) -> tuple[tuple[str, int | None, str], ...]:
+        fields: list[tuple[str, int | None, str]] = [("offset", None, self.offset_ssa)]
+        fields.extend(
+            ("size", index, ssa) for index, ssa in enumerate(self.size_ssas)
+        )
+        fields.extend(
+            ("stride", index, ssa) for index, ssa in enumerate(self.stride_ssas)
+        )
+        return tuple(fields)
+
+
+@dataclass(frozen=True)
 class _ConstGlobal:
     name: str
     shape: tuple[int, ...]
     elem: str
-    value: int | float
+    value: int | float | tuple[int | float, ...]
 
 
 @dataclass
@@ -557,6 +869,9 @@ class _HostModule:
     sig_args: list[str]                       # ordered block-arg SSA names ("%arg0", ...)
     constants: dict[str, tuple[str, str]]     # ssa -> (raw_value, type)
     aligned_ptr_blockargs: dict[str, int]     # aligned-ptr block-arg ssa -> input index
+    pointer_blockargs: dict[str, int]         # allocated/aligned input ptr -> input index
+    descriptors: tuple[_MemRefDescriptor, ...]
+    descriptor_scalar_fields: dict[str, tuple[int, str, int | None]]
     destination_aligned_ptrs: list[str]       # destination-passing result ptrs
     destination_result_indices: list[int]     # declared result index per destination
     malloc_buffers: dict[str, "_Buffer"]      # normalized aligned-ptr ssa -> buffer
@@ -604,8 +919,12 @@ def _host_func_text(binary_mlir: str) -> tuple[str, str]:
     launches region via a simple brace counter, which is robust to the nested
     ``!llvm.struct<...>`` angle brackets (we only count ``{`` / ``}``).
     """
-    func_starts = [(mm.start(), mm.group(1), mm.end())
-                   for mm in re.finditer(r"llvm\.func\s+@(\w+)\s*\(", binary_mlir)]
+    func_starts = [
+        (mm.start(), mm.group(1), mm.end())
+        for mm in re.finditer(
+            rf"llvm\.func\s+@({_MLIR_SYMBOL_RE})\s*\(", binary_mlir
+        )
+    ]
     for k, (start, name, end) in enumerate(func_starts):
         # A declaration-only func (e.g. @malloc) has no body brace before the
         # next llvm.func; reject a brace that belongs to a *later* function.
@@ -644,26 +963,124 @@ def _host_func_text(binary_mlir: str) -> tuple[str, str]:
     raise ValueError("orchestrate: no host llvm.func containing gpu.launch_func found")
 
 
-def _parse_signature_blockargs(func_text: str) -> tuple[str, list[str], list[str]]:
-    """Return (func_name, ordered_blockarg_ssa, ptr_blockarg_ssa).
+def _parse_signature_blockargs(
+    func_text: str,
+) -> tuple[str, list[str], list[str], list[tuple[str, str]]]:
+    """Return the host function name and its typed block arguments.
 
-    ptr_blockarg_ssa is the subset typed ``!llvm.ptr`` in declaration order.
+    The fourth result preserves argument order and type spelling.  It is needed
+    to reconstruct the flattened ranked-memref descriptors; retaining only the
+    pointer subset loses which ``i64`` values are offsets, sizes, and strides.
     """
-    m = re.search(r"llvm\.func\s+@(\w+)\s*\((.*?)\)\s*(?:->|attributes|\{)",
-                  func_text, re.DOTALL)
+    m = re.search(
+        rf"llvm\.func\s+@({_MLIR_SYMBOL_RE})\s*\((.*?)\)\s*"
+        rf"(?:->|attributes|\{{)",
+        func_text,
+        re.DOTALL,
+    )
     if not m:
         raise ValueError("orchestrate: could not parse host llvm.func signature")
     name = m.group(1)
     sig = m.group(2)
     ordered: list[str] = []
     ptrs: list[str] = []
-    for am in re.finditer(r"(%\w+)\s*:\s*([^,]+?)(?:,|$)", sig):
+    typed: list[tuple[str, str]] = []
+    for piece in _split_top_level(sig):
+        piece = piece.strip()
+        if not piece:
+            continue
+        am = re.match(rf"({_MLIR_SSA_RE})\s*:\s*(.+)$", piece)
+        if am is None:
+            raise ValueError(
+                f"orchestrate: could not parse host block argument {piece!r}"
+            )
         ssa = am.group(1)
         ty = am.group(2).strip()
         ordered.append(ssa)
+        typed.append((ssa, ty))
         if ty.startswith("!llvm.ptr"):
             ptrs.append(ssa)
-    return name, ordered, ptrs
+    return name, ordered, ptrs, typed
+
+
+def _parse_memref_descriptors(
+    typed_args: list[tuple[str, str]],
+    intent_inputs: list[_IntentInput],
+    intent_results: list[tuple[tuple[int | None, ...], str]],
+    fresh_results: list[int],
+) -> tuple[tuple[_MemRefDescriptor, ...], dict[str, int], dict[str, tuple[int, str, int | None]]]:
+    """Recover every flattened ranked-memref descriptor from the host ABI.
+
+    Descriptor order is the function-boundary order: all logical inputs, then
+    fresh destination-passing results.  Each rank ``r`` descriptor must contain
+    ``2 + 1 + r + r`` fields.  The exact count check is intentional: accepting a
+    partial descriptor would make a later scalar look like a size/stride and
+    silently corrupt a CUDA launch.
+    """
+
+    specs: list[tuple[str, int, int]] = [
+        ("input", index, len(item.shape))
+        for index, item in enumerate(intent_inputs)
+    ]
+    specs.extend(
+        ("output", result_index, len(intent_results[result_index][0]))
+        for result_index in fresh_results
+    )
+    if not specs:
+        return (), {}, {}
+
+    descriptors: list[_MemRefDescriptor] = []
+    pointer_blockargs: dict[str, int] = {}
+    scalar_fields: dict[str, tuple[int, str, int | None]] = {}
+    cursor = 0
+    for ordinal, (role, value_index, rank) in enumerate(specs):
+        field_count = 2 + 1 + 2 * rank
+        fields = typed_args[cursor : cursor + field_count]
+        if len(fields) != field_count:
+            raise NotImplementedError(
+                "orchestrate: host LLVM signature ends in a partial memref "
+                f"descriptor for {role} {value_index}"
+            )
+        pointers = fields[:2]
+        if any(not ty.startswith("!llvm.ptr") for _ssa, ty in pointers):
+            raise NotImplementedError(
+                "orchestrate: flattened memref descriptor must begin with "
+                f"allocated/aligned pointers for {role} {value_index}"
+            )
+        scalars = fields[2:]
+        if any(ty != "i64" for _ssa, ty in scalars):
+            raise NotImplementedError(
+                "orchestrate: flattened memref descriptor scalar fields must "
+                f"be i64 for {role} {value_index}"
+            )
+        allocated_ssa, aligned_ssa = pointers[0][0], pointers[1][0]
+        offset_ssa = scalars[0][0]
+        size_ssas = tuple(ssa for ssa, _ty in scalars[1 : 1 + rank])
+        stride_ssas = tuple(ssa for ssa, _ty in scalars[1 + rank :])
+        descriptor = _MemRefDescriptor(
+            ordinal=ordinal,
+            role=role,
+            value_index=value_index,
+            rank=rank,
+            allocated_ssa=allocated_ssa,
+            aligned_ssa=aligned_ssa,
+            offset_ssa=offset_ssa,
+            size_ssas=size_ssas,
+            stride_ssas=stride_ssas,
+        )
+        descriptors.append(descriptor)
+        if role == "input":
+            pointer_blockargs[allocated_ssa] = value_index
+            pointer_blockargs[aligned_ssa] = value_index
+        for kind, index, ssa in descriptor.scalar_fields:
+            scalar_fields[ssa] = (ordinal, kind, index)
+        cursor += field_count
+    if cursor != len(typed_args):
+        raise NotImplementedError(
+            "orchestrate: host LLVM signature contains arguments outside the "
+            "declared ranked-memref descriptors"
+        )
+    return tuple(descriptors), pointer_blockargs, scalar_fields
 
 
 def _map_input_aligned_ptrs(ptr_blockargs: list[str]) -> dict[str, int]:
@@ -700,7 +1117,7 @@ def _parse_constants(func_text: str) -> dict[str, tuple[str, str]]:
 
     consts: dict[str, tuple[str, str]] = {}
     for m in re.finditer(
-        r"(%\w+)\s*=\s*llvm\.mlir\.constant\(([^)]*)\)\s*:\s*(\S+)",
+        rf"({_MLIR_SSA_RE})\s*=\s*llvm\.mlir\.constant\(([^)]*)\)\s*:\s*(\S+)",
         func_text,
     ):
         body = m.group(2).strip()
@@ -728,13 +1145,16 @@ def _parse_malloc_buffers(func_text: str) -> dict[str, _Buffer]:
     # value_inserted[ssa_result] = (src_ssa, inserted_ssa, position)
     inserts: list[tuple[str, str, str, str]] = []  # (result, src, inserted, pos)
     for m in re.finditer(
-        r"(%\w+)\s*=\s*llvm\.insertvalue\s+(%\w+),\s*(%\w+)\[([0-9, ]+)\]",
+        rf"({_MLIR_SSA_RE})\s*=\s*llvm\.insertvalue\s+"
+        rf"({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE})\[([0-9, ]+)\]",
         func_text,
     ):
         inserts.append((m.group(1), m.group(3), m.group(2), m.group(4).strip()))
 
     # Build forward chains rooted at llvm.mlir.undef structs.
-    undefs = set(re.findall(r"(%\w+)\s*=\s*llvm\.mlir\.undef", func_text))
+    undefs = set(
+        re.findall(rf"({_MLIR_SSA_RE})\s*=\s*llvm\.mlir\.undef", func_text)
+    )
     # For each insertvalue, follow src back to find the originating undef root.
     src_to_result: dict[str, str] = {r: r for (r, _s, _i, _p) in inserts}
     # parent map: result -> src
@@ -830,14 +1250,14 @@ def _parse_loose_buffers(func_text: str) -> dict[str, _LooseBuffer]:
     """
     # defs[ssa] = the verbatim RHS of its single defining op (SSA is unique).
     defs: dict[str, str] = {}
-    for m in re.finditer(r"(%\w+)\s*=\s*([^\n]+)", func_text):
+    for m in re.finditer(rf"({_MLIR_SSA_RE})\s*=\s*([^\n]+)", func_text):
         defs.setdefault(m.group(1), m.group(2).strip())
 
     # getelementptr def -> (N, elem).  LLVM may spell the static element count
     # either as a literal ``[N]`` or as an SSA constant ``[%n]`` after CSE.
     def _gep_info(rhs: str):
         gm = re.match(
-            r"llvm\.getelementptr\s+%\w+\[(%\w+|\d+)\]\s*:\s*"
+            rf"llvm\.getelementptr\s+{_MLIR_SSA_RE}\[({_MLIR_SSA_RE}|\d+)\]\s*:\s*"
             r"\([^)]*\)\s*->\s*!llvm\.ptr\s*,\s*"
             r"([A-Za-z0-9_!.<>]+)",
             rhs,
@@ -867,7 +1287,7 @@ def _parse_loose_buffers(func_text: str) -> dict[str, _LooseBuffer]:
             if g is not None:
                 return g
             # llvm.add %p, %c   -> follow the operand that is NOT the 64-const
-            am = re.match(r"llvm\.add\s+(%\w+),\s*(%\w+)", rhs)
+            am = re.match(rf"llvm\.add\s+({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE})", rhs)
             if am:
                 a, b = am.group(1), am.group(2)
                 # prefer the ptrtoint-bearing side; fall back to first.
@@ -878,7 +1298,7 @@ def _parse_loose_buffers(func_text: str) -> dict[str, _LooseBuffer]:
                     cur = b
                 continue
             # llvm.ptrtoint %g -> follow %g
-            pm = re.match(r"llvm\.ptrtoint\s+(%\w+)", rhs)
+            pm = re.match(rf"llvm\.ptrtoint\s+({_MLIR_SSA_RE})", rhs)
             if pm:
                 cur = pm.group(1)
                 continue
@@ -889,9 +1309,12 @@ def _parse_loose_buffers(func_text: str) -> dict[str, _LooseBuffer]:
     # dependencies; source-order pairing silently aliases distinct allocations.
     mallocs = [(m.start(), m.group(1), m.group(2))
                for m in re.finditer(
-                   r"(%\w+)\s*=\s*llvm\.call\s+@malloc\((%\w+)\)", func_text)]
+                   rf"({_MLIR_SSA_RE})\s*=\s*llvm\.call\s+@malloc\(({_MLIR_SSA_RE})\)",
+                   func_text)]
     inttoptrs = [m.group(1)
-                 for m in re.finditer(r"(%\w+)\s*=\s*llvm\.inttoptr", func_text)]
+                 for m in re.finditer(
+                     rf"({_MLIR_SSA_RE})\s*=\s*llvm\.inttoptr", func_text
+                 )]
 
     def _depends_on(ssa: str, allocation_ssa: str, seen: set[str]) -> bool:
         if ssa == allocation_ssa:
@@ -901,7 +1324,7 @@ def _parse_loose_buffers(func_text: str) -> dict[str, _LooseBuffer]:
         seen.add(ssa)
         return any(
             _depends_on(operand, allocation_ssa, seen)
-            for operand in re.findall(r"%\w+", defs[ssa])
+            for operand in re.findall(_MLIR_SSA_RE, defs[ssa])
         )
 
     loose: dict[str, _LooseBuffer] = {}
@@ -935,11 +1358,11 @@ def _parse_loose_buffers(func_text: str) -> dict[str, _LooseBuffer]:
 def _parse_launches(func_text: str) -> list[_LaunchSite]:
     sites: list[_LaunchSite] = []
     pat = re.compile(
-        r"gpu\.launch_func\s+@(\w+)::@(\w+)\s+"
-        r"blocks\s+in\s+\((%\w+),\s*(%\w+),\s*(%\w+)\)\s+"
-        r"threads\s+in\s+\((%\w+),\s*(%\w+),\s*(%\w+)\)\s*"
+        rf"gpu\.launch_func\s+@({_MLIR_SYMBOL_RE})::@({_MLIR_SYMBOL_RE})\s+"
+        rf"blocks\s+in\s+\(({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE})\)\s+"
+        rf"threads\s+in\s+\(({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE})\)\s*"
         r"(?::\s*\S+\s*)?"
-        r"(?:dynamic_shared_memory_size\s+(%\w+)\s*)?"  # M5 tiled smem cache
+        rf"(?:dynamic_shared_memory_size\s+({_MLIR_SSA_RE})\s*)?"  # M5 tiled smem cache
         r"args\(([^)]*)\)"
     )
     for m in pat.finditer(func_text):
@@ -953,7 +1376,7 @@ def _parse_launches(func_text: str) -> list[_LaunchSite]:
             piece = piece.strip()
             if not piece:
                 continue
-            om = re.match(r"(%\w+)\s*:\s*(.+)$", piece)
+            om = re.match(rf"({_MLIR_SSA_RE})\s*:\s*(.+)$", piece)
             if not om:
                 raise NotImplementedError(
                     f"orchestrate: unparsable launch operand {piece!r}"
@@ -995,7 +1418,7 @@ def _parse_return_aligned_ptrs(func_text: str) -> list[str]:
     is itself an insertvalue result), and each inner descriptor's [1] is its
     aligned ptr. Returns ``[]`` if no return ptr can be recovered.
     """
-    rm = re.search(r"llvm\.return\s+(%\w+)", func_text)
+    rm = re.search(rf"llvm\.return\s+({_MLIR_SSA_RE})", func_text)
     if not rm:
         return []
     ret_ssa = rm.group(1)
@@ -1004,7 +1427,8 @@ def _parse_return_aligned_ptrs(func_text: str) -> list[str]:
     pos_of: dict[str, str] = {}
     inserted_of: dict[str, str] = {}
     for m in re.finditer(
-        r"(%\w+)\s*=\s*llvm\.insertvalue\s+(%\w+),\s*(%\w+)\[([0-9, ]+)\]",
+        rf"({_MLIR_SSA_RE})\s*=\s*llvm\.insertvalue\s+"
+        rf"({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE})\[([0-9, ]+)\]",
         func_text,
     ):
         result, inserted, src, pos = m.group(1), m.group(2), m.group(3), m.group(4).strip()
@@ -1047,43 +1471,61 @@ def _parse_return_aligned_ptrs(func_text: str) -> list[str]:
 
 
 def _parse_const_globals(binary_mlir: str, func_text: str) -> dict[str, _ConstGlobal]:
-    """Resolve scalar and dense-splat globals plus zero-offset GEP aliases."""
+    """Resolve scalar/dense globals plus zero-offset GEP aliases."""
 
     def parse_value(text: str, elem: str) -> int | float:
         if elem == "i1" and text in {"true", "false"}:
             return int(text == "true")
         return _parse_f32(text) if elem.startswith("f") else int(text, 0)
 
+    def parse_dense_values(text: str, elem: str) -> int | float | tuple[int | float, ...]:
+        text = text.strip()
+        if not (text.startswith("[") and text.endswith("]")):
+            return parse_value(text, elem)
+        pieces = [piece.strip() for piece in text[1:-1].split(",") if piece.strip()]
+        return tuple(parse_value(piece, elem) for piece in pieces)
+
     globals_: dict[str, _ConstGlobal] = {}
     for match in re.finditer(
-        r"llvm\.mlir\.global\s+[^@]*@(\w+)\(\s*"
+        rf"llvm\.mlir\.global\s+[^@]*@({_MLIR_SYMBOL_RE})\(\s*"
         r"(true|false|[-+0-9.eExXa-fA-F]+)"
-        r"(?:\s*:\s*[fi]\d+)?\s*\)\s*"
-        r"(?:\{[^}\n]*\}\s*)?:\s*([fi]\d+)",
+        r"(?:\s*:\s*(?:bf16|f\d+|(?:ui|si|i)\d+))?\s*\)\s*"
+        r"(?:\{[^}\n]*\}\s*)?:\s*(bf16|f\d+|(?:ui|si|i)\d+)",
         binary_mlir,
     ):
         name, raw, elem = match.group(1), match.group(2), match.group(3)
         globals_[name] = _ConstGlobal(name, (), elem, parse_value(raw, elem))
     for match in re.finditer(
-        r"llvm\.mlir\.global\s+[^@]*@(\w+)\(\s*dense<"
-        r"([-+0-9.eExXa-fA-F]+)>\s*:\s*tensor<"
-        r"((?:\d+x)*)?([fi]\d+)>\s*\)",
+        rf"llvm\.mlir\.global\s+[^@]*@({_MLIR_SYMBOL_RE})\(\s*dense<"
+        r"(?P<values>\[[^]]*\]|[^>]+)>\s*:\s*tensor<"
+        r"(?P<dims>(?:\d+x)*)?(?P<elem>bf16|f\d+|(?:ui|si|i)\d+)>\s*\)",
         binary_mlir,
     ):
         name, raw, dims_text, elem = (
             match.group(1),
-            match.group(2),
-            match.group(3) or "",
-            match.group(4),
+            match.group("values"),
+            match.group("dims") or "",
+            match.group("elem"),
         )
         shape = tuple(int(dim) for dim in dims_text.split("x") if dim)
+        parsed = parse_dense_values(raw, elem)
+        if isinstance(parsed, tuple):
+            expected = int(np.prod(shape, dtype=np.int64)) if shape else 1
+            if len(parsed) == 1 and expected > 1:
+                parsed = parsed * expected
+            if len(parsed) != expected:
+                raise ValueError(
+                    f"orchestrate: constant global @{name} element count does not "
+                    f"match its declared shape {shape}"
+                )
         globals_[name] = _ConstGlobal(
-            name, shape, elem, parse_value(raw, elem)
+            name, shape, elem, parsed
         )
 
     out: dict[str, _ConstGlobal] = {}
     for match in re.finditer(
-        r"(%\w+)\s*=\s*llvm\.mlir\.addressof\s+@(\w+)", func_text
+        rf"({_MLIR_SSA_RE})\s*=\s*llvm\.mlir\.addressof\s+@({_MLIR_SYMBOL_RE})",
+        func_text
     ):
         if match.group(2) in globals_:
             out[match.group(1)] = globals_[match.group(2)]
@@ -1091,7 +1533,8 @@ def _parse_const_globals(binary_mlir: str, func_text: str) -> dict[str, _ConstGl
     while changed:
         changed = False
         for match in re.finditer(
-            r"(%\w+)\s*=\s*llvm\.getelementptr\s+(%\w+)\[([^]]+)\]",
+            rf"({_MLIR_SSA_RE})\s*=\s*llvm\.getelementptr\s+"
+            rf"({_MLIR_SSA_RE})\[([^]]+)\]",
             func_text,
         ):
             result, base, indices = match.group(1), match.group(2), match.group(3)
@@ -1108,13 +1551,16 @@ def _parse_const_globals(binary_mlir: str, func_text: str) -> dict[str, _ConstGl
 def _parse_host_module(
     binary_mlir: str,
     intent_inputs: list[_IntentInput],
-    intent_results: list[tuple[tuple[int, ...], str]] | None = None,
+    intent_results: list[tuple[tuple[int | None, ...], str]] | None = None,
     intent_inplace: list[int] | None = None,
+    require_descriptor_abi: bool = False,
 ) -> _HostModule:
     _func_name, func_text = _host_func_text(binary_mlir)
-    sig_name, ordered, ptr_blockargs = _parse_signature_blockargs(func_text)
-    all_aligned = _map_input_aligned_ptrs(ptr_blockargs)
-    result_count = len(intent_results or [])
+    sig_name, ordered, ptr_blockargs, typed_args = _parse_signature_blockargs(
+        func_text
+    )
+    declared_results = intent_results or []
+    result_count = len(declared_results)
     input_count = len(intent_inputs)
     destination_aligned_ptrs: list[str] = []
     destination_result_indices: list[int] = []
@@ -1123,24 +1569,89 @@ def _parse_host_module(
         if intent_inplace is not None
         else list(range(result_count))
     )
-    if len(all_aligned) == input_count:
-        aligned_map = all_aligned
-    elif fresh_results and len(all_aligned) == input_count + len(fresh_results):
-        ordered_aligned = [
-            ssa for ssa, _index in sorted(all_aligned.items(), key=lambda item: item[1])
-        ]
-        aligned_map = {
-            ssa: index for index, ssa in enumerate(ordered_aligned[:input_count])
-        }
-        destination_aligned_ptrs = ordered_aligned[input_count:]
-        destination_result_indices = fresh_results
-    else:
-        raise NotImplementedError(
-            "orchestrate: host has "
-            f"{len(all_aligned)} memrefs but intent signature has {input_count} "
-            f"inputs and {result_count} results; cannot distinguish input and "
-            "destination-passing buffers unambiguously"
+    descriptors: tuple[_MemRefDescriptor, ...] = ()
+    aligned_map: dict[str, int] = {}
+    pointer_blockargs: dict[str, int] = {}
+    descriptor_scalar_fields: dict[str, tuple[int, str, int | None]] = {}
+    descriptor_error: NotImplementedError | None = None
+    try:
+        descriptors, pointer_blockargs, descriptor_scalar_fields = (
+            _parse_memref_descriptors(
+                typed_args,
+                intent_inputs,
+                declared_results,
+                fresh_results,
+            )
         )
+    except NotImplementedError as exc:
+        descriptor_error = exc
+
+    if descriptors:
+        input_descriptors = tuple(
+            item for item in descriptors if item.role == "input"
+        )
+        destination_descriptors = tuple(
+            item for item in descriptors if item.role == "output"
+        )
+        if len(input_descriptors) != input_count or len(destination_descriptors) != len(
+            fresh_results
+        ):
+            raise NotImplementedError(
+                "orchestrate: flattened descriptor order does not match the "
+                "declared input/destination ABI"
+            )
+        aligned_map = {
+            item.aligned_ssa: item.value_index for item in input_descriptors
+        }
+        destination_aligned_ptrs = [
+            item.aligned_ssa for item in destination_descriptors
+        ]
+        destination_result_indices = [
+            item.value_index for item in destination_descriptors
+        ]
+    else:
+        if require_descriptor_abi:
+            detail = f": {descriptor_error}" if descriptor_error else ""
+            raise NotImplementedError(
+                "orchestrate: CUDA Ragged graph requires the complete flattened "
+                f"memref-descriptor ABI{detail}"
+            )
+        all_aligned = _map_input_aligned_ptrs(ptr_blockargs)
+        if len(all_aligned) == input_count:
+            aligned_map = all_aligned
+            ordered_pairs = [
+                (ptr_blockargs[2 * index], ptr_blockargs[2 * index + 1])
+                for index in range(input_count)
+            ]
+        elif fresh_results and len(all_aligned) == input_count + len(fresh_results):
+            ordered_aligned = [
+                ssa
+                for ssa, _index in sorted(
+                    all_aligned.items(), key=lambda item: item[1]
+                )
+            ]
+            aligned_map = {
+                ssa: index
+                for index, ssa in enumerate(ordered_aligned[:input_count])
+            }
+            destination_aligned_ptrs = ordered_aligned[input_count:]
+            destination_result_indices = fresh_results
+            ordered_pairs = [
+                (ptr_blockargs[2 * index], ptr_blockargs[2 * index + 1])
+                for index in range(input_count)
+            ]
+        else:
+            raise NotImplementedError(
+                "orchestrate: host has "
+                f"{len(all_aligned)} memrefs but intent signature has {input_count} "
+                f"inputs and {result_count} results; cannot distinguish input and "
+                "destination-passing buffers unambiguously"
+            )
+        pointer_blockargs = {
+            pointer: index
+            for index, pair in enumerate(ordered_pairs)
+            for pointer in pair
+        }
     struct_buffers = _parse_malloc_buffers(func_text)
     loose_buffers = _parse_loose_buffers(func_text)
     # The struct-packed (returned) buffer wins: it carries real shape+dtype, so
@@ -1152,6 +1663,9 @@ def _parse_host_module(
         sig_args=ordered,
         constants=_parse_constants(func_text),
         aligned_ptr_blockargs=aligned_map,
+        pointer_blockargs=pointer_blockargs,
+        descriptors=descriptors,
+        descriptor_scalar_fields=descriptor_scalar_fields,
         destination_aligned_ptrs=destination_aligned_ptrs,
         destination_result_indices=destination_result_indices,
         malloc_buffers=struct_buffers,
@@ -1196,10 +1710,12 @@ def _execute_host_scalar_prelude(
     body = host.body_text
     first_launch = body.find("gpu.launch_func")
     definitions: dict[str, str] = {}
-    for match in re.finditer(r"(%\w+)\s*=\s*([^\n]+)", body):
+    for match in re.finditer(rf"({_MLIR_SSA_RE})\s*=\s*([^\n]+)", body):
         definitions[match.group(1)] = match.group(2).strip()
     stores: list[tuple[int, str, str]] = []
-    for match in re.finditer(r"llvm\.store\s+(%\w+),\s*(%\w+)\s*:", body):
+    for match in re.finditer(
+        rf"llvm\.store\s+({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE})\s*:", body
+    ):
         destination = match.group(2)
         if destination not in buffer_tensor_by_ssa:
             continue
@@ -1221,9 +1737,9 @@ def _execute_host_scalar_prelude(
     initialized_scalar_buffers: set[str] = set()
 
     def resolve_load_pointer(pointer: str) -> tuple["torch.Tensor", int]:
-        if pointer in host.aligned_ptr_blockargs:
+        if pointer in host.pointer_blockargs:
             return (
-                input_tensor_by_index[host.aligned_ptr_blockargs[pointer]],
+                input_tensor_by_index[host.pointer_blockargs[pointer]],
                 0,
             )
         if pointer in host.const_globals and pointer in buffer_tensor_by_ssa:
@@ -1240,7 +1756,7 @@ def _execute_host_scalar_prelude(
                 f"orchestrate: scalar load pointer {pointer} has no definition"
             )
         gep = re.match(
-            r"llvm\.getelementptr\s+(%\w+)\[([^]]+)\]",
+            rf"llvm\.getelementptr\s+({_MLIR_SSA_RE})\[([^]]+)\]",
             rhs,
         )
         if gep:
@@ -1273,7 +1789,11 @@ def _execute_host_scalar_prelude(
                     _parse_f32(raw), dtype=_torch_dtype(ty), device="cuda"
                 )
             else:
-                dtype = _torch_dtype(ty) if ty in {"i1", "i8", "i16", "i32", "i64"} else torch.int64
+                integer_types = {
+                    "i1", "i8", "i16", "i32", "i64",
+                    "ui8", "ui16", "ui32",
+                }
+                dtype = _torch_dtype(ty) if ty in integer_types else torch.int64
                 value = torch.tensor(int(raw), dtype=dtype, device="cuda")
             cache[ssa] = value
             return value
@@ -1282,7 +1802,7 @@ def _execute_host_scalar_prelude(
             raise NotImplementedError(
                 f"orchestrate: scalar prelude value {ssa} has no definition"
             )
-        load = re.match(r"llvm\.load\s+(%\w+)\s*:", rhs)
+        load = re.match(rf"llvm\.load\s+({_MLIR_SSA_RE})\s*:", rhs)
         if load:
             pointer = load.group(1)
             tensor, offset = resolve_load_pointer(pointer)
@@ -1297,7 +1817,7 @@ def _execute_host_scalar_prelude(
 
         cast = re.match(
             r"llvm\.(sitofp|uitofp|fptosi|fptoui|fpext|fptrunc|sext|zext|trunc)\s+"
-            r"(%\w+)\s*:\s*\S+\s+to\s+(\S+)",
+            rf"({_MLIR_SSA_RE})\s*:\s*\S+\s+to\s+(\S+)",
             rhs,
         )
         if cast:
@@ -1307,7 +1827,7 @@ def _execute_host_scalar_prelude(
 
         binary = re.match(
             r"llvm\.(add|sub|mul|sdiv|udiv|fadd|fsub|fmul|fdiv|and|or|xor)\s+"
-            r"(%\w+),\s*(%\w+)",
+            rf"({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE})",
             rhs,
         )
         if binary:
@@ -1333,7 +1853,7 @@ def _execute_host_scalar_prelude(
 
         icmp = re.match(
             r'llvm\.icmp\s+"(eq|ne|slt|sle|sgt|sge|ult|ule|ugt|uge)"\s+'
-            r"(%\w+),\s*(%\w+)",
+            rf"({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE})",
             rhs,
         )
         if icmp:
@@ -1356,7 +1876,8 @@ def _execute_host_scalar_prelude(
             return value
 
         select = re.match(
-            r"llvm\.select\s+(%\w+),\s*(%\w+),\s*(%\w+)\s*:",
+            rf"llvm\.select\s+({_MLIR_SSA_RE}),\s*({_MLIR_SSA_RE}),\s*"
+            rf"({_MLIR_SSA_RE})\s*:",
             rhs,
         )
         if select:
@@ -1433,7 +1954,11 @@ def run_program(
     by_binary: dict[str, CompiledKernel] = {k.binary_name: k for k in kernels}
 
     host = _parse_host_module(
-        binary_mlir, intent_inputs, intent_results, intent_inplace
+        binary_mlir,
+        intent_inputs,
+        intent_results,
+        intent_inplace,
+        require_descriptor_abi="intent.ragged" in intent_src,
     )
     if host.return_aligned_ptrs:
         output_aligned_ptrs = host.return_aligned_ptrs
@@ -1508,6 +2033,13 @@ def run_program(
             )
         input_tensor_by_index[idx] = t.contiguous()
 
+    intent_results = _resolve_intent_result_shapes(
+        intent_src,
+        intent_inputs,
+        intent_results,
+        input_tensor_by_index,
+    )
+
     alias_tensor_by_ssa: dict[str, "torch.Tensor"] = {}
     if output_aliases:
         if not isinstance(output_aliases, dict):
@@ -1562,22 +2094,55 @@ def run_program(
     # SSA->tensor entry per buffer means a pointer reused across kernels
     # (e.g. softmax's exp buffer) resolves to the same storage automatically.
     buffer_tensor_by_ssa: dict[str, "torch.Tensor"] = {}
+
+    def register_descriptor_pointers(
+        pointer_ssa: str, tensor: "torch.Tensor"
+    ) -> None:
+        """Bind both fields of one destination memref descriptor.
+
+        The flattened non-bare-pointer ABI carries ``allocated`` and
+        ``aligned`` as separate pointer arguments even though both describe
+        the same allocation.  Output aliases and fresh destinations must
+        therefore register both SSA identities; registering only the aligned
+        field makes the host descriptor internally inconsistent and leaves a
+        later launch operand unresolved.
+        """
+
+        buffer_tensor_by_ssa[pointer_ssa] = tensor
+        matches = [
+            descriptor
+            for descriptor in host.descriptors
+            if descriptor.role == "output"
+            and pointer_ssa
+            in {descriptor.allocated_ssa, descriptor.aligned_ssa}
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "orchestrate: one destination pointer belongs to multiple "
+                "memref descriptors"
+            )
+        if matches:
+            descriptor = matches[0]
+            buffer_tensor_by_ssa[descriptor.allocated_ssa] = tensor
+            buffer_tensor_by_ssa[descriptor.aligned_ssa] = tensor
+
     for ssa, result_index in zip(
         host.destination_aligned_ptrs,
         host.destination_result_indices,
         strict=True,
     ):
         if ssa in alias_tensor_by_ssa:
-            buffer_tensor_by_ssa[ssa] = alias_tensor_by_ssa[ssa]
+            register_descriptor_pointers(ssa, alias_tensor_by_ssa[ssa])
             continue
         if result_index >= len(intent_results):
             raise RuntimeError(
                 "orchestrate: destination-passing output has no declared P4 result"
             )
         shape, elem = intent_results[result_index]
-        buffer_tensor_by_ssa[ssa] = torch.empty(
+        tensor = torch.empty(
             shape if shape else (), dtype=_torch_dtype(elem), device="cuda"
         ).contiguous()
+        register_descriptor_pointers(ssa, tensor)
     for ssa, buf in host.malloc_buffers.items():
         if ssa in alias_tensor_by_ssa:
             buffer_tensor_by_ssa[ssa] = alias_tensor_by_ssa[ssa]
@@ -1597,21 +2162,54 @@ def run_program(
             (lbuf.n_elems,), dtype=dtype, device="cuda"
         ).contiguous()
 
-    # Static scalar / dense-splat globals become read-only CUDA buffers.  GEP
-    # aliases share the same allocation instead of materializing extra copies.
+    # Static scalar / dense globals become read-only CUDA buffers.  GEP aliases
+    # share the same allocation instead of materializing extra copies.  This is
+    # also the runtime representation of a rank-one constant Ragged carrier
+    # after MLIR bufferization.
     const_tensor_by_name: dict[str, "torch.Tensor"] = {}
     for ssa, constant in host.const_globals.items():
         tensor = const_tensor_by_name.get(constant.name)
         if tensor is None:
-            shape = constant.shape if constant.shape else (1,)
-            tensor = torch.full(
-                shape,
-                constant.value,
-                dtype=_torch_dtype(constant.elem),
-                device="cuda",
-            ).contiguous()
+            dtype = _torch_dtype(constant.elem)
+            if isinstance(constant.value, tuple):
+                tensor = torch.tensor(
+                    constant.value,
+                    dtype=dtype,
+                    device="cuda",
+                ).reshape(constant.shape).contiguous()
+            else:
+                shape = constant.shape if constant.shape else (1,)
+                tensor = torch.full(
+                    shape,
+                    constant.value,
+                    dtype=dtype,
+                    device="cuda",
+                ).contiguous()
             const_tensor_by_name[constant.name] = tensor
         buffer_tensor_by_ssa[ssa] = tensor
+
+    # ``memref.get_global`` lowers its unused allocated-pointer field to the
+    # LLVM placeholder 0xDEADBEEF while the aligned field points at the actual
+    # global.  The CUDA kernel consumes the aligned field, but the flattened
+    # launch ABI still contains both pointers.  Supply any valid device pointer
+    # for the placeholder so the driver argument list remains complete; the
+    # corresponding aligned global pointer is still passed in its own slot.
+    if const_tensor_by_name:
+        fallback = next(iter(const_tensor_by_name.values()))
+        for match in re.finditer(
+            rf"({_MLIR_SSA_RE})\s*=\s*llvm\.inttoptr\s+"
+            rf"({_MLIR_SSA_RE})\s*:\s*i64\s+to\s+!llvm\.ptr",
+            host.body_text,
+        ):
+            constant = host.constants.get(match.group(2))
+            if constant is None:
+                continue
+            try:
+                value = int(constant[0], 0)
+            except ValueError:
+                continue
+            if value == 0xDEADBEEF:
+                buffer_tensor_by_ssa.setdefault(match.group(1), fallback)
 
     _execute_host_scalar_prelude(
         host,
@@ -1621,26 +2219,60 @@ def run_program(
 
     # --- map each launch operand to a concrete launch arg ------------------ #
     def _resolve_ptr(ssa: str) -> "torch.Tensor":
-        if ssa in host.aligned_ptr_blockargs:
-            return input_tensor_by_index[host.aligned_ptr_blockargs[ssa]]
+        if ssa in host.pointer_blockargs:
+            return input_tensor_by_index[host.pointer_blockargs[ssa]]
         if ssa in buffer_tensor_by_ssa:
             return buffer_tensor_by_ssa[ssa]
         raise NotImplementedError(
-            f"orchestrate: pointer operand {ssa} is neither an input aligned-ptr, "
-            f"a struct-packed buffer, nor a loose malloc buffer "
+            f"orchestrate: pointer operand {ssa} is neither an input descriptor "
+            f"pointer, a destination descriptor pointer, a struct-packed buffer, "
+            f"nor a loose malloc buffer "
             f"(unhandled host construct)"
         )
+
+    descriptor_tensors: dict[int, "torch.Tensor"] = {}
+    for descriptor in host.descriptors:
+        if descriptor.role == "input":
+            descriptor_tensors[descriptor.ordinal] = input_tensor_by_index[
+                descriptor.value_index
+            ]
+        elif descriptor.aligned_ssa in buffer_tensor_by_ssa:
+            descriptor_tensors[descriptor.ordinal] = buffer_tensor_by_ssa[
+                descriptor.aligned_ssa
+            ]
+
+    def _descriptor_scalar(ssa: str) -> int | None:
+        field = host.descriptor_scalar_fields.get(ssa)
+        if field is None:
+            return None
+        ordinal, kind, index = field
+        tensor = descriptor_tensors.get(ordinal)
+        if tensor is None:
+            raise RuntimeError(
+                f"orchestrate: no host tensor is bound to descriptor {ordinal}"
+            )
+        if kind == "offset":
+            # All launcher tensors are made contiguous before binding, so the
+            # destination-passing descriptor has the canonical zero offset.
+            return int(tensor.storage_offset())
+        if kind == "size":
+            assert index is not None
+            return int(tensor.shape[index])
+        if kind == "stride":
+            assert index is not None
+            return int(tensor.stride(index))
+        raise RuntimeError(f"orchestrate: unknown descriptor scalar field {kind!r}")
 
     # --- execute each launch in order -------------------------------------- #
     scalar_load_inputs: dict[str, int] = {}
     for match in re.finditer(
-        r"(%\w+)\s*=\s*llvm\.load\s+(%\w+)\s*:\s*!llvm\.ptr\s*->\s*"
-        r"(i32|i64|f16|bf16|f32|f64)",
+        rf"({_MLIR_SSA_RE})\s*=\s*llvm\.load\s+({_MLIR_SSA_RE})\s*:\s*!llvm\.ptr\s*->\s*"
+        r"(i1|i8|i16|i32|i64|ui8|ui16|ui32|f16|bf16|f32|f64)",
         host.body_text,
     ):
         result_ssa, pointer_ssa = match.group(1), match.group(2)
-        if pointer_ssa in host.aligned_ptr_blockargs:
-            scalar_load_inputs[result_ssa] = host.aligned_ptr_blockargs[pointer_ssa]
+        if pointer_ssa in host.pointer_blockargs:
+            scalar_load_inputs[result_ssa] = host.pointer_blockargs[pointer_ssa]
 
     def _loaded_input_scalar(ssa: str, expected_dtype):
         if ssa not in scalar_load_inputs:
@@ -1706,8 +2338,11 @@ def run_program(
                 plan.append(("ptr", len(launch_tensors)))
                 launch_tensors.append(t)
             elif ty in ("i64", "index"):
+                descriptor_value = _descriptor_scalar(op.ssa)
                 value = (
-                    int(host.constants[op.ssa][0])
+                    descriptor_value
+                    if descriptor_value is not None
+                    else int(host.constants[op.ssa][0])
                     if op.ssa in host.constants
                     else int(_loaded_input_scalar(op.ssa, torch.int64))
                 )
@@ -1719,6 +2354,27 @@ def run_program(
                     else int(_loaded_input_scalar(op.ssa, torch.int32))
                 )
                 plan.append(("i32", value))
+            elif ty == "ui8":
+                value = (
+                    int(host.constants[op.ssa][0])
+                    if op.ssa in host.constants
+                    else int(_loaded_input_scalar(op.ssa, torch.uint8))
+                )
+                plan.append(("u8", value))
+            elif ty == "ui16":
+                value = (
+                    int(host.constants[op.ssa][0])
+                    if op.ssa in host.constants
+                    else int(_loaded_input_scalar(op.ssa, torch.uint16))
+                )
+                plan.append(("u16", value))
+            elif ty == "ui32":
+                value = (
+                    int(host.constants[op.ssa][0])
+                    if op.ssa in host.constants
+                    else int(_loaded_input_scalar(op.ssa, torch.uint32))
+                )
+                plan.append(("u32", value))
             elif ty == "f16":
                 bits = (
                     _parse_f16_bits(host.constants[op.ssa][0])
@@ -1772,13 +2428,15 @@ def run_program(
                     f"orchestrate: returned aligned ptr {ssa} is not a known buffer/input"
                 )
     else:
-        # Fallback: if exactly one malloc buffer exists, treat it as the output.
-        if len(buffer_tensor_by_ssa) == 1:
-            outputs["out0"] = next(iter(buffer_tensor_by_ssa.values()))
-        else:
+        if intent_results:
             raise NotImplementedError(
-                "orchestrate: could not determine program output(s) from llvm.return "
-                f"(found {len(buffer_tensor_by_ssa)} malloc buffers)"
+                "orchestrate: compiled module has declared results but no "
+                "explicit returned or destination-passing output pointer"
+            )
+        if buffer_tensor_by_ssa:
+            raise NotImplementedError(
+                "orchestrate: compiled module has unbound buffers but no "
+                "declared output binding"
             )
     if intent_results:
         if len(outputs) != len(intent_results):

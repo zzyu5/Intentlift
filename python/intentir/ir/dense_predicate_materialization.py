@@ -36,7 +36,7 @@ from intentir.ir.contract_materialization import (
     ContractMaterializationProjection,
     project_contract_materialization,
 )
-from intentir.ir.model import IntentFunction, IntentOp
+from intentir.ir.model import IntentFunction, IntentOp, walk_intent_op_paths
 from intentir.verify.gate1.model import SemanticArchive
 
 
@@ -190,18 +190,20 @@ def _walk(
     body: Sequence[IntentOp],
     prefix: str = "body",
 ) -> tuple[tuple[str, IntentOp], ...]:
-    result: list[tuple[str, IntentOp]] = []
-    for index, operation in enumerate(body):
-        path = f"{prefix}[{index}]"
-        result.append((path, operation))
-        result.extend(_walk(operation.body, f"{path}.body"))
-        for polarity, arm in (
-            ("positive", operation.positive),
-            ("negative", operation.negative),
-        ):
-            if arm is not None:
-                result.extend(_walk(arm.body, f"{path}.{polarity}.body"))
-    return tuple(result)
+    return tuple(walk_intent_op_paths(body, prefix))
+
+
+def _canonical_walk(
+    j: SemanticArchive,
+) -> tuple[tuple[str, IntentOp], ...]:
+    """Return the one typed operation view owned by canonical J records."""
+
+    rows = j_elaboration(j).typed_operation_rows
+    if rows is None:
+        raise DensePredicateMaterializationError(
+            "canonical operation records have no typed operation view"
+        )
+    return tuple(rows)
 
 
 def _results(operation: IntentOp) -> tuple[str, ...]:
@@ -321,7 +323,7 @@ def _guard_dominates_output(
     if len(produced) != 1:
         return False
     value = produced[0]
-    operations = [item for _path, item in _walk(j.intent.body)]
+    operations = [item for _path, item in _canonical_walk(j)]
     uses = [
         (candidate, index)
         for candidate in operations
@@ -376,7 +378,9 @@ def materialize_dense_load_predicates(
     """
 
     j = elaborate_j(j)
-    if any(operation.op == "loop" for _path, operation in _walk(j.intent.body)):
+    if any(
+        operation.op == "loop" for _path, operation in _canonical_walk(j)
+    ):
         return None
 
     scalar_inputs = {
@@ -391,13 +395,14 @@ def materialize_dense_load_predicates(
         extent
         for tensor in [*j.intent.inputs, *j.intent.outputs]
         for extent in tensor.shape
-        if isinstance(extent, str)
+        if isinstance(extent, str) and extent != "?"
     }
     value_dimensions = {
         item.value_ref: item.dimension_ref
         for item in j.value_dimension_relations
     }
-    parsed_accesses = j_elaboration(j).access_by_id
+    elaboration = j_elaboration(j)
+    parsed_accesses = elaboration.access_by_id
     tensors = {
         item.name: item for item in [*j.intent.inputs, *j.intent.outputs]
     }
@@ -450,18 +455,36 @@ def materialize_dense_load_predicates(
     transformed = copy.deepcopy(function)
     transformed_nodes: dict[str, IntentOp] = {}
     path_nodes = dict(_walk(transformed.body))
-    for node_id, path in j.node_ids.items():
-        if path in path_nodes:
-            transformed_nodes[node_id] = path_nodes[path]
+    record_by_path = {
+        record["path"]: record for record in elaboration.operation_records
+    }
+    if set(record_by_path) != set(path_nodes):
+        raise DensePredicateMaterializationError(
+            "dense predicate nodes disagree with canonical J operation records"
+        )
+    authored_by_path = elaboration.authored_node_by_path(j.node_ids)
     for path, operation in path_nodes.items():
+        record = record_by_path[path]
+        record_id = record.get("id")
+        if not isinstance(record_id, str):
+            raise DensePredicateMaterializationError(
+                f"dense predicate operation {path!r} has no canonical node id"
+            )
+        if authored_by_path.get(path, record_id) != record_id:
+            raise DensePredicateMaterializationError(
+                f"dense predicate node id disagrees at {path!r}"
+            )
+        if operation.node_id is not None and operation.node_id != record_id:
+            raise DensePredicateMaterializationError(
+                f"dense predicate typed node id disagrees at {path!r}"
+            )
         transformed_nodes[path] = operation
-        if operation.node_id is not None:
-            transformed_nodes[operation.node_id] = operation
+        transformed_nodes[record_id] = operation
 
     prefix: list[IntentOp] = []
     broadcasts: dict[str, dict[str, tuple[int, ...]]] = {}
     records: list[PredicateMaterializationRecord] = []
-    mask_cache: dict[
+    predicate_value_cache: dict[
         tuple[str, tuple[int | str, ...]],
         tuple[str, tuple[int | str, ...], tuple[str, ...]],
     ] = {}
@@ -500,7 +523,7 @@ def materialize_dense_load_predicates(
         original_consumer = next(
             (
                 operation
-                for path, operation in _walk(j.intent.body)
+                for path, operation in _canonical_walk(j)
                 if path == j.node_ids.get(access.node_ref)
                 or operation.node_id == access.node_ref
             ),
@@ -565,8 +588,8 @@ def materialize_dense_load_predicates(
             fill = 0
             guard_dominated = True
 
-        mask_key = (access.predicate, _shape_tuple(tensor.shape))
-        cached = mask_cache.get(mask_key)
+        predicate_key = (access.predicate, _shape_tuple(tensor.shape))
+        cached = predicate_value_cache.get(predicate_key)
         generated: list[str] = []
         if cached is None:
             components: list[tuple[str, tuple[int | str, ...], int | None]] = []
@@ -678,7 +701,11 @@ def materialize_dense_load_predicates(
                     for axis in range(len(tensor.shape))
                     if axis not in active_positions
                 ) if compact_shape else ()
-            mask_cache[mask_key] = (mask_value, mask_shape, mask_axes)
+            predicate_value_cache[predicate_key] = (
+                mask_value,
+                mask_shape,
+                mask_axes,
+            )
         else:
             mask_value, mask_shape, mask_axes = cached
 

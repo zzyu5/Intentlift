@@ -1,4 +1,4 @@
-"""Strict normalized MLIR/PTX topology observer for the CuTe DSL frontend."""
+"""Strict normalized MLIR/PTX topology observer for the CuTe frontend."""
 
 from __future__ import annotations
 

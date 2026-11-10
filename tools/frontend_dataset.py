@@ -9,16 +9,25 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PYTHON_ROOT = ROOT / "python"
+if str(PYTHON_ROOT) not in sys.path:
+    sys.path.insert(0, str(PYTHON_ROOT))
 
 from intentir.verify.frontend_dataset import (
     load_frontend_dataset,
     resolve_cuda_include_dirs,
+    resolve_tilelang_python_executable,
 )
 from intentir.verify.gate1.cuda_compiler import (
     CudaCompileCase,
     CudaCompiler,
     CudaKernelSource,
     FrontendParameter,
+    _observe_cuda_interface,
 )
 from intentir.verify.gate1.tilelang_compiler import (
     TileLangCompileCase,
@@ -29,13 +38,17 @@ from intentir.verify.gate1.tilelang_compiler import (
 
 def _probe_tilelang(catalog, *, workers: int, timeout: float) -> dict:
     rows = catalog.select(frontend="tilelang")
+    python_executable = resolve_tilelang_python_executable(catalog.root)
     # Factory compilation is shape/schedule self-contained.  This placeholder
     # parameter only satisfies the compile-case type; the worker reports the
     # actual PrimFunc/PTX interface in its result.
     case = TileLangCompileCase((FrontendParameter("pointer", "f32", 1, "input"),))
 
     def probe(row):
-        result = TileLangCompiler(timeout=timeout).compile(
+        result = TileLangCompiler(
+            timeout=timeout,
+            python_executable=python_executable,
+        ).compile(
             TileLangKernelSource.from_factory_file(row.path, row.symbol),
             case,
         )
@@ -65,13 +78,66 @@ def _probe_tilelang(catalog, *, workers: int, timeout: float) -> dict:
     }
 
 
+def _cuda_probe_parameters(row):
+    """Build the compile case from the source's physical ABI facts.
+
+    Dataset CUDA entries may have a generated ``cuda_abi`` sidecar.  Handwritten
+    entries do not, so their declaration is observed with the same mechanical
+    observer used by ``CudaCompiler``.  A single placeholder parameter here
+    would make every multi-argument kernel fail before nvcc is invoked.
+    """
+
+    abi = row.metadata.get("cuda_abi")
+    raw_parameters = abi.get("parameters") if isinstance(abi, dict) else None
+    if not isinstance(raw_parameters, list):
+        code = row.path.read_text(encoding="utf-8")
+        observed = _observe_cuda_interface(code, row.symbol)
+        raw_parameters = observed.get("parameters")
+    if not isinstance(raw_parameters, list) or not raw_parameters:
+        raise ValueError(f"CUDA Dataset case {row.case_id} lacks a physical ABI")
+    parameters = []
+    for raw in raw_parameters:
+        if not isinstance(raw, dict):
+            raise ValueError(f"CUDA Dataset case {row.case_id} has malformed ABI row")
+        kind = str(raw.get("kind") or "")
+        if kind not in {"pointer", "scalar", "opaque"}:
+            raise ValueError(f"CUDA Dataset case {row.case_id} has unsupported ABI kind")
+        if kind == "pointer":
+            mode = str(raw.get("mode") or ("input" if raw.get("pointee_const") else "inout"))
+            rank = int(raw.get("rank") or 0)
+        else:
+            mode = "value"
+            rank = 0
+        parameters.append(FrontendParameter(kind, str(raw.get("dtype") or ""), rank, mode))
+    return tuple(parameters)
+
+
+def _launch_extent(launch, key: str) -> int:
+    value = launch.get(key, 1) if isinstance(launch, dict) else 1
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        parsed = 1
+    return max(parsed, 1)
+
+
 def _probe_cuda(catalog, *, workers: int, timeout: float, arch: str) -> dict:
     rows = catalog.select(frontend="cuda")
 
     def probe(row):
         include_dirs = resolve_cuda_include_dirs(row)
+        parameters = _cuda_probe_parameters(row)
+        launch = row.metadata.get("launch")
         case = CudaCompileCase(
-            (FrontendParameter("pointer", "f32", 1, "input"),),
+            parameters,
+            grid=tuple(
+                _launch_extent(launch, f"blockIdx.{axis}")
+                for axis in ("x", "y", "z")
+            ),
+            block=tuple(
+                _launch_extent(launch, f"threadIdx.{axis}")
+                for axis in ("x", "y", "z")
+            ),
             arch=arch,
             include_dirs=include_dirs,
         )
@@ -194,12 +260,16 @@ def _atomic_text(path: Path, value: str) -> None:
 
 def _export_cuda_snapshots(catalog, *, workers: int, timeout: float) -> dict:
     rows = catalog.select(frontend="tilelang")
+    python_executable = resolve_tilelang_python_executable(catalog.root)
     output = catalog.root / "cuda" / "generated"
     output.mkdir(parents=True, exist_ok=True)
     case = TileLangCompileCase((FrontendParameter("pointer", "f32", 1, "input"),))
 
     def export(row):
-        result = TileLangCompiler(timeout=timeout).compile(
+        result = TileLangCompiler(
+            timeout=timeout,
+            python_executable=python_executable,
+        ).compile(
             TileLangKernelSource.from_factory_file(row.path, row.symbol),
             case,
         )

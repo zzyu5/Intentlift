@@ -8,6 +8,8 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 
+#include <limits>
+
 using namespace mlir;
 using namespace intent;
 
@@ -18,32 +20,192 @@ using namespace intent;
 // Verifiers
 //===----------------------------------------------------------------------===//
 
+namespace {
+
+bool isRankOneIntegerTensor(Type type) {
+  return isRaggedCarrierTensorType(type);
+}
+
+LogicalResult verifyRaggedDescriptor(Operation *op, Type type,
+                                     TupleType &descriptor) {
+  auto tuple = dyn_cast<TupleType>(type);
+  if (!tuple)
+    return op->emitOpError("ragged descriptor must be a builtin tuple type");
+  if (tuple.size() != 2)
+    return op->emitOpError(
+        "ragged descriptor must contain exactly offsets and indices fields");
+  if (!isRankOneIntegerTensor(tuple.getType(0)))
+    return op->emitOpError(
+        "ragged descriptor offsets field must use a rank-1 closed carrier tensor");
+  if (!isRankOneIntegerTensor(tuple.getType(1)))
+    return op->emitOpError(
+        "ragged descriptor indices field must use a rank-1 closed carrier tensor");
+  descriptor = tuple;
+  return success();
+}
+
+} // namespace
+
+LogicalResult YieldOp::verify() {
+  Operation *parent = getOperation()->getParentOp();
+  if (isa<LoopOp>(parent))
+    return success();
+  return emitOpError(
+      "yield must be nested in intent.loop");
+}
+
+LogicalResult RaggedOp::verify() {
+  auto offsetsTy = dyn_cast<RankedTensorType>(getOffsets().getType());
+  auto indicesTy = dyn_cast<RankedTensorType>(getIndices().getType());
+  if (!offsetsTy || !isRankOneIntegerTensor(offsetsTy))
+    return emitOpError("offsets must be a rank-1 closed carrier tensor");
+  if (!indicesTy || !isRankOneIntegerTensor(indicesTy))
+    return emitOpError("indices must be a rank-1 closed carrier tensor");
+
+  TupleType descriptor;
+  if (failed(verifyRaggedDescriptor(getOperation(), getResult().getType(),
+                                    descriptor)))
+    return failure();
+  if (descriptor.getType(0) != offsetsTy)
+    return emitOpError(
+        "descriptor offsets field type must equal offsets operand");
+  if (descriptor.getType(1) != indicesTy)
+    return emitOpError(
+        "descriptor indices field type must equal indices operand");
+  return success();
+}
+
+LogicalResult RaggedOuterOp::verify() {
+  TupleType descriptor;
+  if (failed(verifyRaggedDescriptor(getOperation(), getRagged().getType(),
+                                    descriptor)))
+    return failure();
+
+  auto resultTy = dyn_cast<RankedTensorType>(getResult().getType());
+  if (!resultTy || resultTy.getRank() != 0)
+    return emitOpError("result must be a rank-0 integer tensor");
+  if (!isRaggedCarrierElementType(resultTy.getElementType()))
+    return emitOpError("result must use a closed Ragged carrier dtype");
+
+  auto offsetsTy = dyn_cast<RankedTensorType>(descriptor.getType(0));
+  if (!offsetsTy)
+    return emitOpError("descriptor offsets field must be ranked");
+  if (resultTy.getElementType() != offsetsTy.getElementType())
+    return emitOpError(
+        "result element type must equal the descriptor offsets element type");
+  return success();
+}
+
+LogicalResult RaggedMemberOp::verify() {
+  TupleType descriptor;
+  if (failed(verifyRaggedDescriptor(getOperation(), getRagged().getType(),
+                                    descriptor)))
+    return failure();
+
+  auto indexTy = dyn_cast<RankedTensorType>(getIndex().getType());
+  if (!indexTy || indexTy.getRank() != 0 ||
+      !isRaggedCarrierElementType(indexTy.getElementType()))
+    return emitOpError("index must be a rank-0 closed Ragged carrier tensor");
+
+  auto resultTy = dyn_cast<RankedTensorType>(getResult().getType());
+  if (!resultTy || resultTy.getRank() != 1 || !resultTy.isDynamicDim(0))
+    return emitOpError(
+        "result must be a dynamic-length rank-1 integer tensor");
+  if (!isRaggedCarrierElementType(resultTy.getElementType()))
+    return emitOpError("result must use a closed Ragged carrier dtype");
+
+  auto indicesTy = dyn_cast<RankedTensorType>(descriptor.getType(1));
+  if (!indicesTy)
+    return emitOpError("descriptor indices field must be ranked");
+  if (resultTy.getElementType() != indicesTy.getElementType())
+    return emitOpError(
+        "result element type must equal the descriptor indices element type");
+  return success();
+}
+
 LogicalResult MapBinaryOp::verify() {
-  static constexpr llvm::StringRef kFns[] = {
-      "add", "sub", "mul", "div", "max", "min", "pow", "cmp",
-      // atan2(y, x): the complex angle primitive (angle = atan2(imag, real)).
-      "atan2"};
-  // Comparison fns produce an i1-typed result tensor (the boolean condition for
-  // intent.select); every other fn is element-type-preserving. C2c adds the
-  // logical family (logical_and/or/xor) and isclose, which likewise yield i1.
-  static constexpr llvm::StringRef kCmpFns[] = {
-      "gt",          "ge",         "lt",          "le",      "eq", "ne",
-      "logical_and", "logical_or", "logical_xor", "and", "or", "xor",
-      "isclose"};
-  bool isCmp = false;
-  for (llvm::StringRef f : kCmpFns)
-    if (getFn() == f)
-      isCmp = true;
-  if (isCmp) {
-    auto rTy = cast<RankedTensorType>(getResult().getType());
-    if (!rTy.getElementType().isInteger(1))
-      return emitOpError("comparison fn '")
+  static constexpr llvm::StringRef kArithmeticFns[] = {
+      "add", "sub", "mul", "div", "max", "min"};
+  static constexpr llvm::StringRef kComparisonFns[] = {
+      "gt", "ge", "lt", "le", "eq", "ne"};
+  static constexpr llvm::StringRef kLogicalFns[] = {
+      "logical_and", "logical_or", "logical_xor", "and", "or", "xor"};
+  static constexpr llvm::StringRef kMatchingNumericFns[] = {
+      "floordiv", "remainder"};
+  static constexpr llvm::StringRef kShiftFns[] = {"left_shift", "right_shift"};
+
+  auto lhsTy = dyn_cast<RankedTensorType>(getLhs().getType());
+  auto rhsTy = dyn_cast<RankedTensorType>(getRhs().getType());
+  auto resultTy = dyn_cast<RankedTensorType>(getResult().getType());
+  if (!lhsTy || !rhsTy || !resultTy)
+    return emitOpError("requires ranked tensor operands and result");
+
+  Type lhsElement = lhsTy.getElementType();
+  Type rhsElement = rhsTy.getElementType();
+  Type resultElement = resultTy.getElementType();
+  auto isNumeric = [](Type type) {
+    return isa<FloatType, IntegerType>(type);
+  };
+  auto in = [](llvm::StringRef value,
+               llvm::ArrayRef<llvm::StringRef> values) {
+    return llvm::is_contained(values, value);
+  };
+
+  if (in(getFn(), kComparisonFns) || in(getFn(), kLogicalFns) ||
+      getFn() == "isclose") {
+    if (!resultElement.isInteger(1))
+      return emitOpError("predicate fn '")
              << getFn() << "' must produce an i1-typed result tensor";
+    if (getFn() == "isclose") {
+      if (!isa<FloatType>(lhsElement) || !isa<FloatType>(rhsElement))
+        return emitOpError("isclose requires floating-point operands");
+    } else if (!isNumeric(lhsElement) || !isNumeric(rhsElement)) {
+      return emitOpError("predicate fn '")
+             << getFn() << "' requires numeric operands";
+    }
+    if (lhsElement != rhsElement)
+      return emitOpError("predicate fn '")
+             << getFn() << "' requires matching operand element types";
     return success();
   }
-  for (llvm::StringRef f : kFns)
-    if (getFn() == f)
-      return success();
+
+  if (in(getFn(), kShiftFns)) {
+    if (!isa<IntegerType>(lhsElement) || !isa<IntegerType>(rhsElement) ||
+        !isa<IntegerType>(resultElement))
+      return emitOpError("shift fn '")
+             << getFn() << "' requires integer operands and result";
+    if (lhsElement != rhsElement || resultElement != lhsElement)
+      return emitOpError("shift fn '")
+             << getFn() << "' requires matching operand/result integer types";
+    return success();
+  }
+
+  if (in(getFn(), kMatchingNumericFns)) {
+    if (!isNumeric(lhsElement) || lhsElement != rhsElement ||
+        resultElement != lhsElement)
+      return emitOpError("fn '")
+             << getFn() << "' requires matching numeric operand/result types";
+    return success();
+  }
+
+  if (getFn() == "pow" || getFn() == "atan2" || getFn() == "copysign") {
+    if (!isa<FloatType>(lhsElement) || !isa<FloatType>(rhsElement) ||
+        !isa<FloatType>(resultElement))
+      return emitOpError("fn '")
+             << getFn() << "' requires floating-point operands and result";
+    if (lhsElement != rhsElement || resultElement != lhsElement)
+      return emitOpError("fn '")
+             << getFn() << "' requires matching operand/result types";
+    return success();
+  }
+
+  if (in(getFn(), kArithmeticFns)) {
+    if (!isNumeric(lhsElement) || lhsElement != rhsElement ||
+        resultElement != lhsElement)
+      return emitOpError("fn '")
+             << getFn() << "' requires matching numeric operand/result types";
+    return success();
+  }
   return emitOpError("unknown fn '") << getFn() << "'";
 }
 
@@ -77,6 +239,8 @@ LogicalResult MapUnaryOp::verify() {
   static constexpr llvm::StringRef kFns[] = {
       "identity", "exp", "log", "log2", "neg", "abs", "sqrt", "rsqrt", "recip",
       "tanh", "sigmoid", "cos", "sin", "tan",  "exp2", "erf", "atan",
+      "acos", "asin", "cbrt", "ceil", "floor", "round", "roundeven", "trunc",
+      "sign", "log10", "log1p", "expm1", "erfc",
       // logical_not is i1->i1, still element-type-preserving.
       "logical_not"};
   // Predicate fns produce an i1-typed result tensor (the boolean condition for
@@ -90,6 +254,9 @@ LogicalResult MapUnaryOp::verify() {
         return emitOpError("predicate fn '")
                << getFn() << "' must produce an i1-typed result tensor";
       auto iTy = cast<RankedTensorType>(getInput().getType());
+      if (!isa<FloatType>(iTy.getElementType()))
+        return emitOpError("predicate fn '")
+               << getFn() << "' requires a floating-point input tensor";
       if (iTy.getShape() != rTy.getShape())
         return emitOpError("result shape must equal input shape");
       return success();
@@ -103,6 +270,21 @@ LogicalResult MapUnaryOp::verify() {
   // Shape-preserving: result type matches the input type.
   if (getInput().getType() != getResult().getType())
     return emitOpError("result type must equal input type");
+  auto iTy = cast<RankedTensorType>(getInput().getType());
+  Type element = iTy.getElementType();
+  if (getFn() == "logical_not") {
+    if (!element.isInteger(1))
+      return emitOpError("logical_not requires an i1 input/result tensor");
+  } else if (getFn() == "identity") {
+    return success();
+  } else if (getFn() == "sign" || getFn() == "neg" || getFn() == "abs") {
+    if (!isa<FloatType, IntegerType>(element))
+      return emitOpError("unary fn '")
+             << getFn() << "' requires a numeric input/result tensor";
+  } else if (!isa<FloatType>(element)) {
+    return emitOpError("unary fn '")
+           << getFn() << "' requires a floating-point input/result tensor";
+  }
   return success();
 }
 
@@ -128,9 +310,14 @@ LogicalResult ScanOp::verify() {
   if (getInput().getType() != getResult().getType())
     return emitOpError("result type must equal input type");
   auto inTy = cast<RankedTensorType>(getInput().getType());
-  if (getAxis() < 0 || getAxis() >= inTy.getRank())
+  // The generated accessor for the I64 attribute is unsigned.  A negative
+  // textual attribute is therefore represented outside the valid rank range,
+  // so the upper-bound check rejects it as well without a tautological < 0
+  // comparison.
+  const uint64_t rank = static_cast<uint64_t>(inTy.getRank());
+  if (getAxis() >= rank)
     return emitOpError("axis ")
-           << getAxis() << " out of range for rank-" << inTy.getRank()
+           << getAxis() << " out of range for rank-" << rank
            << " input";
   return success();
 }
@@ -203,8 +390,8 @@ LogicalResult GatherOp::verify() {
     return emitOpError("index must be an integer-typed tensor");
   if (dTy.getElementType() != rTy.getElementType())
     return emitOpError("result element type must equal data element type");
-  int64_t axis = getAxis();
-  if (axis < 0 || axis >= dTy.getRank())
+  uint64_t axis = getAxis();
+  if (axis >= static_cast<uint64_t>(dTy.getRank()))
     return emitOpError("axis ")
            << axis << " out of range for rank-" << dTy.getRank() << " data";
   llvm::StringRef mode = getMode();
@@ -254,6 +441,93 @@ LogicalResult ScatterOp::verify() {
     return emitOpError("along_axis scatter: index/src rank must equal data rank");
   if (rTy.getShape() != dTy.getShape())
     return emitOpError("scatter result shape must equal data shape");
+
+  // The three atomic fields are additive metadata.  An old scatter has none of
+  // them and follows the historical verifier/lowering path unchanged.  Once
+  // any field is present, require the complete ordering/scope contract so no
+  // consumer can accidentally erase part of the synchronization semantics.
+  Operation *operation = getOperation();
+  bool hasAtomic = operation->hasAttr("atomic");
+  bool hasOrdering = operation->hasAttr("ordering");
+  bool hasMemoryScope = operation->hasAttr("memory_scope");
+  auto atomicAttr = operation->getAttrOfType<StringAttr>("atomic");
+  auto orderingAttr = operation->getAttrOfType<StringAttr>("ordering");
+  auto memoryScopeAttr = operation->getAttrOfType<StringAttr>("memory_scope");
+  if ((hasAtomic && !atomicAttr) || (hasOrdering && !orderingAttr) ||
+      (hasMemoryScope && !memoryScopeAttr))
+    return emitOpError(
+        "atomic, ordering, and memory_scope must be string attributes");
+  if (hasAtomic || hasOrdering || hasMemoryScope) {
+    if (!hasAtomic || !hasOrdering || !hasMemoryScope)
+      return emitOpError(
+          "atomic scatter requires atomic, ordering, and memory_scope");
+    StringRef atomic = atomicAttr.getValue();
+    if (atomic != "add" && atomic != "cas")
+      return emitOpError("unknown atomic kind '") << atomic << "'";
+    StringRef ordering = orderingAttr.getValue();
+    if (ordering != "relaxed" && ordering != "acquire" &&
+        ordering != "release" && ordering != "acq_rel" &&
+        ordering != "seq_cst")
+      return emitOpError("unknown atomic ordering '") << ordering << "'";
+    StringRef memoryScope = memoryScopeAttr.getValue();
+    if (memoryScope != "work_item" && memoryScope != "subgroup" &&
+        memoryScope != "workgroup" && memoryScope != "device" &&
+        memoryScope != "system")
+      return emitOpError("unknown atomic memory_scope '") << memoryScope << "'";
+    if (atomic == "add" && getReduce() != "add")
+      return emitOpError("atomic='add' requires reduce='add'");
+    if (atomic == "cas")
+      return emitOpError(
+          "atomic='cas' requires the complete intent.atomic_scatter form");
+  }
+  return success();
+}
+
+LogicalResult AtomicScatterOp::verify() {
+  auto dTy = cast<RankedTensorType>(getData().getType());
+  auto iTy = cast<RankedTensorType>(getIndex().getType());
+  auto cTy = cast<RankedTensorType>(getCompare().getType());
+  auto sTy = cast<RankedTensorType>(getSrc().getType());
+  auto uTy = cast<RankedTensorType>(getUpdated().getType());
+  auto oTy = cast<RankedTensorType>(getObserved().getType());
+
+  if (getAtomic() != "cas")
+    return emitOpError("atomic_scatter currently requires atomic='cas'");
+  if (getMode() != "along_axis")
+    return emitOpError("atomic_scatter currently requires mode='along_axis'");
+  if (getAxis() >= static_cast<uint64_t>(dTy.getRank()))
+    return emitOpError("axis is outside the data rank");
+  if (!isa<IntegerType>(iTy.getElementType()) &&
+      !iTy.getElementType().isIndex())
+    return emitOpError("index must have an integer or index element type");
+  if (iTy.getShape() != cTy.getShape() || iTy.getShape() != sTy.getShape())
+    return emitOpError("index, compare, and src must share one shape");
+  if (iTy.getRank() != dTy.getRank())
+    return emitOpError("index rank must equal data rank");
+  if (uTy.getShape() != dTy.getShape() || oTy.getShape() != sTy.getShape())
+    return emitOpError("updated/observed shapes do not match data/index shapes");
+  if (cTy.getElementType() != dTy.getElementType() ||
+      sTy.getElementType() != dTy.getElementType() ||
+      uTy.getElementType() != dTy.getElementType() ||
+      oTy.getElementType() != dTy.getElementType())
+    return emitOpError(
+        "compare, src, updated, and observed must match the data element type");
+
+  StringRef ordering = getOrdering();
+  if (ordering != "relaxed" && ordering != "acquire" &&
+      ordering != "release" && ordering != "acq_rel" &&
+      ordering != "seq_cst")
+    return emitOpError("unknown atomic ordering '") << ordering << "'";
+  StringRef memoryScope = getMemoryScope();
+  if (memoryScope != "work_item" && memoryScope != "subgroup" &&
+      memoryScope != "workgroup" && memoryScope != "device" &&
+      memoryScope != "system")
+    return emitOpError("unknown atomic memory_scope '") << memoryScope << "'";
+  if (auto retry = getOperation()->getAttrOfType<StringAttr>("cas_retry")) {
+    if (retry.getValue() != "single_attempt" &&
+        retry.getValue() != "until_success")
+      return emitOpError("unknown cas_retry mode '") << retry.getValue() << "'";
+  }
   return success();
 }
 
@@ -344,6 +618,58 @@ LogicalResult ConcatOp::verify() {
   if (axisStatic && !ShapedType::isDynamic(ra) && axisSum != ra)
     return emitOpError("sum of input axis extents ")
            << axisSum << " != result axis extent " << ra;
+  return success();
+}
+
+LogicalResult ReshapeOp::verify() {
+  auto iTy = cast<RankedTensorType>(getInput().getType());
+  auto rTy = cast<RankedTensorType>(getResult().getType());
+  if (iTy.getElementType() != rTy.getElementType())
+    return emitOpError("reshape is element-type-preserving");
+  if (static_cast<int64_t>(getShape().size()) != rTy.getRank())
+    return emitOpError("shape attribute rank must equal result rank");
+
+  SmallVector<int64_t> shape;
+  shape.reserve(getShape().size());
+  for (Attribute attr : getShape()) {
+    int64_t extent = cast<IntegerAttr>(attr).getInt();
+    if (extent < 0)
+      return emitOpError("shape entries must be non-negative");
+    shape.push_back(extent);
+  }
+  for (int64_t dim = 0; dim < rTy.getRank(); ++dim) {
+    int64_t declared = rTy.getDimSize(dim);
+    if (!ShapedType::isDynamic(declared) && declared != shape[dim])
+      return emitOpError("result extent ")
+             << declared << " != shape attribute extent " << shape[dim]
+             << " at dim " << dim;
+  }
+
+  // A static source and a static shape must describe the same linear element
+  // sequence.  Keep the multiplication checked so a malformed i64 attribute
+  // cannot wrap into a false equality.
+  if (iTy.hasStaticShape()) {
+    auto elementCount = [](ArrayRef<int64_t> extents,
+                           int64_t &count) -> bool {
+      count = 1;
+      for (int64_t extent : extents) {
+        if (extent < 0 ||
+            (extent != 0 &&
+             count > std::numeric_limits<int64_t>::max() / extent))
+          return false;
+        count *= extent;
+      }
+      return true;
+    };
+    int64_t inputCount = 0;
+    int64_t resultCount = 0;
+    if (!elementCount(iTy.getShape(), inputCount) ||
+        !elementCount(shape, resultCount))
+      return emitOpError("static element count overflows i64");
+    if (inputCount != resultCount)
+      return emitOpError("reshape changes element count from ")
+             << inputCount << " to " << resultCount;
+  }
   return success();
 }
 
@@ -482,11 +808,34 @@ LogicalResult UpsampleOp::verify() {
     return emitOpError("upsample is element-type-preserving");
   if (getMode() != "nearest" && getMode() != "bicubic")
     return emitOpError("upsample mode must be 'nearest' or 'bicubic'");
+  if (getScale().size() != 2)
+    return emitOpError("upsample scale must contain exactly [sh, sw]");
+  int64_t scale[2];
+  for (unsigned index = 0; index < 2; ++index) {
+    auto attr = dyn_cast<IntegerAttr>(getScale()[index]);
+    if (!attr || attr.getInt() < 1)
+      return emitOpError("upsample scale entries must be positive i64 integers");
+    scale[index] = attr.getInt();
+  }
+  for (unsigned index = 0; index < 2; ++index) {
+    int64_t inputExtent = iTy.getDimSize(index);
+    int64_t resultExtent = rTy.getDimSize(index);
+    if (!ShapedType::isDynamic(inputExtent) &&
+        !ShapedType::isDynamic(resultExtent) && inputExtent != resultExtent)
+      return emitOpError("upsample preserves the N and C extents");
+  }
   if (!iTy.hasStaticShape() || !rTy.hasStaticShape())
     return success();
-  if (iTy.getDimSize(0) != rTy.getDimSize(0) ||
-      iTy.getDimSize(1) != rTy.getDimSize(1))
-    return emitOpError("upsample preserves the N and C extents");
+  for (unsigned index = 0; index < 2; ++index) {
+    int64_t inputExtent = iTy.getDimSize(2 + index);
+    int64_t expectedExtent =
+        inputExtent > std::numeric_limits<int64_t>::max() / scale[index]
+            ? -1
+            : inputExtent * scale[index];
+    if (expectedExtent < 0 || rTy.getDimSize(2 + index) != expectedExtent)
+      return emitOpError("upsample result spatial extent does not equal input "
+                         "extent multiplied by scale");
+  }
   return success();
 }
 
@@ -651,6 +1000,34 @@ LogicalResult ContractionOp::verify() {
 LogicalResult LoopOp::verify() {
   unsigned nScan = getScanInputs().size();
   unsigned nCarry = getInits().size();
+  Value upperBound = getUpperBound();
+  bool dynamicTrip = static_cast<bool>(upperBound);
+
+  auto isLoopIntegerElement = [](Type type) {
+    if (type.isIndex())
+      return true;
+    auto integer = dyn_cast<IntegerType>(type);
+    // A boolean is an integer type in MLIR, but it is not a meaningful loop
+    // bound or induction carrier.  Keep this identical for the bound and the
+    // loop-local induction value so the J/MLIR ABI cannot drift by width.
+    return integer && !integer.isInteger(1);
+  };
+
+  if (dynamicTrip) {
+    auto upperTy = dyn_cast<RankedTensorType>(upperBound.getType());
+    if (!upperTy || upperTy.getRank() != 0 ||
+        !isLoopIntegerElement(upperTy.getElementType()))
+      return emitOpError(
+          "dynamic upper_bound must be a rank-0 non-boolean integer tensor");
+    if (nScan != 0)
+      return emitOpError(
+          "dynamic upper_bound form cannot have scan inputs; use the static "
+          "semantic-axis form for scanned loops");
+  } else if (nScan == 0) {
+    return emitOpError(
+        "static semantic-axis loop requires at least one scan input");
+  }
+
   if (nCarry != getResults().size())
     return emitOpError("number of inits (")
            << nCarry << ") must equal number of results (" << getResults().size()
@@ -669,13 +1046,41 @@ LogicalResult LoopOp::verify() {
   }
 
   Block &body = getBody().front();
-  if (body.getNumArguments() != nScan + nCarry)
+  unsigned inductionArgs = dynamicTrip ? 1 : 0;
+  if (body.getNumArguments() != nScan + inductionArgs + nCarry)
     return emitOpError("body must have ")
-           << (nScan + nCarry) << " block args (scan slices + carries), got "
+           << (nScan + inductionArgs + nCarry)
+           << " block args (scan slices + optional induction + carries), got "
            << body.getNumArguments();
-  // Carry block args (after the scan-slice args) and results must match inits.
+
+  if (dynamicTrip) {
+    auto upperTy = cast<RankedTensorType>(upperBound.getType());
+    auto inductionTy =
+        dyn_cast<RankedTensorType>(body.getArgument(nScan).getType());
+    if (!inductionTy || inductionTy.getRank() != 0 ||
+        !isLoopIntegerElement(inductionTy.getElementType()))
+      return emitOpError(
+          "dynamic induction block argument must be a rank-0 non-boolean "
+          "integer tensor");
+    if (inductionTy.getElementType() != upperTy.getElementType())
+      return emitOpError(
+          "dynamic induction block argument element type must equal "
+          "upper_bound element type");
+  }
+
+  unsigned carryArgBase = nScan + inductionArgs;
+  // Carry block args (after scan slices and the optional induction) and
+  // results must match inits.
   for (auto [i, init] : llvm::enumerate(getInits())) {
-    Type carryArgTy = body.getArgument(nScan + i).getType();
+    if (isa<TupleType>(init.getType()))
+      return emitOpError(
+          "tuple/Ragged descriptors are region-local and cannot cross a "
+          "loop carry or result ABI");
+    Type carryArgTy = body.getArgument(carryArgBase + i).getType();
+    if (isa<TupleType>(carryArgTy) || isa<TupleType>(getResult(i).getType()))
+      return emitOpError(
+          "tuple/Ragged descriptors are region-local and cannot cross a "
+          "loop carry or result ABI");
     if (carryArgTy != init.getType())
       return emitOpError("carry block arg ")
              << i << " type " << carryArgTy << " != init type " << init.getType();

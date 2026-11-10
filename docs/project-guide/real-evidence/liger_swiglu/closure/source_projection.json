@@ -1,0 +1,963 @@
+{
+  "c_slot_order": [
+    "BLOCK_SIZE"
+  ],
+  "compiler_slot_order": [],
+  "constexpr_parameter_order": [
+    "n_cols",
+    "BLOCK_SIZE"
+  ],
+  "constexpr_parameters": [
+    "n_cols",
+    "BLOCK_SIZE"
+  ],
+  "device_entry_symbol": "_swiglu_forward_kernel",
+  "execution_generated_target_source_manifest": {
+    "arguments": [
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "a_ptr",
+        "output_key": null,
+        "role": "input",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "b_ptr",
+        "output_key": null,
+        "role": "input",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "c_ptr",
+        "output_key": "c",
+        "role": "output",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "runtime_scalar",
+        "dtype": "i64",
+        "logical_dtype": null,
+        "name": "stride",
+        "output_key": null,
+        "role": "value",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 127
+      },
+      {
+        "category": "runtime_scalar",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "gate_multiplier",
+        "output_key": null,
+        "role": "value",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 1.0
+      },
+      {
+        "category": "semantic_constexpr",
+        "dtype": "i32",
+        "logical_dtype": null,
+        "name": "n_cols",
+        "output_key": null,
+        "role": "semantic_constexpr",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": "h1",
+        "strides": null,
+        "value": 127
+      },
+      {
+        "category": "c_slot",
+        "dtype": "i32",
+        "logical_dtype": null,
+        "name": "BLOCK_SIZE",
+        "output_key": null,
+        "role": "constexpr",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 128
+      }
+    ],
+    "c_slot_order": [
+      "BLOCK_SIZE"
+    ],
+    "c_slot_values": {
+      "BLOCK_SIZE": 128
+    },
+    "c_source_constexpr_parameters": [
+      "BLOCK_SIZE"
+    ],
+    "compiler_slot_order": [],
+    "constexpr_parameter_order": [
+      "n_cols",
+      "BLOCK_SIZE"
+    ],
+    "contract_ir_digest": "fdc0a05e69760b8f365123ad7d3149ac5f5f9212115f0de9a504d0d264f0b63c",
+    "device_entry_symbol": "_swiglu_forward_kernel",
+    "dimension_relations": [],
+    "e_c_interface_digest": "ebaa7b33eb9e11c6693b0835eca01e254b1398f5b093a5c2316f05fa1cca223b",
+    "execution_device_entry_symbol": null,
+    "execution_source_location": null,
+    "execution_source_sha256": null,
+    "execution_source_slice_sha256": null,
+    "grid": [
+      2
+    ],
+    "grid_contract": [
+      "rows"
+    ],
+    "grid_shape_coordinates": [
+      "h0"
+    ],
+    "j_digest": "7836b307a0c7ef2db41ff5a220fc9e11a2132183f9527d8b995ab903662c878b",
+    "j_dimension_relations": [],
+    "j_value_dimension_relations": [],
+    "layout_relations": [
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "a_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      },
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "b_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      },
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "c_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      }
+    ],
+    "lifecycle_records": [],
+    "output_bindings": [
+      {
+        "output_key": "c",
+        "parameter": "c_ptr",
+        "role": "output"
+      }
+    ],
+    "protocol": "intentir.generated-target-source-manifest",
+    "runtime_parameter_order": [
+      "a_ptr",
+      "b_ptr",
+      "c_ptr",
+      "stride",
+      "gate_multiplier"
+    ],
+    "runtime_scalar_values": {
+      "gate_multiplier": 1.0,
+      "stride": 127
+    },
+    "semantic_constexpr_parameters": [
+      "n_cols"
+    ],
+    "semantic_constexpr_values": {
+      "n_cols": 127
+    },
+    "shape_coordinate_bindings": [
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "a_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "a_ptr"
+      },
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "b_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "b_ptr"
+      },
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "c_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "c_ptr"
+      }
+    ],
+    "shape_coordinate_values": {
+      "h0": 2,
+      "h1": 127
+    },
+    "source_location": "dataset://Liger-Kernel/src/liger_kernel/ops/swiglu.py",
+    "source_parameter_order": [
+      "a_ptr",
+      "b_ptr",
+      "c_ptr",
+      "stride",
+      "gate_multiplier",
+      "n_cols",
+      "BLOCK_SIZE"
+    ],
+    "source_sha256": "7397029e8fefac0de42e5eeafcbbac147644a91c357bd30b9ba019fa5df3ce0a",
+    "source_slice_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f",
+    "tensor_map_relations": [],
+    "value_dimension_relations": [
+      {
+        "dimension_ref": "h1",
+        "provenance": "explicit_shape_coordinate",
+        "relation": "eq",
+        "value_ref": "n_cols"
+      }
+    ]
+  },
+  "execution_generated_target_source_manifest_digest": "d0ce5401159d1fe7de0e0e815b6d3425f45f1cf9b6ab4ceaa1b9f13365597f99",
+  "final_generated_target_source_manifest": {
+    "arguments": [
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "a_ptr",
+        "output_key": null,
+        "role": "input",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "b_ptr",
+        "output_key": null,
+        "role": "input",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "c_ptr",
+        "output_key": "c",
+        "role": "output",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "runtime_scalar",
+        "dtype": "i64",
+        "logical_dtype": null,
+        "name": "stride",
+        "output_key": null,
+        "role": "value",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 127
+      },
+      {
+        "category": "runtime_scalar",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "gate_multiplier",
+        "output_key": null,
+        "role": "value",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 1.0
+      },
+      {
+        "category": "semantic_constexpr",
+        "dtype": "i32",
+        "logical_dtype": null,
+        "name": "n_cols",
+        "output_key": null,
+        "role": "semantic_constexpr",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": "h1",
+        "strides": null,
+        "value": 127
+      },
+      {
+        "category": "c_slot",
+        "dtype": "i32",
+        "logical_dtype": null,
+        "name": "BLOCK_SIZE",
+        "output_key": null,
+        "role": "constexpr",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 128
+      }
+    ],
+    "c_slot_order": [
+      "BLOCK_SIZE"
+    ],
+    "c_slot_values": {
+      "BLOCK_SIZE": 128
+    },
+    "c_source_constexpr_parameters": [
+      "BLOCK_SIZE"
+    ],
+    "compiler_slot_order": [],
+    "constexpr_parameter_order": [
+      "n_cols",
+      "BLOCK_SIZE"
+    ],
+    "contract_ir_digest": "fdc0a05e69760b8f365123ad7d3149ac5f5f9212115f0de9a504d0d264f0b63c",
+    "device_entry_symbol": "_swiglu_forward_kernel",
+    "dimension_relations": [],
+    "e_c_interface_digest": "ebaa7b33eb9e11c6693b0835eca01e254b1398f5b093a5c2316f05fa1cca223b",
+    "execution_device_entry_symbol": null,
+    "execution_source_location": null,
+    "execution_source_sha256": null,
+    "execution_source_slice_sha256": null,
+    "grid": [
+      2
+    ],
+    "grid_contract": [
+      "rows"
+    ],
+    "grid_shape_coordinates": [
+      "h0"
+    ],
+    "j_digest": "7836b307a0c7ef2db41ff5a220fc9e11a2132183f9527d8b995ab903662c878b",
+    "j_dimension_relations": [],
+    "j_value_dimension_relations": [],
+    "layout_relations": [
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "a_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      },
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "b_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      },
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "c_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      }
+    ],
+    "lifecycle_records": [
+      {
+        "artifact_digest": "912731195e4a40b4ed793a58b58cf9bfc2d83bcfcbe1b4d5de3772a791d65585",
+        "artifact_kind": "triton.compiled_pair",
+        "consumer": "gate2.triton.source+replay",
+        "output_binding_digest": null,
+        "output_digest": null,
+        "phase": "source_compile",
+        "source_slice_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f"
+      },
+      {
+        "artifact_digest": "912731195e4a40b4ed793a58b58cf9bfc2d83bcfcbe1b4d5de3772a791d65585",
+        "artifact_kind": "triton.compiled_pair",
+        "consumer": "gate2.triton.source+replay",
+        "output_binding_digest": "987227661c22cdc30c9cc10c227f1960fb900d8d318a3649e8f664105788fd00",
+        "output_digest": null,
+        "phase": "source_execute",
+        "source_slice_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f"
+      },
+      {
+        "artifact_digest": "e7b3023a8affdb1e8dd745ce5dac362711abc28e51dce89897250c00cf97d217",
+        "artifact_kind": "outputs",
+        "consumer": "gate2.triton.source+replay+j",
+        "output_binding_digest": "ce58613ed0d7b15ff6bf7b7cad20ed561accd89c91ad16666d1b4300a694c757",
+        "output_digest": "e7b3023a8affdb1e8dd745ce5dac362711abc28e51dce89897250c00cf97d217",
+        "phase": "output_digest",
+        "source_slice_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f"
+      }
+    ],
+    "output_bindings": [
+      {
+        "output_key": "c",
+        "parameter": "c_ptr",
+        "role": "output"
+      }
+    ],
+    "protocol": "intentir.generated-target-source-manifest",
+    "runtime_parameter_order": [
+      "a_ptr",
+      "b_ptr",
+      "c_ptr",
+      "stride",
+      "gate_multiplier"
+    ],
+    "runtime_scalar_values": {
+      "gate_multiplier": 1.0,
+      "stride": 127
+    },
+    "semantic_constexpr_parameters": [
+      "n_cols"
+    ],
+    "semantic_constexpr_values": {
+      "n_cols": 127
+    },
+    "shape_coordinate_bindings": [
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "a_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "a_ptr"
+      },
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "b_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "b_ptr"
+      },
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "c_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "c_ptr"
+      }
+    ],
+    "shape_coordinate_values": {
+      "h0": 2,
+      "h1": 127
+    },
+    "source_location": "dataset://Liger-Kernel/src/liger_kernel/ops/swiglu.py",
+    "source_parameter_order": [
+      "a_ptr",
+      "b_ptr",
+      "c_ptr",
+      "stride",
+      "gate_multiplier",
+      "n_cols",
+      "BLOCK_SIZE"
+    ],
+    "source_sha256": "7397029e8fefac0de42e5eeafcbbac147644a91c357bd30b9ba019fa5df3ce0a",
+    "source_slice_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f",
+    "tensor_map_relations": [],
+    "value_dimension_relations": [
+      {
+        "dimension_ref": "h1",
+        "provenance": "explicit_shape_coordinate",
+        "relation": "eq",
+        "value_ref": "n_cols"
+      }
+    ]
+  },
+  "final_generated_target_source_manifest_digest": "58c67b3d7ca1eca23f3aa13077b8c29721b9a37c88f874f15790608d6fb869ef",
+  "function": "_swiglu_forward_kernel",
+  "generated_target_source_manifest": {
+    "arguments": [
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "a_ptr",
+        "output_key": null,
+        "role": "input",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "b_ptr",
+        "output_key": null,
+        "role": "input",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "buffer",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "c_ptr",
+        "output_key": "c",
+        "role": "output",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "shape_coordinate": null,
+        "strides": null,
+        "value": null
+      },
+      {
+        "category": "runtime_scalar",
+        "dtype": "i64",
+        "logical_dtype": null,
+        "name": "stride",
+        "output_key": null,
+        "role": "value",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 127
+      },
+      {
+        "category": "runtime_scalar",
+        "dtype": "f32",
+        "logical_dtype": null,
+        "name": "gate_multiplier",
+        "output_key": null,
+        "role": "value",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 1.0
+      },
+      {
+        "category": "semantic_constexpr",
+        "dtype": "i32",
+        "logical_dtype": null,
+        "name": "n_cols",
+        "output_key": null,
+        "role": "semantic_constexpr",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": "h1",
+        "strides": null,
+        "value": 127
+      },
+      {
+        "category": "c_slot",
+        "dtype": "i32",
+        "logical_dtype": null,
+        "name": "BLOCK_SIZE",
+        "output_key": null,
+        "role": "constexpr",
+        "shape": null,
+        "shape_contract": null,
+        "shape_coordinate": null,
+        "strides": null,
+        "value": 128
+      }
+    ],
+    "c_slot_order": [
+      "BLOCK_SIZE"
+    ],
+    "c_slot_values": {
+      "BLOCK_SIZE": 128
+    },
+    "c_source_constexpr_parameters": [
+      "BLOCK_SIZE"
+    ],
+    "compiler_slot_order": [],
+    "constexpr_parameter_order": [
+      "n_cols",
+      "BLOCK_SIZE"
+    ],
+    "contract_ir_digest": "fdc0a05e69760b8f365123ad7d3149ac5f5f9212115f0de9a504d0d264f0b63c",
+    "device_entry_symbol": "_swiglu_forward_kernel",
+    "dimension_relations": [],
+    "e_c_interface_digest": "ebaa7b33eb9e11c6693b0835eca01e254b1398f5b093a5c2316f05fa1cca223b",
+    "execution_device_entry_symbol": null,
+    "execution_source_location": null,
+    "execution_source_sha256": null,
+    "execution_source_slice_sha256": null,
+    "grid": [
+      2
+    ],
+    "grid_contract": [
+      "rows"
+    ],
+    "grid_shape_coordinates": [
+      "h0"
+    ],
+    "j_digest": "7836b307a0c7ef2db41ff5a220fc9e11a2132183f9527d8b995ab903662c878b",
+    "j_dimension_relations": [],
+    "j_value_dimension_relations": [],
+    "layout_relations": [
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "a_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      },
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "b_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      },
+      {
+        "layout": null,
+        "logical_dtype": "f32",
+        "memory_space": null,
+        "parameter": "c_ptr",
+        "physical_dtype": "f32",
+        "physical_kind": "buffer",
+        "shape": [
+          2,
+          127
+        ],
+        "shape_contract": [
+          "h0",
+          "h1"
+        ],
+        "strides": null
+      }
+    ],
+    "lifecycle_records": [],
+    "output_bindings": [
+      {
+        "output_key": "c",
+        "parameter": "c_ptr",
+        "role": "output"
+      }
+    ],
+    "protocol": "intentir.generated-target-source-manifest",
+    "runtime_parameter_order": [
+      "a_ptr",
+      "b_ptr",
+      "c_ptr",
+      "stride",
+      "gate_multiplier"
+    ],
+    "runtime_scalar_values": {
+      "gate_multiplier": 1.0,
+      "stride": 127
+    },
+    "semantic_constexpr_parameters": [
+      "n_cols"
+    ],
+    "semantic_constexpr_values": {
+      "n_cols": 127
+    },
+    "shape_coordinate_bindings": [
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "a_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "a_ptr"
+      },
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "b_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "b_ptr"
+      },
+      {
+        "axis": 0,
+        "coordinate": "h0",
+        "extent": 2,
+        "parameter": "c_ptr"
+      },
+      {
+        "axis": 1,
+        "coordinate": "h1",
+        "extent": 127,
+        "parameter": "c_ptr"
+      }
+    ],
+    "shape_coordinate_values": {
+      "h0": 2,
+      "h1": 127
+    },
+    "source_location": "dataset://Liger-Kernel/src/liger_kernel/ops/swiglu.py",
+    "source_parameter_order": [
+      "a_ptr",
+      "b_ptr",
+      "c_ptr",
+      "stride",
+      "gate_multiplier",
+      "n_cols",
+      "BLOCK_SIZE"
+    ],
+    "source_sha256": "7397029e8fefac0de42e5eeafcbbac147644a91c357bd30b9ba019fa5df3ce0a",
+    "source_slice_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f",
+    "tensor_map_relations": [],
+    "value_dimension_relations": [
+      {
+        "dimension_ref": "h1",
+        "provenance": "explicit_shape_coordinate",
+        "relation": "eq",
+        "value_ref": "n_cols"
+      }
+    ]
+  },
+  "generated_target_source_manifest_digest": "d0ce5401159d1fe7de0e0e815b6d3425f45f1cf9b6ab4ceaa1b9f13365597f99",
+  "included_declarations": [
+    "triton",
+    "tl",
+    "silu",
+    "_swiglu_forward_kernel"
+  ],
+  "included_functions": [
+    "silu",
+    "_swiglu_forward_kernel"
+  ],
+  "inlined_imports": [],
+  "lift_source_kind": "python",
+  "lift_source_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f",
+  "lineage_required": true,
+  "manifest_grid": [
+    2
+  ],
+  "manifest_grid_contract": [
+    "rows"
+  ],
+  "manifest_output_binding_digest": "da89921089c7932cfb688fd54fe6af43fe22be7ac0d38c0b75cd5ebe532a61f6",
+  "parameters": [
+    "a_ptr",
+    "b_ptr",
+    "c_ptr",
+    "stride",
+    "gate_multiplier",
+    "n_cols",
+    "BLOCK_SIZE"
+  ],
+  "protocol": "intentir.triton.fixed-c-source-slice.v3",
+  "reingress_source_slice_sha256": null,
+  "removed_decorators": [],
+  "selected_device_entry_symbol": "_swiglu_forward_kernel",
+  "selected_source_location": "dataset://Liger-Kernel/src/liger_kernel/ops/swiglu.py",
+  "selected_source_slice_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f",
+  "source_location": "dataset://Liger-Kernel/src/liger_kernel/ops/swiglu.py",
+  "source_parameter_order": [
+    "a_ptr",
+    "b_ptr",
+    "c_ptr",
+    "stride",
+    "gate_multiplier",
+    "n_cols",
+    "BLOCK_SIZE"
+  ],
+  "source_sha256": "7397029e8fefac0de42e5eeafcbbac147644a91c357bd30b9ba019fa5df3ce0a",
+  "source_slice_sha256": "28a5b43e2e370cd0fb998891ebf4752c84e034d6d3a4bc7db2af9a47866aa68f",
+  "vararg_arity": null
+}

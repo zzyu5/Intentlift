@@ -142,6 +142,17 @@ class TileLangKernelSource:
             "factory_kwargs": dict(self.factory_kwargs),
         }
 
+    def read_code(self) -> str:
+        """Read the exact Python/TIR source bytes consumed by the frontend."""
+
+        if self.code is not None:
+            return self.code
+        assert self.path is not None
+        try:
+            return Path(self.path).resolve().read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"cannot read TileLang source {self.path}: {exc}") from exc
+
 
 @dataclass(frozen=True)
 class TileLangCompileResult:

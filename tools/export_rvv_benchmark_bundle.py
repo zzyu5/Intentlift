@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from intentir.backend.ablation import ABLATION_PROTOCOL
 from intentir.backend.cuda.portable_bundle import encode_values
 from intentir.backend.cuda.production_cases import (
@@ -31,12 +33,21 @@ from intentir.backend.measurement_spec import (
     MEASUREMENT_PROTOCOL,
 )
 from intentir.backend.protocol import BackendTarget
-from intentir.backend.riscv.compile import compile_riscv_object
+from intentir.backend.riscv.compile import lower_j_to_riscv
 from intentir.backend.riscv.contract import derive_riscv_contract_view
 from intentir.backend.riscv.native_baselines import native_rvv_baseline_record
-from intentir.backend.riscv.search import plan_riscv_search
+from intentir.backend.riscv.search import (
+    build_riscv_target_artifact,
+    plan_riscv_search,
+)
 from intentir.backend.workload_cost import derive_j_workload_cost
+from intentir.backend.protocol import LoweringRequest
+from intentir.ir.canonical_j import j_elaboration
 from intentir.ir.production_snapshot import load_production_snapshot
+from intentir.ir.value_dimension import (
+    resolve_runtime_output_shapes,
+    validate_ragged_runtime_invocation,
+)
 from intentir.verify.gate1._triton_worker import _normalize_deprecated_triton_dot
 from intentir.verify.gate1.compiler import KernelSource
 from intentir.verify.gate1.model import ResultRelationKind
@@ -51,7 +62,17 @@ TARGET = BackendTarget("riscv", "rv64gcv_zfh_zvfh", ("vlen128",))
 
 
 def _shape(shape: list[int | str], dims: dict[str, int]) -> list[int]:
-    return [int(dims[item]) if isinstance(item, str) else int(item) for item in shape]
+    resolved: list[int] = []
+    for item in shape:
+        if item == "?":
+            raise ValueError("input shape cannot contain a data-dependent extent")
+        if isinstance(item, str):
+            if item not in dims:
+                raise ValueError(f"input shape has an unbound J extent {item!r}")
+            resolved.append(int(dims[item]))
+        else:
+            resolved.append(int(item))
+    return resolved
 
 
 def _output_rules(snapshot: Any, comparison_policy: Any) -> dict[str, Any]:
@@ -59,10 +80,10 @@ def _output_rules(snapshot: Any, comparison_policy: Any) -> dict[str, Any]:
         item.output: item.kind for item in snapshot.j.boundary.result_relations
     }
     result = {}
-    for output in snapshot.j.intent.outputs:
-        kind = relations.get(output.name, ResultRelationKind.EXACT)
-        rule = comparison_policy.rule_for(kind, output.dtype)
-        result[output.name] = {
+    for binding in j_elaboration(snapshot.j).output_bindings:
+        kind = relations.get(binding.output, ResultRelationKind.EXACT)
+        rule = comparison_policy.rule_for(kind, binding.output_type.dtype)
+        result[binding.output] = {
             "comparison_class": kind.value,
             "dtype": rule.dtype,
             "tolerance": (
@@ -143,6 +164,25 @@ def _entry(
     comparison_policy.validate_j(snapshot.j)
     case = suite.cases[0]
     dims = case.refeval.dims_map
+    canonical_outputs = j_elaboration(snapshot.j).output_bindings
+    if not canonical_outputs:
+        raise ValueError("accepted J has no canonical output bindings")
+    runtime_inputs = [
+        np.asarray(case.values[case.refeval.input_binding_map[item.name]])
+        for item in snapshot.j.intent.inputs
+    ]
+    validate_ragged_runtime_invocation(
+        snapshot.j.intent,
+        runtime_inputs,
+        dims=dims,
+    )
+    runtime_output_shapes = resolve_runtime_output_shapes(
+        snapshot.j.intent,
+        [list(item.output_type.shape) for item in canonical_outputs],
+        runtime_inputs,
+        dims=dims,
+        canonical_output_bindings=canonical_outputs,
+    )
     constexpr_bindings = constexpr_input_bindings(
         snapshot.j,
         case.refeval.input_binding_map,
@@ -153,20 +193,48 @@ def _entry(
         dims,
         constexpr_bindings=constexpr_bindings,
     )
-    state = attach_c(materialized, snapshot.c, TARGET)
-    contract = derive_riscv_contract_view(state)
+    prior_state = attach_c(materialized, snapshot.c, TARGET)
+    neutral_state = attach_c(materialized, None, TARGET)
+    prior_contract = derive_riscv_contract_view(prior_state)
+    contract = derive_riscv_contract_view(neutral_state)
+    if prior_contract.to_dict() != contract.to_dict():
+        raise AssertionError("RISC-V ContractView changed when C was erased")
     workload_cost = derive_j_workload_cost(materialized)
-    search_plan = plan_riscv_search(state, enable_b_transformations=True)
+    prior_search_plan = plan_riscv_search(
+        prior_state,
+        enable_b_transformations=True,
+    )
+    neutral_search_plan = plan_riscv_search(
+        neutral_state,
+        enable_b_transformations=True,
+    )
+    if {
+        item.candidate_id for item in prior_search_plan.universe
+    } != {
+        item.candidate_id for item in neutral_search_plan.universe
+    }:
+        raise AssertionError("C changed the RISC-V candidate universe")
+    search_plan = prior_search_plan
     candidates = []
     rejected = []
     for candidate in search_plan.universe:
         started = time.perf_counter_ns()
         try:
-            compiled = compile_riscv_object(
-                state,
+            artifact = build_riscv_target_artifact(
+                neutral_state,
                 candidate,
-                capabilities=contract.capabilities,
             )
+            lowering = lower_j_to_riscv(
+                LoweringRequest(
+                    j=neutral_state.base.j,
+                    target=TARGET,
+                    variant="specialized",
+                    c=artifact,
+                    constexpr_bindings=neutral_state.base.constexpr_bindings,
+                ),
+                neutral_state.base.concrete_extents_map,
+            )
+            compiled = lowering.artifact
         except Exception as error:
             rejected.append(
                 {
@@ -270,6 +338,18 @@ def _entry(
     reference_outputs, reference_kind, canonical_j_reference_error = (
         _canonical_reference_outputs(prepared, case)
     )
+    for output, shape in zip(canonical_outputs, runtime_output_shapes, strict=True):
+        output_key = case.refeval.output_binding_map[output.output]
+        if output_key not in reference_outputs:
+            raise RuntimeError(
+                f"canonical reference omitted output {output.output!r}"
+            )
+        actual_shape = tuple(np.asarray(reference_outputs[output_key]).shape)
+        if actual_shape != shape:
+            raise RuntimeError(
+                f"canonical reference output shape for {output.output!r} differs "
+                f"from the J-derived runtime shape: {actual_shape} != {shape}"
+            )
     return {
         "kernel": name,
         "case_id": PRODUCTION_CASE_IDS[name],
@@ -300,11 +380,12 @@ def _entry(
         },
         "output_specs": [
             {
-                "name": item.name,
-                "dtype": item.dtype,
-                "shape": _shape(item.shape, dims),
+                "name": item.output,
+                "dtype": item.output_type.dtype,
+                "shape": list(shape),
+                "shape_contract": list(item.output_type.shape),
             }
-            for item in snapshot.j.intent.outputs
+            for item, shape in zip(canonical_outputs, runtime_output_shapes, strict=True)
         ],
         "output_rules": _output_rules(snapshot, comparison_policy),
         "values": encode_values(case.values),

@@ -11,16 +11,33 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Mapping
 
 from intentir.backend.contract_capabilities import B_CAP_READONLY_INPUTS
-from intentir.backend.materialize import BackendSearchState
+from intentir.backend.materialize import (
+    BackendSearchState,
+    MaterializedJ,
+    materialize_j,
+)
+from intentir.backend.protocol import LoweringRequest
+from intentir.backend.protocol import (
+    TargetBindingContext,
+    TargetPluginArtifact,
+    deserialize_target_artifact,
+    serialize_target_artifact,
+)
+from intentir.backend.riscv.contract import (
+    derive_riscv_contract_view,
+    riscv_allowed_authorizations,
+)
 from intentir.backend.toolchain.tools import (
     INTENT_OPT,
     LLVM_BIN,
     MLIR_OPT,
     MLIR_TRANSLATE,
 )
+from intentir.ir.layer_c import LayerCInterface, TargetLayerCPlugin, layer_c_content_digest
+from intentir.ir.intent_op_contract import RAGGED_OPS
 
 
 OPT = os.environ.get("LLVM_OPT", str(LLVM_BIN / "opt"))
@@ -31,6 +48,16 @@ MATTR = os.environ.get("INTENT_RISCV_MATTR", "+v,+zfh,+zvfh")
 RVV_B_FUSION = "riscv.b.readonly_producer_consumer_fusion.v2"
 RVV_B_FUSED_SOFTMAX = "riscv.b.readonly_fused_softmax.v1"
 RVV_B_GATHER_COMPOSITION = "riscv.b.readonly_gather_composition.v1"
+
+
+def _has_ragged_ops(mlir: str) -> bool:
+    return any(f"intent.{name}" in mlir for name in RAGGED_OPS)
+
+
+def ragged_requires_scalar_schedule(mlir: str) -> bool:
+    """Return whether the module exposes the dynamic Ragged member ABI."""
+
+    return "intent.ragged_member" in mlir
 
 
 def _run_text(command: list[str], *, stdin: str) -> str:
@@ -442,6 +469,19 @@ class RiscvSchedule:
         }
 
 
+def ragged_schedule_supported(schedule: RiscvSchedule) -> bool:
+    """Return the one native schedule shape closed for dynamic Ragged output."""
+
+    return (
+        isinstance(schedule, RiscvSchedule)
+        and not schedule.vectorize
+        and not schedule.scalable_vectorization
+        and schedule.parallel_tile == 0
+        and schedule.reduction_tile == 0
+        and schedule.thread_count == 1
+    )
+
+
 @dataclass(frozen=True)
 class RiscvLoweringCandidate:
     transformation: RiscvTransformationState
@@ -636,6 +676,42 @@ class RiscvTransformationRecord:
         }
 
 
+def validate_riscv_schedule_realization(
+    candidate: RiscvLoweringCandidate,
+    record: RiscvTransformationRecord,
+) -> None:
+    """Require the compiler's applied schedule to equal the requested one.
+
+    The requested schedule is part of the candidate identity and the applied
+    values are read back from the actual structured MLIR produced by the
+    tiling pass.  Letting these values diverge would make the target contract
+    describe one realization while the object and consumption evidence
+    describe another one.
+    """
+
+    if not isinstance(candidate, RiscvLoweringCandidate):
+        raise TypeError("RISC-V schedule validation requires a lowering candidate")
+    if not isinstance(record, RiscvTransformationRecord):
+        raise TypeError("RISC-V schedule validation requires a transformation record")
+    requested = candidate.schedule
+    mismatches: list[str] = []
+    if requested.parallel_tile != record.parallel_tile_applied:
+        mismatches.append(
+            "parallel_tile requested="
+            f"{requested.parallel_tile} applied={record.parallel_tile_applied}"
+        )
+    if requested.reduction_tile != record.reduction_tile_applied:
+        mismatches.append(
+            "reduction_tile requested="
+            f"{requested.reduction_tile} applied={record.reduction_tile_applied}"
+        )
+    if mismatches:
+        raise RuntimeError(
+            "RISC-V requested/applied schedule mismatch: "
+            + "; ".join(mismatches)
+        )
+
+
 @dataclass(frozen=True)
 class RiscvCompiledObject:
     candidate: RiscvLoweringCandidate
@@ -646,6 +722,42 @@ class RiscvCompiledObject:
     scalable_vector_ir_count: int
     rvv_vsetvl_modes: tuple[str, ...]
     transformation_record: RiscvTransformationRecord
+    # Actual stage outputs are retained for per-record consumption evidence.
+    fusion_mlir: str = ""
+    memory_layout_mlir: str = ""
+    parallel_tiling_mlir: str = ""
+    reduction_tiling_mlir: str = ""
+    lowered_mlir: str = ""
+    llvm_ir: str = ""
+    optimized_llvm_ir: str = ""
+    assembly: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candidate, RiscvLoweringCandidate):
+            raise TypeError("RISC-V compiled object has an invalid candidate")
+        if not isinstance(self.object_bytes, (bytes, bytearray, memoryview)):
+            raise TypeError("RISC-V compiled object must contain object bytes")
+        if not self.object_bytes:
+            raise ValueError("RISC-V compiled object must not be empty")
+        for field_name in (
+            "fusion_mlir",
+            "memory_layout_mlir",
+            "parallel_tiling_mlir",
+            "reduction_tiling_mlir",
+            "lowered_mlir",
+            "llvm_ir",
+            "optimized_llvm_ir",
+            "assembly",
+        ):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"RISC-V compiled object is missing real {field_name} output"
+                )
+        validate_riscv_schedule_realization(
+            self.candidate,
+            self.transformation_record,
+        )
 
     @property
     def c_interface_symbol(self) -> str:
@@ -679,6 +791,22 @@ class RiscvCompiledObject:
             "symbol": self.symbol,
             "c_interface_symbol": self.c_interface_symbol,
             "object_size_bytes": len(self.object_bytes),
+            "lowered_mlir_size_bytes": len(self.lowered_mlir.encode("utf-8")),
+            "llvm_ir_size_bytes": len(self.llvm_ir.encode("utf-8")),
+            "optimized_llvm_ir_size_bytes": len(
+                self.optimized_llvm_ir.encode("utf-8")
+            ),
+            "assembly_size_bytes": len(self.assembly.encode("utf-8")),
+            "fusion_mlir_size_bytes": len(self.fusion_mlir.encode("utf-8")),
+            "memory_layout_mlir_size_bytes": len(
+                self.memory_layout_mlir.encode("utf-8")
+            ),
+            "parallel_tiling_mlir_size_bytes": len(
+                self.parallel_tiling_mlir.encode("utf-8")
+            ),
+            "reduction_tiling_mlir_size_bytes": len(
+                self.reduction_tiling_mlir.encode("utf-8")
+            ),
             "rvv_instruction_count": self.rvv_instruction_count,
             "rvv_reduction_instruction_count": (
                 self.rvv_reduction_instruction_count
@@ -687,6 +815,93 @@ class RiscvCompiledObject:
             "rvv_vsetvl_modes": list(self.rvv_vsetvl_modes),
             "true_mlir_pipeline": True,
             "python_target_kernel_emission": False,
+        }
+
+
+class RiscvJLoweringError(ValueError):
+    """Raised at the public J-to-RVV target-plugin boundary."""
+
+
+@dataclass(frozen=True)
+class RiscvJLowering:
+    """One RISC-V lowering produced from immutable J and target Layer C."""
+
+    request: LoweringRequest
+    artifact: RiscvCompiledObject
+    boundary_consumption: Mapping[str, Any]
+    concrete_extents: tuple[tuple[str, int], ...]
+    materializer_version: str
+    materialization_form: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, LoweringRequest):
+            raise RiscvJLoweringError(
+                "RISC-V J lowering requires a LoweringRequest"
+            )
+        if not isinstance(self.artifact, RiscvCompiledObject):
+            raise RiscvJLoweringError(
+                "RISC-V J lowering requires a compiled RVV object"
+            )
+        if not self.boundary_consumption.get("supported", False):
+            raise RiscvJLoweringError(
+                "RISC-V lowering lacks complete target realization consumption"
+            )
+        if self.request.c is not None and self.request.c.contract is not None:
+            try:
+                self.request.c.contract.validate_consumption_evidence(
+                    self.boundary_consumption
+                )
+            except (TypeError, ValueError) as exc:
+                raise RiscvJLoweringError(str(exc)) from exc
+
+    @property
+    def concrete_extents_map(self) -> dict[str, int]:
+        return dict(self.concrete_extents)
+
+    def to_record(self) -> dict[str, Any]:
+        target_artifact = None
+        if self.request.c is not None:
+            if self.request.e_c is None:
+                raise RiscvJLoweringError(
+                    "RISC-V target plugin record is missing its shared E_C"
+                )
+            target_artifact = TargetPluginArtifact(
+                e_c=self.request.e_c,
+                plugin=self.request.c,
+                e_c_mapping=self.request.e_c_mapping,
+            )
+        return {
+            "target": self.request.target.to_dict(),
+            "variant": self.request.variant,
+            "j_digest": layer_c_content_digest(self.request.j.to_json()),
+            "layer_c_interface_digest": self.request.c.interface_digest
+            if self.request.c is not None
+            else None,
+            "constexpr_bindings": dict(self.request.constexpr_bindings),
+            "concrete_extents": self.concrete_extents_map,
+            "materializer_version": self.materializer_version,
+            "materialization_form": self.materialization_form,
+            "boundary_consumption": dict(self.boundary_consumption),
+            "e_c_interface_digest": (
+                target_artifact.e_c_digest if target_artifact is not None else None
+            ),
+            "e_c_mapping_digest": (
+                target_artifact.e_c_mapping_digest
+                if target_artifact is not None
+                else None
+            ),
+            "target_plugin_digest": (
+                self.request.c.content_digest if self.request.c is not None else None
+            ),
+            "target_artifact_digest": (
+                target_artifact.content_digest if target_artifact is not None else None
+            ),
+            # RISC-V stores the typed target-consumption evidence directly in
+            # ``boundary_consumption`` (unlike CUDA, whose Layer-B diagnostic
+            # wraps it under ``target_realization``).  Preserve that evidence
+            # at the public record key instead of emitting a misleading null.
+            "target_realization": dict(self.boundary_consumption),
+            "riscv": self.artifact.to_record(),
         }
 
 
@@ -709,12 +924,66 @@ def _linalg_op_count(mlir: str) -> int:
     return len(re.findall(r"\blinalg\.[A-Za-z0-9_]+", mlir))
 
 
+@dataclass(frozen=True)
+class _RiscvStageArtifacts:
+    """Real compiler outputs for the independently declared target stages."""
+
+    fusion_mlir: str
+    memory_layout_mlir: str
+    parallel_tiling_mlir: str
+    reduction_tiling_mlir: str
+    lowered_mlir: str
+    llvm_ir: str
+    optimized_llvm_ir: str
+    assembly: str
+
+
+def _tile_linalg_stage(
+    source: str,
+    *,
+    parallel_tile: int,
+    reduction_tile: int,
+    fuse_producers: bool,
+) -> str:
+    """Apply one real iterator-kind tiling stage to structured MLIR."""
+
+    if parallel_tile == 0 and reduction_tile == 0:
+        return source
+    return _run_text(
+        [
+            INTENT_OPT,
+            (
+                "-tile-linalg-by-iterator-kind="
+                f"parallel-tile={parallel_tile} "
+                f"reduction-tile={reduction_tile} "
+                f"fuse-producers={'true' if fuse_producers else 'false'}"
+            ),
+            "-canonicalize",
+            "-cse",
+        ],
+        stdin=source,
+    )
+
+
 def _lower_to_llvm_ir(
     state: BackendSearchState,
     candidate: RiscvLoweringCandidate,
-) -> tuple[str, str, RiscvTransformationRecord]:
+) -> tuple[_RiscvStageArtifacts, RiscvTransformationRecord]:
     source = state.base.intent_mlir
     schedule = candidate.schedule
+    has_ragged = _has_ragged_ops(source)
+    has_dynamic_ragged_member = ragged_requires_scalar_schedule(source)
+    if has_dynamic_ragged_member:
+        if candidate.transformation != RiscvTransformationState(False):
+            raise ValueError(
+                "RISC-V Ragged lowering uses the shared carrier-tensor path and "
+                "does not admit unrelated structural transformation states"
+            )
+        if not ragged_schedule_supported(schedule):
+            raise ValueError(
+                "RISC-V Ragged lowering requires the scalar untiled native "
+                "schedule; vectorized or tiled schedules are not ABI-closed"
+            )
     if candidate.transformation.composed_indexed_gather:
         if not schedule.vectorize or schedule.scalable_vectorization:
             raise ValueError(
@@ -752,6 +1021,11 @@ def _lower_to_llvm_ir(
         ],
         stdin=source,
     )
+    if has_ragged and _has_ragged_ops(linalg):
+        raise RuntimeError(
+            "RISC-V lowering left a high-level Ragged operation after the "
+            "shared Intent-to-Linalg conversion"
+        )
     if candidate.transformation.fused_softmax:
         fused_structured = _run_text(
             [
@@ -851,23 +1125,39 @@ def _lower_to_llvm_ir(
             _linalg_op_count(pre_schedule_structured)
             < _linalg_op_count(before_second_fusion)
         )
-    structured = pre_schedule_structured
-    if schedule.parallel_tile or schedule.reduction_tile:
-        structured = _run_text(
-            [
-                INTENT_OPT,
-                (
-                    "-tile-linalg-by-iterator-kind="
-                    f"parallel-tile={schedule.parallel_tile} "
-                    f"reduction-tile={schedule.reduction_tile} "
-                    "fuse-producers="
-                    f"{'true' if candidate.transformation.fuse_producers else 'false'}"
-                ),
-                "-canonicalize",
-                "-cse",
-            ],
-            stdin=structured,
+    fusion_mlir = pre_schedule_structured
+
+    # Parallel and reduction records refer to different iterator-kind
+    # applications.  When both are requested, retain both as real compiler
+    # stages: the reduction pass consumes the MLIR produced by the preceding
+    # parallel-only pass.  TileLinalgByIteratorKind preserves the earlier
+    # schedule attributes and cumulative counters across this split.
+    if schedule.parallel_tile:
+        parallel_tiling_mlir = _tile_linalg_stage(
+            pre_schedule_structured,
+            parallel_tile=schedule.parallel_tile,
+            reduction_tile=0,
+            fuse_producers=candidate.transformation.fuse_producers,
         )
+        structured = parallel_tiling_mlir
+    else:
+        parallel_tiling_mlir = pre_schedule_structured
+        structured = pre_schedule_structured
+    if schedule.reduction_tile:
+        reduction_tiling_mlir = _tile_linalg_stage(
+            structured,
+            parallel_tile=0,
+            reduction_tile=schedule.reduction_tile,
+            # Producer fusion belongs to the first structural stage.  Repeating
+            # it in the reduction stage could duplicate producer slices.
+            fuse_producers=(
+                candidate.transformation.fuse_producers
+                and not schedule.parallel_tile
+            ),
+        )
+        structured = reduction_tiling_mlir
+    else:
+        reduction_tiling_mlir = pre_schedule_structured
     record = RiscvTransformationRecord(
         linalg_ops_before=_linalg_op_count(linalg),
         linalg_ops_after=_linalg_op_count(structured),
@@ -968,6 +1258,7 @@ def _lower_to_llvm_ir(
             structured, "intent.rvv.sibling_output_eliminated_traversals"
         ),
     )
+    validate_riscv_schedule_realization(candidate, record)
     if (
         candidate.transformation.reassociate_reductions
         and record.reassociated_float_combines == 0
@@ -1167,6 +1458,7 @@ def _lower_to_llvm_ir(
             "intent.rvv.flash_attention_removed_materialization_count",
         ),
     )
+    validate_riscv_schedule_realization(candidate, record)
     if candidate.transformation.paired_rotation and (
         record.paired_rotation_lowerings != 1
         or record.paired_rotation_head_angle_reuses
@@ -1280,36 +1572,83 @@ def _lower_to_llvm_ir(
         flags=re.MULTILINE,
     ):
         raise RuntimeError("RVV lowering left high-level Intent/Linalg ops")
+    if has_ragged and (
+        any(f"intent.{name}" in lowered for name in RAGGED_OPS)
+        or "tuple<" in lowered
+    ):
+        raise RuntimeError(
+            "RISC-V Ragged lowering left a tuple descriptor in the native ABI"
+        )
     llvm_ir = _run_text(
         [MLIR_TRANSLATE, "--mlir-to-llvmir"],
         stdin=lowered,
     )
-    return lowered, llvm_ir, record
+    return (
+        _RiscvStageArtifacts(
+            fusion_mlir=fusion_mlir,
+            memory_layout_mlir=bufferized,
+            parallel_tiling_mlir=parallel_tiling_mlir,
+            reduction_tiling_mlir=reduction_tiling_mlir,
+            lowered_mlir=lowered,
+            llvm_ir=llvm_ir,
+            optimized_llvm_ir="",
+            assembly="",
+        ),
+        record,
+    )
 
 
 def compile_riscv_object(
     state: BackendSearchState,
     candidate: RiscvLoweringCandidate,
     *,
-    capabilities: tuple[str, ...],
+    capabilities: tuple[str, ...] | None = None,
 ) -> RiscvCompiledObject:
-    """Compile one already-admitted RVV search candidate to a PIC object."""
+    """Compile one internal RVV candidate using freshly derived authority.
 
-    if state.target.family != "riscv":
-        raise ValueError("RVV compiler requires a riscv BackendTarget")
+    ``capabilities`` is retained for existing callers only.  It is never an
+    authority input: when provided it must exactly equal the contract view
+    derived again at this boundary.
+    """
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("RVV compiler requires BackendSearchState")
     if not isinstance(candidate, RiscvLoweringCandidate):
         raise TypeError("RVV compiler requires RiscvLoweringCandidate")
+    from intentir.backend.riscv.contract import derive_riscv_contract_view
+
+    contract = derive_riscv_contract_view(state)
+    derived_capabilities = contract.capabilities
+    if capabilities is not None:
+        if not isinstance(capabilities, tuple) or any(
+            not isinstance(item, str) for item in capabilities
+        ):
+            raise TypeError("RVV compatibility capabilities must be tuple[str, ...]")
+        if capabilities != derived_capabilities:
+            raise ValueError(
+                "RVV caller capabilities differ from the internally derived contract"
+            )
     missing = set(candidate.transformation.required_b_capabilities) - set(
-        capabilities
+        derived_capabilities
     )
     if missing:
         raise ValueError(
             "RVV candidate lacks required B capabilities: "
             + ", ".join(sorted(missing))
         )
-    lowered, raw_llvm_ir, transformation_record = _lower_to_llvm_ir(
-        state, candidate
-    )
+    # The low-level function remains available to the bounded search driver,
+    # but it still admits only a candidate reconstructed by the current
+    # J/target plan.  This closes a direct-call path around target Layer C.
+    from intentir.backend.riscv.search import plan_riscv_search
+
+    plan = plan_riscv_search(state, enable_b_transformations=True)
+    if sum(item == candidate for item in plan.universe) != 1:
+        raise ValueError(
+            "RVV compiler candidate is absent or ambiguous in the rebuilt search plan"
+        )
+    stage_artifacts, transformation_record = _lower_to_llvm_ir(state, candidate)
+    lowered = stage_artifacts.lowered_mlir
+    raw_llvm_ir = stage_artifacts.llvm_ir
     # Keep the production entrypoint fail-closed even when an alternate caller
     # supplies a pre-lowered module.  A requested structural/numeric state is
     # not a distinct candidate unless the compiler record proves it happened.
@@ -1527,6 +1866,11 @@ def compile_riscv_object(
             }
         )
     )
+    stage_artifacts = replace(
+        stage_artifacts,
+        optimized_llvm_ir=optimized,
+        assembly=assembly,
+    )
     return RiscvCompiledObject(
         candidate=candidate,
         symbol=_function_symbol(state.base.intent_mlir),
@@ -1536,7 +1880,292 @@ def compile_riscv_object(
         scalable_vector_ir_count=scalable_vector_ir_count,
         rvv_vsetvl_modes=rvv_vsetvl_modes,
         transformation_record=transformation_record,
+        fusion_mlir=stage_artifacts.fusion_mlir,
+        memory_layout_mlir=stage_artifacts.memory_layout_mlir,
+        parallel_tiling_mlir=stage_artifacts.parallel_tiling_mlir,
+        reduction_tiling_mlir=stage_artifacts.reduction_tiling_mlir,
+        lowered_mlir=stage_artifacts.lowered_mlir,
+        llvm_ir=stage_artifacts.llvm_ir,
+        optimized_llvm_ir=stage_artifacts.optimized_llvm_ir,
+        assembly=stage_artifacts.assembly,
     )
+
+
+def compile_riscv_target_plugin(
+    state: BackendSearchState,
+    plugin: TargetLayerCPlugin | TargetPluginArtifact,
+) -> RiscvCompiledObject:
+    """J-facing fail-closed boundary for one target Layer-C RVV artifact.
+
+    Resolution regenerates the contract, target-specific search plan, and
+    candidate universe.  Only the exact internal candidate matched by both the
+    opaque key and canonical digest reaches the compiler; there is no generic
+    or nearest-candidate fallback.
+    """
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("RVV plugin compilation requires BackendSearchState")
+    if not isinstance(plugin, (TargetLayerCPlugin, TargetPluginArtifact)):
+        raise TypeError(
+            "RVV plugin compilation requires TargetLayerCPlugin or "
+            "TargetPluginArtifact"
+        )
+    from intentir.backend.riscv.search import (
+        resolve_riscv_target_plugin,
+        riscv_layer_c_interface,
+    )
+
+    before = layer_c_content_digest(state.base.j.to_json())
+    contract_view = derive_riscv_contract_view(state)
+    target_interface = riscv_layer_c_interface(state.base.j)
+    if isinstance(plugin, TargetPluginArtifact):
+        artifact_payload = serialize_target_artifact(plugin)
+        shared_e_c = plugin.e_c
+    else:
+        # A plugin-only request has no producer-side shared E_C.  The target
+        # interface may still contain target-only declarations; those belong
+        # to C_target and must not synthesize a Source-C value.
+        artifact_payload = serialize_target_artifact(
+            TargetPluginArtifact(
+                e_c=LayerCInterface(),
+                plugin=plugin,
+                e_c_mapping=(),
+            )
+        )
+        shared_e_c = LayerCInterface()
+    target_artifact = deserialize_target_artifact(
+        TargetBindingContext(
+            j=state.base.j,
+            target=state.target,
+            interface=target_interface,
+            capabilities=contract_view.capabilities,
+            allowed_authorizations=riscv_allowed_authorizations(state),
+            e_c=shared_e_c,
+        ),
+        artifact_payload,
+    )
+    target_plugin = target_artifact.plugin
+    candidate = resolve_riscv_target_plugin(state, target_plugin)
+    compiled = compile_riscv_object(state, candidate)
+    after = layer_c_content_digest(state.base.j.to_json())
+    if after != before or target_plugin.j_digest != before:
+        raise RuntimeError("RVV plugin lowering mutated or detached from canonical J")
+    return compiled
+
+
+def _riscv_consumption_phase(record_id: str) -> str:
+    """Map each typed contract record to the real RVV compiler phase."""
+
+    if record_id == "lowering":
+        return "riscv_lowering"
+    field_name = record_id.split(":", 1)[0]
+    phases = {
+        "memory_layout": "riscv_memory_layout",
+        "parallel_mapping": "riscv_parallel_mapping",
+        "pipeline": "riscv_pipeline",
+        "fusion": "riscv_fusion",
+        "split": "riscv_reduction_split",
+    }
+    try:
+        return phases[field_name]
+    except KeyError as exc:
+        raise RiscvJLoweringError(
+            f"RISC-V has no consumption phase for record {record_id!r}"
+        ) from exc
+
+
+def _riscv_consumption_applications(
+    contract: Any,
+    artifact: RiscvCompiledObject,
+) -> tuple[Any, ...]:
+    """Create one independent application from actual RVV stage outputs."""
+
+    artifacts = {
+        "pipeline": ("riscv_lowered_mlir", artifact.lowered_mlir),
+        "parallel_mapping": (
+            "riscv_parallel_tiling_mlir",
+            artifact.parallel_tiling_mlir,
+        ),
+        "split": ("riscv_reduction_tiling_mlir", artifact.reduction_tiling_mlir),
+        "fusion": ("riscv_fusion_mlir", artifact.fusion_mlir),
+        "memory_layout": (
+            "riscv_memory_layout_mlir",
+            artifact.memory_layout_mlir,
+        ),
+        "lowering": ("riscv_object", artifact.object_bytes),
+    }
+    applications: list[Any] = []
+    for record_id in contract.declared_record_ids():
+        field_name = "lowering" if record_id == "lowering" else record_id.split(":", 1)[0]
+        try:
+            artifact_kind, stage_artifact = artifacts[field_name]
+        except KeyError as exc:
+            raise RiscvJLoweringError(
+                f"RISC-V has no independent artifact for target realization record "
+                f"{record_id!r}"
+            ) from exc
+        if not stage_artifact:
+            raise RiscvJLoweringError(
+                f"RISC-V compiler did not produce the {field_name} stage artifact"
+            )
+        applications.append(
+            contract.record_consumption_from_artifact(
+                record_id,
+                consumer="riscv.native",
+                phase=_riscv_consumption_phase(record_id),
+                artifact_kind=artifact_kind,
+                artifact=stage_artifact,
+            )
+        )
+    return tuple(applications)
+
+
+def _deserialize_riscv_target_artifact(
+    request: LoweringRequest,
+    context: TargetBindingContext,
+) -> TargetPluginArtifact:
+    """Reparse the complete ``E_C``/``C_target`` handoff at RVV ingress."""
+
+    if request.c is None:
+        raise RiscvJLoweringError(
+            "RISC-V target-artifact ingress requires a target Layer-C plugin"
+        )
+    # A plugin-only request is compatible only when the shared E_C is empty.
+    # For a non-empty interface the producer must provide the explicit
+    # TargetPluginArtifact; the consumer must not invent its lineage.
+    if request.e_c is None:
+        if context.e_c.points:
+            raise RiscvJLoweringError(
+                "RISC-V lowering requires an explicit TargetPluginArtifact for "
+                "non-empty shared E_C"
+            )
+        e_c = context.e_c
+        e_c_mapping = ()
+    else:
+        e_c = request.e_c
+        e_c_mapping = request.e_c_mapping
+    try:
+        envelope = TargetPluginArtifact(
+            e_c=e_c,
+            plugin=request.c,
+            e_c_mapping=e_c_mapping,
+        )
+        return deserialize_target_artifact(
+            context,
+            serialize_target_artifact(envelope),
+            expected_e_c=e_c,
+            expected_e_c_mapping=e_c_mapping,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RiscvJLoweringError(
+            "RISC-V target artifact failed public ingress validation: " + str(exc)
+        ) from exc
+
+
+def lower_j_to_riscv(
+    request: LoweringRequest,
+    concrete_extents: Mapping[str, int],
+) -> RiscvJLowering:
+    """Lower J through a neutral M0 and one validated RVV target plugin.
+
+    Source/Harness ``ImplementationConfig`` values are intentionally not
+    accepted at this boundary.  The request carries only target Layer C; the
+    temporary search state has no C priors, so the same J-facing contract is
+    used by direct production lowering and by the native compiler.
+    """
+
+    if not isinstance(request, LoweringRequest):
+        raise RiscvJLoweringError(
+            "RISC-V lowering requires LoweringRequest"
+        )
+    if request.target.family != "riscv":
+        raise RiscvJLoweringError("RISC-V backend requires a RISC-V target")
+    if request.c is None:
+        raise RiscvJLoweringError(
+            "RISC-V lowering requires a target Layer-C plugin"
+        )
+
+    j_digest_before = layer_c_content_digest(request.j.to_json())
+    try:
+        materialized: MaterializedJ = materialize_j(
+            request.j,
+            concrete_extents,
+            constexpr_bindings=dict(request.constexpr_bindings),
+        )
+    except (TypeError, ValueError) as exc:
+        raise RiscvJLoweringError(str(exc)) from exc
+
+    neutral_state = BackendSearchState(
+        base=materialized,
+        target=request.target,
+        priors=(),
+        ignored_slots=(),
+    )
+    try:
+        from intentir.backend.riscv.search import riscv_layer_c_interface
+
+        contract_view = derive_riscv_contract_view(neutral_state)
+        target_interface = riscv_layer_c_interface(neutral_state.base.j)
+        shared_e_c = (
+            request.e_c if request.e_c is not None else LayerCInterface()
+        )
+        target_artifact = _deserialize_riscv_target_artifact(
+            request,
+            TargetBindingContext(
+                j=neutral_state.base.j,
+                target=neutral_state.target,
+                interface=target_interface,
+                capabilities=contract_view.capabilities,
+                allowed_authorizations=riscv_allowed_authorizations(
+                    neutral_state
+                ),
+                e_c=shared_e_c,
+            ),
+        )
+        request = replace(
+            request,
+            c=target_artifact,
+            e_c=None,
+            e_c_mapping=(),
+        )
+        compiled = compile_riscv_target_plugin(neutral_state, target_artifact)
+    except RiscvJLoweringError:
+        raise
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise RiscvJLoweringError(str(exc)) from exc
+
+    j_digest_after = layer_c_content_digest(request.j.to_json())
+    if j_digest_after != j_digest_before or request.c.j_digest != j_digest_before:
+        raise RiscvJLoweringError(
+            "RISC-V lowering mutated J or detached target Layer C from canonical J"
+        )
+    contract = request.c.contract
+    if contract is None:
+        raise RiscvJLoweringError(
+            "RISC-V target plugin is missing its realization contract"
+        )
+    applications = _riscv_consumption_applications(
+        contract,
+        compiled,
+    )
+    try:
+        boundary_consumption = contract.consumption_evidence(applications)
+    except (TypeError, ValueError) as exc:
+        raise RiscvJLoweringError(
+            "RISC-V target Layer-C consumption is not exact: " + str(exc)
+        ) from exc
+    return RiscvJLowering(
+        request=request,
+        artifact=compiled,
+        boundary_consumption=boundary_consumption,
+        concrete_extents=materialized.concrete_extents,
+        materializer_version=materialized.materializer_version,
+        materialization_form=materialized.form,
+    )
+
+
+# Compatibility spelling for the initial target-plugin design draft.
+compile_riscv_plugin_object = compile_riscv_target_plugin
 
 
 __all__ = [
@@ -1544,10 +2173,17 @@ __all__ = [
     "RVV_B_FUSED_SOFTMAX",
     "RVV_B_FUSION",
     "RiscvCompiledObject",
+    "RiscvJLowering",
+    "RiscvJLoweringError",
     "RiscvLoweringCandidate",
     "RiscvSchedule",
     "RiscvTransformationRecord",
     "RiscvTransformationState",
+    "ragged_requires_scalar_schedule",
+    "ragged_schedule_supported",
     "TRIPLE",
+    "compile_riscv_plugin_object",
     "compile_riscv_object",
+    "compile_riscv_target_plugin",
+    "lower_j_to_riscv",
 ]

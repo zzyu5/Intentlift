@@ -79,8 +79,8 @@ class CodexCLISubmissionAccepted(CodexCLIError):
         super().__init__("exact-byte submission accepted by the closed host tool")
 
 
-class CodexCLIDiagnosticReady(CodexCLIError):
-    """Stable exact bytes were rejected and a same-thread repair can start now."""
+class CodexCLISubmissionRejected(CodexCLIError):
+    """A closed host tool rejected exact bytes, so this owner must stop."""
 
     def __init__(
         self,
@@ -91,7 +91,7 @@ class CodexCLIDiagnosticReady(CodexCLIError):
         self.elapsed_ms = elapsed_ms
         self.thread_id = thread_id
         self.physical_calls = 1
-        super().__init__("exact-byte diagnostic is ready for same-thread repair")
+        super().__init__("exact-byte submission rejected; fresh owner required")
 
 
 def _codex_tool_client_source() -> str:
@@ -784,19 +784,19 @@ class CodexCLISession:
         self,
         prompt: str,
         *,
-        timeout_seconds: float,
+        timeout_seconds: float | None,
         effort: str | None = None,
         resume: bool | None = None,
         stop_requested: Callable[[], int | None] | None = None,
         submission_accepted: Callable[[], bool] | None = None,
-        diagnostic_ready: Callable[[], bool] | None = None,
+        submission_rejected: Callable[[], bool] | None = None,
         submission_grace_seconds: float = 2.0,
         diagnostic_grace_seconds: float = 2.0,
     ) -> CodexCLITurn:
         if self._closed:
             raise CodexCLIError("Codex session is closed")
-        if timeout_seconds <= 0:
-            raise ValueError("Codex turn timeout must be positive")
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("Codex turn timeout must be positive when set")
         if submission_grace_seconds < 0:
             raise ValueError("submission grace must be non-negative")
         if diagnostic_grace_seconds < 0:
@@ -858,9 +858,9 @@ class CodexCLISession:
                     if (
                         limit_error is None
                         and not accepted_submission
-                        and diagnostic_ready is not None
+                        and submission_rejected is not None
                     ):
-                        observed_diagnostic = diagnostic_ready()
+                        observed_diagnostic = submission_rejected()
                         if not isinstance(observed_diagnostic, bool):
                             limit_error = (
                                 "diagnostic callback returned a non-boolean value"
@@ -878,7 +878,10 @@ class CodexCLISession:
                         and not accepted_submission
                         and not ready_diagnostic
                     ):
-                        if elapsed >= timeout_seconds:
+                        if (
+                            timeout_seconds is not None
+                            and elapsed >= timeout_seconds
+                        ):
                             limit_error = "Codex turn exceeded its wall-time limit"
                         elif stdout.tell() > MAX_CODEX_STDOUT_BYTES:
                             limit_error = "Codex stdout exceeded its byte limit"
@@ -925,9 +928,9 @@ class CodexCLISession:
             thread_id = self._recover_partial_thread_identity(raw_stdout)
             if thread_id is None:
                 raise CodexCLIError(
-                    "diagnostic-ready Codex turn lacks a resumable thread identity"
+                    "rejected Codex submission lacks a thread identity"
                 )
-            raise CodexCLIDiagnosticReady(
+            raise CodexCLISubmissionRejected(
                 elapsed_ms=elapsed_ms,
                 thread_id=thread_id,
             )
@@ -1026,7 +1029,7 @@ __all__ = [
     "MAX_CODEX_STDOUT_BYTES",
     "CodexCLIError",
     "CodexCLICancelled",
-    "CodexCLIDiagnosticReady",
+    "CodexCLISubmissionRejected",
     "CodexCLISubmissionAccepted",
     "CodexCLISession",
     "CodexCLIToolBridge",

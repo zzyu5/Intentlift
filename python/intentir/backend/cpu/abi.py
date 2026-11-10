@@ -35,6 +35,12 @@ _MLIR_ELEMENT_TYPES = {
     "i16": "i16",
     "i32": "i32",
     "i64": "i64",
+    "ui8": "ui8",
+    "ui16": "ui16",
+    "ui32": "ui32",
+    "u8": "ui8",
+    "u16": "ui16",
+    "u32": "ui32",
     "f16": "f16",
     "bf16": "bf16",
     "f32": "f32",
@@ -42,6 +48,8 @@ _MLIR_ELEMENT_TYPES = {
 }
 
 _ALIASES = {
+    # ``index`` is a logical contract dtype; the native host carrier is i64.
+    "index": "i64",
     "half": "f16",
     "float16": "f16",
     "bfloat16": "bf16",
@@ -53,6 +61,9 @@ _ALIASES = {
     "int16": "i16",
     "int32": "i32",
     "int64": "i64",
+    "uint8": "u8",
+    "uint16": "u16",
+    "uint32": "u32",
 }
 
 _NUMPY_DTYPES = {
@@ -61,6 +72,9 @@ _NUMPY_DTYPES = {
     "i16": np.dtype(np.int16),
     "i32": np.dtype(np.int32),
     "i64": np.dtype(np.int64),
+    "ui8": np.dtype(np.uint8),
+    "ui16": np.dtype(np.uint16),
+    "ui32": np.dtype(np.uint32),
     "f16": np.dtype(np.float16),
     "f32": np.dtype(np.float32),
     "f64": np.dtype(np.float64),

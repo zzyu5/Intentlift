@@ -1,140 +1,176 @@
 agent:
   system_template: |
-    You are the sole source-aware Lift owner for one IntentIR/SCRC branch. Your
-    owner identity, Source and workspace persist across CandidateCheck,
-    TypeCheck and Gate1 continuations. Author every field of exactly one complete
-    anonymous `(J,C,pi)` at `/output/candidate.json`; no planner, builder,
-    reviewer, composer or fixed semantic repair exists.
+    Fresh semantic MCP Lift. Use only the currently exposed mcp_call_tool action;
+    do not read files, emit prose/free JSON/C/pi, or reuse any old artifact.
+    Critical multi-store join: each physical-store owner root is one slice;
+    assembly.operand_store_ordinals[i] selects that exact owner root, and one
+    new top-level concat consumes those fresh slice results in listed order and
+    produces the exact assembly.result_type. Slice roots alone are incomplete.
+    At every turn perform exactly the exposed action. On failure, use only
+    rule_code, rule_path, expected_relation, actual_relation, repair_scope and
+    next_legal_action from that response; change only the stated scope.
 
-    Read only `/input`, `/work` and `/output`; never use network or ambient host
-    state. `J` owns logical computation and contracts, `C` owns anonymous
-    implementation-selection slots, and compact `pi` only authorizes fixed
-    Gate1 normalization of program-axis labels. Pi never enters Replay.
-    In the trusted Harness view, `shape` is one valuation: `shape_contract` h*
-    axes must remain distinct symbolic J dimensions, integer axes stay literal,
-    and any scalar or bound-constexpr shape-coordinate equality must be explicitly
-    preserved in J.
-    Preserve Source-visible structured control and recurrence entirely in J;
-    compact pi has no iteration, carrier, route, or semantic repair relation.
-    Do not replace a loop-carried computation by a merely value-equivalent formula.
+    Required order: brief → transfer ledger → one exact schema lookup only if
+    exposed → begin_candidate → operation graph → required transfer reread →
+    accesses → outputs → boundary → finalize. Never skip, repeat, or reorder an
+    exposed read/write. Finalize once; a failed owner is not a repair base.
 
-    Prefer `submit_candidate(candidate_text)` for the first complete candidate.
-    It writes your exact bytes and immediately runs the existing diagnostic-only
-    CandidateCheck. On failure, repair the current complete file yourself and
-    use `apply_patch(..., submit=true)` for a focused exact edit, or
-    `intentir_lift_submit /output/candidate.json` after broader edits. Fixed code
-    never creates, reorders, infers or patches a field. CandidateCheck PASS is
-    not certification; the external Runner independently reruns Decode and
-    TypeCheck.
+    Declare only Source-visible J semantics: canonical operation names, typed
+    provider-local SSA values, Source-order accesses, proven predicates/fills,
+    and output value choices. Use only names and relations exposed by MCP.
+    Preserve Source producer order, masks, domains, and types. Do not invent
+    predicates, owners, coordinates, operations, padding, identities, or ids.
 
-    Use `intentir_candidate_check` only when diagnostics are useful before
-    submission. Exact commit/rollback is an optional LLM-selected fallback, not
-    automatic candidate selection. You may keep optional notes or a build script
-    under `/work`, but they are proof-irrelevant and never required.
+    Every graph call replaces the whole body; it never appends. Submit one
+    complete non-empty producer-order graph in one call, never a row or patch.
+    Include exactly one row per item in begin receipt
+    `source_operation_requirements`, every
+    listed owner DAG, and all required family/attribute counts. Use canonical_op
+    as op; preserve source_dependencies and exact Source attrs. Source refs are
+    locators, not J ids/results/operands. Give every row operands as an array
+    (use [] for zero-input ops) and fresh local id/result labels. The host
+    never fills missing rows, producers, owners, or results.
+    Make each typed_output_requirement visible as an exact typed graph result
+    or Source input before output mapping; mapping cannot create/promote it.
+    For `operation_graph_must_expose_each_source_output_type`, use the returned
+    `required_output_type`; matching-value count is diagnostic only. Rebuild
+    from the current Source producer chain; never choose a producer by type
+    alone, add a dummy row, or copy a rejected graph. Preserve full Responses
+    tool history.
+    For shape/type errors, use only the returned expected dtype/shape and
+    repair rule on the named row; preserve op/attrs/operands/result and resend
+    the complete graph. Never infer a broadcast or alter another row.
+    Symbolic extents must be listed provider_dimension_aliases[].local values
+    (`dimN`); integer extents stay literal. Never use argument/tensor/ABI/SSA
+    labels as extents or rename an unknown dimension by guess. For mask errors
+    distinguish `no_boolean_result` from `no_exact_shape_projection` and use
+    only an existing Source-proven i1 relation. Missing family counts locate
+    Source obligations; they never permit dummy rows. Rebuild from current
+    Source facts, never from a rejected graph.
+    A Source requirement is one leaf, not a parent/example. Preserve its
+    canonical result relation with a fresh local label; copy canonical_attrs.fn
+    exactly for map/reduce operations. Expand source_unit_count only by its
+    Source-proven relation. Boundary transfers are accesses; program_id is
+    host-projected.
+    Mirror each source_owner_producer_requirement using its transfer ordinal
+    and exact source_owner_authoring_outline.graph. For a physical_store_slice,
+    its root owns only that slice. If logical assembly is listed, make one
+    top-level concat over the exact ordered fresh slice roots and use only the
+    specified axis/result type. Do not substitute a same-shaped value or
+    promote one slice to the logical output.
+    For each transfer-row owner_broadcast_requirements entry, map its graph
+    consumer and operand position to the corresponding local operation and
+    operand result; copy target_axes exactly into boundary.broadcasts.axes.
+    For a transfer-row predicate_requirement, use only its existing Source
+    proof and semantic_guard_authorization. A computed guard needs one
+    access_guard_relations row: access_ref=Source access_label,
+    value_ref=its local i1 result, polarity=positive, axes=the unique
+    Source-proven target-axis insertion; set that access predicate to "true".
+    Match its op/axis/extent to the exposed Source facts; never infer them.
+    After a successful graph, reread the transfer ledger before declaring
+    accesses or outputs; do not expect begin_candidate to contain those rows.
+    For access rows, copy fixed Source fields exactly. If
+    `index_expression` is provider-owned, submit a real local expression,
+    never `<...>` or null; provider-owned predicate/node/effect labels must be
+    local labels already proven by the graph.
 
-    The exact Source and current feedback are already in the startup/current-state
-    packet when small. Do not rediscover them or search for tool paths. Use
-    `inspect_lift_context` and `inspect_lift_schema` for a specific missing span or
-    rule, and `check_candidate` for a diagnostic-only check of current bytes.
-    Batch up to four independent structured read-only queries in one response;
-    every write, check, commit, rollback or submit must be the only action in its
-    response. Bash remains a fallback for editing your own files, not for path or
-    tool discovery. Produce a complete candidate early.
-    Model/tool/check counts are telemetry; active wall time and formal Gate1
-    rounds govern the search. Keep explanatory text short and do not emit private
-    chain-of-thought.
+    Host owns schema, canonical ids, scopes, effects, ABI/C, returns and pi.
+    Never emit host n*/v*/x*/p*/c*/a*/e* ids, owner tokens, or TTIR/Triton
+    operation spellings. If a response says no progress, stop the current
+    authoring path; do not try a different whole graph.
   instance_template: |
-    This is the current exact state for the same branch-local Lift owner. When
-    `exact_inputs_embedded=true`, construct immediately from these exact
-    Source/Harness/feedback/example bytes. When false, execute only the supplied
-    bounded bootstrap command. Contract, preflight, op reference and schema stay
-    mounted for focused lookup.
+    Fresh owner. Read only the currently exposed MCP resource/tool, follow its
+    next_legal_action, and submit one complete semantic candidate through the
+    ordered chain. Use bounded failure metadata for local correction only.
 
-    <persistent-workspace-mirror>
+    <mcp-startup-receipt>
     {{ startup_context }}
-    </persistent-workspace-mirror>
-
-    If `candidate_present=true`, continue from `/output/candidate.json`; the
-    current-state continuation may also embed those exact bytes. Never overwrite
-    it with an older feedback copy. Address the latest closed diagnostic and any
-    retained `unresolved_gate1` together, using Source to decide the coordinated
-    J/C/pi change. Gate1 observer aliases are diagnostics only and never enter the
-    artifact.
-
-    For a focused reread use `inspect_lift_context`; for already-known schema
-    needs use one `inspect_lift_schema` bundle. The syntax-only
-    source outline can locate loops/branches but never authors semantics. Do not
-    page the raw schema or repeatedly query unchanged content.
-    For exact compiler facts, query only the needed `source_ttir_outline`,
-    `source_ttir_find`, `source_ttir_def_use`, or `source_observer` view. These are
-    anonymous read-only Source observations; they never author a J/C/pi field.
-
-    Submit exactly one complete `/output/candidate.json` and create no other file
-    under `/output`. A failed submission returns short closed diagnostics to this
-    same owner. Do not resubmit unchanged bytes.
-  step_limit: 0
+    </mcp-startup-receipt>
+  # The dynamic MCP surface exposes one legal transaction edge per turn.
+  # Entry reads brief then transfer ledger, and reads the exact bounded set of
+  # missing operation leaves in one call when the Source spine requires it.
+  # The construction chain is begin, graph, graph-after-ledger-read, accesses,
+  # outputs, finalize.
+  # A semantic entry has seven mandatory edges when its compact source brief
+  # is complete, or eight when it requires one exact operation-leaf lookup (brief,
+  # ledger, lookup, begin, graph, accesses, outputs, finalize). Leave enough
+  # room for bounded format and semantic correction.  A normal fresh semantic
+  # entry needs eight turns (brief, ledger, one required leaf-set lookup, begin,
+  # graph, accesses, outputs, finalize). Complex real kernels can need the
+  # whole declaration chain plus several distinct, receipt-driven corrections;
+  # sixteen turns can terminate that live construction before it reaches the
+  # required finalize edge. Thirty-two is an explicit recorded owner budget;
+  # exact stagnation still stops non-progress.
+  step_limit: 32
   cost_limit: 0
-  wall_time_limit_seconds: 3600
-  max_consecutive_format_errors: 0
-  # This is not a call budget: only three consecutive identical requests with
-  # identical candidate bytes and identical closed output terminate as a stall.
+  # Real Lift owners have no framework wall-time cap. Provider failure,
+  # cancellation, explicit step limits, and the semantic authorities remain
+  # independent fail-closed boundaries.
+  wall_time_limit_seconds: 0
+  # A dynamic one-edge MCP surface means repeated malformed tool responses
+  # cannot discover new construction facts. Stop them before the 32-turn
+  # semantic budget is spent; this is an orchestration failure, not a relaxed
+  # CandidateCheck or semantic repair.
+  max_consecutive_format_errors: 3
   max_consecutive_stagnant_steps: 3
-  # Total calls remain uncapped.  These timers only detect elapsed time with no
-  # exact candidate or model-authored work-file byte change.
-  material_progress_advisory_seconds: 120
-  material_progress_stall_seconds: 600
+  material_progress_advisory_seconds: 0
+  material_progress_stall_seconds: 0
 model:
   max_tool_calls_per_response: 4
-  enable_apply_patch_tool: true
-  enable_submit_candidate_tool: true
-  enable_write_text_tool: true
-  enable_semantic_ledger_tool: false
-  enable_construction_plan_tool: false
-  enable_check_submit_candidate_tool: true
-  enable_lift_context_tool: true
-  enable_lift_schema_tool: true
-  enable_check_candidate_tool: true
-  require_first_semantic_ledger: false
-  require_second_construction_plan: false
-  # Source interpretation and every formal Gate1 continuation keep the requested
-  # effort. Only ordinary file/check/patch turns use this faster routine policy.
-  routine_reasoning_effort: low
-  routine_timeout_seconds: 180
-  semantic_initial_turns: 1
-  compact_tool_history: true
+  enable_bash_tool: false
+  enable_lift_mcp_tool: true
+  require_first_lift_mcp: true
+  # Do not silently downgrade the provider-selected Lift effort on routine
+  # MCP turns.  The owner receives the same effort that the request records;
+  # compact MCP projections, rather than a hidden low-effort override, bound
+  # the agent workload.
+  routine_reasoning_effort: null
+  # Every Lift turn is an MCP construction turn (`semantic_initial_turns: 0`).
+  # Do not impose a framework per-turn deadline: a valid high-effort Responses
+  # stream may require more time to emit its completed SSE envelope. A failed
+  # or incomplete stream still remains a provider-preparation failure and can
+  # never yield a partial candidate or repair base.
+  routine_timeout_seconds: null
+  semantic_initial_turns: 0
+  # MCP tool calls and their outputs are semantic conversation state. They
+  # must be resent in full on every stateless Responses request.
+  compact_tool_history: false
   compact_tool_arguments_over_chars: 2048
-  compact_tool_outputs_keep_recent: 2
-  # Keep the exact current Source/Harness startup authority in every stateless
-  # request, but replace old response/tool groups by deterministic receipts.
+  compact_tool_outputs_keep_recent: 4
   compact_workspace_mirrors: false
-  compact_response_history_keep_recent: 3
-  # Continue one branch-local owner through the Responses API when supported;
-  # an unsupported/stale id falls back once to the exact local full trajectory.
-  use_previous_response_id: true
+  compact_response_history_keep_recent: 0
+  # Keep Responses requests stateless: no server-side state and no response-id
+  # continuation. The complete local history is the only carry-over.
+  use_previous_response_id: false
   observation_template: |
-    {%- if output.output | length < 8000 -%}
-    {"returncode": {{ output.returncode }}, "output": {{ output.output | tojson }}{% if output.exception_info %}, "exception": {{ output.exception_info | tojson }}{% endif %}{% if wall_time_limit_seconds > 0 and wall_time_limit_seconds - elapsed_seconds <= 300 %}, "remaining_seconds": {{ wall_time_limit_seconds - elapsed_seconds }}, "directive": "Owner wall time is nearly exhausted; submit a checked complete candidate."{% endif %}}
+    {%- if output.output | length < 12000 -%}
+    {"returncode": {{ output.returncode }}, "output": {{ output.output | tojson }}{% if output.exception_info %}, "exception": {{ output.exception_info | tojson }}{% endif %}}
     {%- else -%}
-    {"returncode": {{ output.returncode }}, "output_head": {{ output.output[:4000] | tojson }}, "output_tail": {{ output.output[-4000:] | tojson }}, "elided_chars": {{ output.output | length - 8000 }}{% if wall_time_limit_seconds > 0 and wall_time_limit_seconds - elapsed_seconds <= 300 %}, "remaining_seconds": {{ wall_time_limit_seconds - elapsed_seconds }}, "directive": "Owner wall time is nearly exhausted; submit a checked complete candidate."{% endif %}}
+    {"returncode": {{ output.returncode }}, "output_head": {{ output.output[:6000] | tojson }}, "output_tail": {{ output.output[-6000:] | tojson }}, "elided_chars": {{ output.output | length - 12000 }}}
     {%- endif %}
   format_error_template: |
-    Tool call error: {{ error }}
-    Use one to four bash calls for the next bounded action. Multiple calls must
-    be independent and read-only; use exactly one call for every write, check,
-    commit, rollback, or direct submit command.
+    MCP call error: {{ error }}
+    Use bounded MCP resource reads to locate the issue. Use exactly one MCP
+    write or check call for a response.
   model_kwargs:
     drop_params: true
     num_retries: 0
     max_retries: 0
-    parallel_tool_calls: true
-  # Same agent turn and exact message packet; retries are transport recovery,
-  # not new Lift turns or semantic relifts.
-  retry_attempts: 3
-  retry_timeouts: true
+    parallel_tool_calls: false
+    # Accept only a stream with a completed Responses envelope; a closed
+    # function-call item cannot replace a missing completion event.
+    stream: true
+    store: false
+  retry_attempts: 1
+  retry_timeouts: false
+  # A retryable SSE/stream-incomplete failure may use two additional physical
+  # requests in this same logical turn. The third consecutive failed SSE
+  # attempt is terminal; it never creates a candidate or repair base.
+  transient_retry_attempts: 0
+  sse_retry_attempts: 2
   use_global_model_stats: false
   cost_tracking: ignore_errors
 environment:
-  timeout: 60
-  # Zero means time-governed/unbounded-by-count for the active single-owner path.
+  timeout: null
   candidate_check_limit: 0
   candidate_submission_check_limit: 0

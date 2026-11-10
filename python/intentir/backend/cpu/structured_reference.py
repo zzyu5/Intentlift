@@ -10,6 +10,8 @@ and output type.  Its API deliberately has no C or pi parameter.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+import math
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -21,10 +23,39 @@ from intentir.backend.cpu.abi import (
     validate_array,
 )
 from intentir.backend.cpu.pipeline import CPUExecutionResult
-from intentir.ir.canonical_j import elaborate_j, j_elaboration
+from intentir.ir.intent_op_contract import (
+    ATOMIC_CAS_RETRIES,
+    ATOMIC_KINDS,
+    ATOMIC_MEMORY_SCOPES,
+    ATOMIC_ORDERINGS,
+    map_binary_result_dtype,
+    operation_attr_contract,
+    map_unary_result_dtype,
+    RAGGED_OPS,
+    validate_const_literal,
+)
+from intentir.ir.canonical_j import (
+    CanonicalValueType,
+    elaborate_j,
+    j_elaboration,
+)
 from intentir.ir.dimension_relation import resolve_dimension_relations
-from intentir.ir.value_dimension import validate_value_dimension_instantiation
-from intentir.ir.model import IntentOp, LoopStateBinding
+from intentir.ir.functional_boundary import _axis_broadcast_positions
+from intentir.ir.value_dimension import (
+    RaggedRuntimeError,
+    ragged_member_length,
+    ragged_outer_count,
+    validate_ragged_runtime_invocation,
+    validate_ragged_runtime_carrier,
+    validate_value_dimension_instantiation,
+)
+from intentir.ir.model import (
+    IntentOp,
+    LoopStateBinding,
+    validate_loop_wiring,
+    validate_ragged_region_boundaries,
+    walk_intent_ops as _walk_ops,
+)
 
 if TYPE_CHECKING:
     from intentir.verify.gate1.model import SemanticArchive
@@ -37,9 +68,61 @@ STRUCTURED_CPU_REFERENCE_PROTOCOL = "intentir.j-structured-cpu-reference.v10"
 # trip-axis-bearing temporary exceeds this many bytes.
 _MAX_REFERENCE_TEMPORARY_BYTES = 128 * 1024 * 1024
 
+_SCATTER_ATTR_CONTRACT = operation_attr_contract("scatter")
+_SCATTER_ALLOWED_ATTRS = frozenset(_SCATTER_ATTR_CONTRACT["allowed"])
+_SCATTER_REQUIRED_ATTRS = frozenset(_SCATTER_ATTR_CONTRACT["required"])
+
+
+def _require_operation_attrs(op: IntentOp) -> None:
+    """Apply the shared IntentOp attr contract before CPU capability checks."""
+
+    contract = operation_attr_contract(op.op)
+    allowed = frozenset(contract["allowed"])
+    required = frozenset(contract["required"])
+    actual = set(op.attrs)
+    missing = sorted(required - actual)
+    unknown = sorted(actual - allowed)
+    if missing or unknown:
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if unknown:
+            details.append("unsupported " + ", ".join(unknown))
+        raise StructuredReferenceUnsupportedError(
+            f"structured {op.op} violates the shared operation attr contract: "
+            + "; ".join(details)
+        )
+
 
 class StructuredReferenceUnsupportedError(CPUBackendUnsupportedError):
     """The typed J lies outside this deliberately narrow denotation."""
+
+
+@dataclass(frozen=True)
+class _RaggedValue:
+    """Closed runtime value for one offsets/indices descriptor."""
+
+    offsets: np.ndarray
+    indices: np.ndarray
+
+
+def _validate_ragged_arrays(
+    offsets: Any,
+    indices: Any,
+    *,
+    context: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    offsets_array = np.asarray(offsets)
+    indices_array = np.asarray(indices)
+    try:
+        validate_ragged_runtime_carrier(
+            offsets_array,
+            indices_array,
+            context=context,
+        )
+    except RaggedRuntimeError as exc:
+        raise ValueError(str(exc)) from exc
+    return offsets_array, indices_array
 
 
 _ORDINARY_OPS = frozenset(
@@ -54,25 +137,45 @@ _ORDINARY_OPS = frozenset(
         "map_unary",
         "pad",
         "reduce",
+        "reshape",
         "scan",
         "scatter",
         "select",
         "tile",
         "transpose",
     }
-)
+) | RAGGED_OPS
 
 _EINSUM_TERM = re.compile(r"^[A-Za-z]*$")
+
+def _isclose(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """Closed J ``isclose`` predicate with the lowering constants."""
+
+    compute_dtype = np.result_type(np.asarray(left).dtype, np.asarray(right).dtype)
+    left_value = np.asarray(left, dtype=compute_dtype)
+    right_value = np.asarray(right, dtype=compute_dtype)
+    return np.less_equal(
+        np.abs(left_value - right_value),
+        np.asarray(1e-8, dtype=compute_dtype)
+        + np.asarray(1e-5, dtype=compute_dtype) * np.abs(right_value),
+    )
+
 
 _BINARY = {
     "add": np.add,
     "sub": np.subtract,
     "mul": np.multiply,
     "div": np.divide,
+    "floordiv": np.floor_divide,
+    "remainder": np.remainder,
+    "left_shift": np.left_shift,
+    "right_shift": np.right_shift,
     "max": np.maximum,
     "min": np.minimum,
     "pow": np.power,
     "atan2": np.arctan2,
+    "copysign": np.copysign,
+    "isclose": _isclose,
     "gt": np.greater,
     "ge": np.greater_equal,
     "lt": np.less,
@@ -111,12 +214,93 @@ def _integer_divide(
         return np.asarray(quotient + adjust.astype(dtype), dtype=dtype)
     return np.asarray(np.floor_divide(lhs, rhs), dtype=dtype)
 
+
+def _integer_floor_divide(
+    left: np.ndarray,
+    right: np.ndarray,
+    dtype: np.dtype[Any],
+) -> np.ndarray:
+    """Implement mathematical floor division for signed integer tensors."""
+
+    lhs, rhs = np.broadcast_arrays(
+        np.asarray(left, dtype=dtype),
+        np.asarray(right, dtype=dtype),
+    )
+    if bool(np.any(rhs == 0)):
+        raise ValueError("structured floor division by zero")
+    if np.issubdtype(dtype, np.signedinteger):
+        info = np.iinfo(dtype)
+        if bool(np.any((lhs == info.min) & (rhs == -1))):
+            raise ValueError("structured signed floor division overflows")
+    return np.asarray(np.floor_divide(lhs, rhs), dtype=dtype)
+
+
+def _integer_remainder(
+    left: np.ndarray,
+    right: np.ndarray,
+    dtype: np.dtype[Any],
+) -> np.ndarray:
+    """Implement the divisor-sign remainder paired with floor division."""
+
+    lhs, rhs = np.broadcast_arrays(
+        np.asarray(left, dtype=dtype),
+        np.asarray(right, dtype=dtype),
+    )
+    if bool(np.any(rhs == 0)):
+        raise ValueError("structured remainder by zero")
+    return np.asarray(np.remainder(lhs, rhs), dtype=dtype)
+
+
+def _erf(value: np.ndarray) -> np.ndarray:
+    array = np.asarray(value)
+    return np.asarray(
+        np.vectorize(math.erf, otypes=[float])(array), dtype=array.dtype
+    )
+
+
+def _erfc(value: np.ndarray) -> np.ndarray:
+    array = np.asarray(value)
+    return np.asarray(
+        np.vectorize(math.erfc, otypes=[float])(array), dtype=array.dtype
+    )
+
+
+def _round_away_from_zero(value: np.ndarray) -> np.ndarray:
+    array = np.asarray(value)
+    magnitude = np.floor(np.abs(array) + np.asarray(0.5, dtype=array.dtype))
+    return np.copysign(magnitude, array).astype(array.dtype, copy=False)
+
+
+def _rsqrt_ftz_f32(value: np.ndarray) -> np.ndarray:
+    """Reference f32 rsqrt with signed subnormal input/output flush.
+
+    Approximation error remains governed by the existing Gate2 comparison
+    policy; the FTZ branch itself is an explicit J semantic obligation.
+    """
+    array = np.asarray(value, dtype=np.float32)
+    tiny = np.finfo(np.float32).tiny
+    operand = np.where(
+        np.abs(array) < tiny,
+        np.copysign(np.float32(0), array),
+        array,
+    )
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        result = np.asarray(np.reciprocal(np.sqrt(operand)), dtype=np.float32)
+    return np.where(
+        np.abs(result) < tiny,
+        np.copysign(np.float32(0), result),
+        result,
+    )
+
+
 _UNARY = {
     "identity": lambda value: value,
     "exp": np.exp,
     "log": np.log,
+    "log2": np.log2,
     "sqrt": np.sqrt,
     "rsqrt": lambda value: np.reciprocal(np.sqrt(value)),
+    "rsqrt_ftz": _rsqrt_ftz_f32,
     "neg": np.negative,
     "recip": np.reciprocal,
     "abs": np.abs,
@@ -129,6 +313,20 @@ _UNARY = {
     "tan": np.tan,
     "exp2": np.exp2,
     "atan": np.arctan,
+    "acos": np.arccos,
+    "asin": np.arcsin,
+    "cbrt": np.cbrt,
+    "ceil": np.ceil,
+    "floor": np.floor,
+    "round": _round_away_from_zero,
+    "roundeven": np.rint,
+    "trunc": np.trunc,
+    "sign": np.sign,
+    "log10": np.log10,
+    "log1p": np.log1p,
+    "expm1": np.expm1,
+    "erf": _erf,
+    "erfc": _erfc,
     "isnan": np.isnan,
     "isinf": np.isinf,
     "isfinite": np.isfinite,
@@ -147,38 +345,42 @@ _CARRY_LITERALS: dict[str, Any] = {
 }
 
 
-def _walk_ops(body: Sequence[IntentOp]) -> tuple[IntentOp, ...]:
-    result: list[IntentOp] = []
-    for op in body:
-        result.append(op)
-        result.extend(_walk_ops(op.body))
-        if op.op in {"effect_if", "value_if"}:
-            assert op.positive is not None and op.negative is not None
-            result.extend(_walk_ops(op.positive.body))
-            result.extend(_walk_ops(op.negative.body))
-    return tuple(result)
+def _runtime_const_literal(value: Any) -> Any:
+    """Map the closed J special-float spellings to NumPy scalar values."""
+
+    if value == "-inf":
+        return -np.inf
+    if value == "inf":
+        return np.inf
+    if value == "nan":
+        return np.nan
+    return value
 
 
-def _walk_op_paths(
-    body: Sequence[IntentOp],
-    prefix: str = "body",
-) -> tuple[tuple[str, IntentOp], ...]:
-    """Walk operations using the canonical paths named by ``J.node_ids``."""
+def _canonical_ops(j: SemanticArchive) -> tuple[IntentOp, ...]:
+    typed_rows = j_elaboration(j).typed_operation_rows
+    if typed_rows is None:
+        raise StructuredReferenceUnsupportedError(
+            "structured reference cannot materialize typed views from canonical records"
+        )
+    return tuple(operation for _path, operation in typed_rows)
 
-    result: list[tuple[str, IntentOp]] = []
-    for index, op in enumerate(body):
-        path = f"{prefix}[{index}]"
-        result.append((path, op))
-        result.extend(_walk_op_paths(op.body, f"{path}.body"))
-        if op.op in {"effect_if", "value_if"}:
-            assert op.positive is not None and op.negative is not None
-            result.extend(
-                _walk_op_paths(op.positive.body, f"{path}.positive.body")
-            )
-            result.extend(
-                _walk_op_paths(op.negative.body, f"{path}.negative.body")
-            )
-    return tuple(result)
+
+def _canonical_rows(j: SemanticArchive) -> tuple[tuple[str, IntentOp], ...]:
+    typed_rows = j_elaboration(j).typed_operation_rows
+    if typed_rows is None:
+        raise StructuredReferenceUnsupportedError(
+            "structured reference cannot materialize canonical operation rows"
+        )
+    return tuple(typed_rows)
+
+
+def _canonical_body(j: SemanticArchive) -> tuple[IntentOp, ...]:
+    return tuple(
+        operation
+        for path, operation in _canonical_rows(j)
+        if "." not in path and path.startswith("body[")
+    )
 
 
 def _result_names(operation: IntentOp) -> tuple[str, ...]:
@@ -202,7 +404,7 @@ def requires_structured_reference(j: SemanticArchive) -> bool:
     """
 
     accepted = elaborate_j(j)
-    operations = _walk_ops(accepted.intent.body)
+    operations = _canonical_ops(accepted)
     return any(
         op.op in {
             "contraction",
@@ -213,7 +415,7 @@ def requires_structured_reference(j: SemanticArchive) -> bool:
             "value_if",
             "gather",
             "scatter",
-        }
+        } | RAGGED_OPS
         for op in operations
     )
 
@@ -237,6 +439,74 @@ def _resolved_shape(shape: Sequence[Any], dims: Mapping[str, int]) -> tuple[int,
     return tuple(result)
 
 
+def _resolved_declared_shape(
+    shape: Sequence[Any],
+    dims: Mapping[str, int],
+    actual_shape: Sequence[int] | None,
+) -> tuple[int, ...] | None:
+    """Resolve a declared shape, using ``?`` only against an actual value."""
+
+    if "?" not in shape:
+        return _resolved_shape(shape, dims)
+    if actual_shape is None or len(actual_shape) != len(shape):
+        return None
+    resolved: list[int] = []
+    for index, dimension in enumerate(shape):
+        if dimension == "?":
+            extent = actual_shape[index]
+            if isinstance(extent, bool) or not isinstance(extent, int) or extent < 0:
+                raise ValueError("structured dynamic shape contains an invalid extent")
+            resolved.append(extent)
+            continue
+        resolved.append(_resolved_shape((dimension,), dims)[0])
+    return tuple(resolved)
+
+
+def _materialize_explicit_broadcast(
+    value: Any,
+    target_shape: Sequence[int],
+    axes: Sequence[int],
+) -> np.ndarray:
+    """Insert the J-authored rank dimensions before NumPy broadcasting.
+
+    ``boundary.broadcasts`` describes explicit target-rank insertion.  Calling
+    ``np.broadcast_to`` on the original value alone only implements trailing
+    NumPy alignment, so a legal J relation such as ``[R] -> [R, C]`` with
+    ``axes=[1]`` was previously rejected by the Gate2 reference executor.
+    Keep the same closed alignment proof used by functional-boundary analysis,
+    then reshape only by inserting singleton dimensions at the proved target
+    positions.  No shape, axis, or relation is inferred here.
+    """
+
+    array = np.asarray(value)
+    resolved_target = tuple(int(extent) for extent in target_shape)
+    source_positions = _axis_broadcast_positions(
+        tuple(int(extent) for extent in array.shape),
+        resolved_target,
+        tuple(int(axis) for axis in axes),
+    )
+    if source_positions is None:
+        raise ValueError(
+            "structured broadcast value does not match its declared "
+            "result shape"
+        )
+    if len(source_positions) != array.ndim:
+        raise ValueError(
+            "structured broadcast alignment does not cover the source rank"
+        )
+    aligned_shape = [1] * len(resolved_target)
+    for source_axis, target_axis in enumerate(source_positions):
+        aligned_shape[target_axis] = array.shape[source_axis]
+    try:
+        aligned = np.reshape(array, tuple(aligned_shape))
+        return np.broadcast_to(aligned, resolved_target)
+    except ValueError as exc:
+        raise ValueError(
+            "structured broadcast value does not match its declared "
+            "result shape"
+        ) from exc
+
+
 class _Evaluator:
     def __init__(
         self,
@@ -244,6 +514,8 @@ class _Evaluator:
         dims: Mapping[str, int],
         broadcast_axes: Mapping[str, Mapping[str, Sequence[int]]],
         access_guard_relations: Sequence[Any] = (),
+        consumer_extensions: Sequence[Any] = (),
+        update_padding_relations: Sequence[Any] = (),
         conditional_effect_stores: Sequence[Any] = (),
     ) -> None:
         self.j = j
@@ -257,6 +529,25 @@ class _Evaluator:
         }
         self.value_types = j_elaboration(j).value_type_by_name
         self.access_guard_loads: dict[tuple[str, int], Any] = {}
+        self.consumer_outside: dict[tuple[str, int], Any] = {}
+        for extension in consumer_extensions:
+            consumer_ref = getattr(extension, "consumer_ref", None)
+            operand_index = getattr(extension, "operand_index", None)
+            if (
+                not isinstance(consumer_ref, str)
+                or isinstance(operand_index, bool)
+                or not isinstance(operand_index, int)
+                or operand_index < 0
+            ):
+                raise ValueError(
+                    "structured consumer-extension receipt is not mechanically closed"
+                )
+            key = (consumer_ref, operand_index)
+            if key in self.consumer_outside:
+                raise ValueError(
+                    "structured consumer-extension receipts duplicate one operand edge"
+                )
+            self.consumer_outside[key] = extension
         for relation in access_guard_relations:
             if getattr(relation, "access_kind", None) != "load":
                 continue
@@ -284,23 +575,38 @@ class _Evaluator:
             previous = refs_by_path.setdefault(path, node_ref)
             if previous != node_ref:
                 raise ValueError("structured reference has duplicate node paths")
+        canonical_records = j_elaboration(j).operation_records
+        record_by_path = {
+            record["path"]: record for record in canonical_records
+        }
+        typed_by_path = dict(_canonical_rows(j))
+        if set(record_by_path) != set(typed_by_path):
+            raise ValueError(
+                "structured reference operation paths disagree with canonical J records"
+            )
         nodes: dict[str, IntentOp] = {}
         self.node_refs_by_operation: dict[int, str] = {}
-        for path, operation in _walk_op_paths(j.intent.body):
+        for path, operation in typed_by_path.items():
+            record = record_by_path[path]
+            record_id = record.get("id")
+            if not isinstance(record_id, str):
+                raise ValueError(
+                    f"structured reference operation {path!r} has no canonical node id"
+                )
             authored_ref = refs_by_path.get(path)
-            if (
-                operation.node_id is not None
-                and authored_ref is not None
-                and operation.node_id != authored_ref
-            ):
+            if authored_ref is not None and authored_ref != record_id:
                 raise ValueError("structured inline and authored node refs disagree")
-            node_ref = operation.node_id or authored_ref
-            if node_ref is None:
-                continue
-            previous = nodes.setdefault(node_ref, operation)
+            if operation.node_id is not None and operation.node_id != record_id:
+                raise ValueError("structured typed and canonical node refs disagree")
+            previous = nodes.setdefault(record_id, operation)
             if previous is not operation:
-                raise ValueError("structured reference has duplicate node refs")
-            self.node_refs_by_operation[id(operation)] = node_ref
+                raise ValueError("structured reference has duplicate canonical node refs")
+            self.node_refs_by_operation[id(operation)] = record_id
+        for path, node_ref in refs_by_path.items():
+            if path not in record_by_path:
+                raise ValueError(
+                    f"structured reference node {node_ref!r} references unknown path"
+                )
         self.logical_updates: dict[str, Any] = {}
         for update in j.boundary.updates:
             operation = nodes.get(update.node_ref)
@@ -313,7 +619,66 @@ class _Evaluator:
                     "structured logical updates duplicate one scatter node"
                 )
             self.logical_updates[update.node_ref] = update
-        output_names = {tensor.name for tensor in j.intent.outputs}
+        accesses = {item.access_id: item for item in j.boundary.accesses}
+        self.update_padding_relations: dict[
+            tuple[str, str, str, int, str], Any
+        ] = {}
+        for relation in update_padding_relations:
+            update_ref = getattr(relation, "update_ref", None)
+            access_ref = getattr(relation, "access_ref", None)
+            consumer_ref = getattr(relation, "consumer_ref", None)
+            operand_index = getattr(relation, "operand_index", None)
+            role = getattr(relation, "update_operand_role", None)
+            update = self.logical_updates.get(update_ref)
+            access = accesses.get(access_ref)
+            consumer = nodes.get(consumer_ref)
+            extension = self.consumer_outside.get((consumer_ref, operand_index))
+            if (
+                update is None
+                or access is None
+                or access.kind.value != "load"
+                or access.predicate is None
+                or consumer is None
+                or consumer.op != "reduce"
+                or extension is None
+                or getattr(extension, "access_ref", None) != access_ref
+                or role not in {"target", "indices", "values"}
+                or not isinstance(getattr(relation, "domain_axes", None), tuple)
+                or not relation.domain_axes
+                or len(set(relation.domain_axes)) != len(relation.domain_axes)
+            ):
+                raise ValueError(
+                    "structured update-padding receipt is not mechanically closed"
+                )
+            if (
+                relation.base_ref != update.base
+                or relation.indices_ref != update.indices
+                or relation.values_ref != update.values
+                or relation.update_axis != update.axis
+                or relation.combiner != update.combiner.value
+                or relation.outside_dtype != getattr(extension, "dtype", None)
+                or relation.outside_value != getattr(extension, "value", None)
+                or relation.identity_law
+                != getattr(extension, "identity_law", None)
+            ):
+                raise ValueError(
+                    "structured update-padding receipt differs from canonical J"
+                )
+            key = (
+                update_ref,
+                access_ref,
+                consumer_ref,
+                operand_index,
+                role,
+            )
+            if key in self.update_padding_relations:
+                raise ValueError(
+                    "structured update-padding receipts duplicate one relation"
+                )
+            self.update_padding_relations[key] = relation
+        output_names = {
+            binding.output for binding in j_elaboration(j).output_bindings
+        }
         self.conditional_effect_stores: dict[str, list[Any]] = {}
         seen_accesses: set[str] = set()
         for relation in conditional_effect_stores:
@@ -382,15 +747,42 @@ class _Evaluator:
         self,
         name: str,
         op: IntentOp | None = None,
+        *,
+        actual_shape: Sequence[int] | None = None,
     ) -> tuple[str, tuple[int, ...]] | None:
         known = self.value_types.get(name)
         if known is not None:
-            return known.dtype, _resolved_shape(known.shape, self.dims)
+            if not known.is_tensor or known.dtype is None:
+                return None
+            shape = _resolved_declared_shape(known.shape, self.dims, actual_shape)
+            if shape is None:
+                return None
+            return known.dtype, shape
         if op is not None and isinstance(op.type, dict):
+            if op.type.get("kind") in {"record", "ragged"}:
+                return None
             dtype = op.type.get("dtype")
             shape = op.type.get("shape")
             if isinstance(dtype, str) and isinstance(shape, list):
-                return dtype, _resolved_shape(shape, self.dims)
+                resolved = _resolved_declared_shape(shape, self.dims, actual_shape)
+                if resolved is None:
+                    return None
+                return dtype, resolved
+        return None
+
+    def _declared_value_type(
+        self,
+        name: str,
+        op: IntentOp | None = None,
+    ) -> CanonicalValueType | None:
+        known = self.value_types.get(name)
+        if known is not None:
+            return known
+        if op is not None and isinstance(op.type, dict):
+            return CanonicalValueType.from_json(
+                op.type,
+                context=f"structured IntentOp {op.op} type",
+            )
         return None
 
     def _validate_value(
@@ -398,8 +790,49 @@ class _Evaluator:
         value: Any,
         *,
         name: str,
-        declared: tuple[str, tuple[int, ...]] | None,
-    ) -> np.ndarray:
+        declared: tuple[str, tuple[int, ...]] | CanonicalValueType | None,
+    ) -> Any:
+        if isinstance(value, _RaggedValue):
+            if declared is None:
+                return value
+            if not isinstance(declared, CanonicalValueType) or not declared.is_ragged:
+                raise ValueError(f"structured value {name!r} has a ragged value")
+            offsets, indices = _validate_ragged_arrays(
+                value.offsets,
+                value.indices,
+                context=f"structured value {name!r}",
+            )
+            for field_name, field_value in (
+                ("offsets", offsets),
+                ("indices", indices),
+            ):
+                field_type = declared.field(field_name)
+                if not field_type.is_tensor or field_type.dtype is None:
+                    raise ValueError(
+                        f"structured ragged field {field_name!r} is not a tensor"
+                    )
+                field_shape = _resolved_shape(field_type.shape, self.dims)
+                if field_value.shape != field_shape:
+                    raise ValueError(
+                        f"structured ragged field {field_name!r} shape mismatch"
+                    )
+                if field_value.dtype != numpy_dtype(field_type.dtype):
+                    raise ValueError(
+                        f"structured ragged field {field_name!r} dtype mismatch"
+                    )
+            return _RaggedValue(offsets, indices)
+        if isinstance(declared, CanonicalValueType):
+            if not declared.is_tensor or declared.dtype is None:
+                raise ValueError(f"structured value {name!r} is not a tensor")
+            actual_shape = np.asarray(value).shape
+            resolved_shape = _resolved_declared_shape(
+                declared.shape,
+                self.dims,
+                actual_shape,
+            )
+            if resolved_shape is None:
+                raise ValueError(f"structured value {name!r} shape is unresolved")
+            declared = (declared.dtype, resolved_shape)
         array = np.asarray(value)
         if declared is None:
             return array
@@ -429,7 +862,7 @@ class _Evaluator:
         op: IntentOp,
         env: Mapping[str, np.ndarray],
         index: int,
-    ) -> np.ndarray:
+    ) -> Any:
         try:
             name = op.operands[index]
             value = env[name]
@@ -439,8 +872,14 @@ class _Evaluator:
             ) from exc
         node_ref = self.node_refs_by_operation.get(id(op), op.node_id)
         materialization = self.access_guard_loads.get((node_ref, index))
+        if isinstance(value, _RaggedValue) and materialization is not None:
+            raise StructuredReferenceUnsupportedError(
+                "ragged descriptors cannot participate in guarded-load "
+                "materialization"
+            )
         if materialization is not None:
-            if name != materialization.tensor:
+            operand_ref = getattr(materialization, "operand_ref", None)
+            if name != materialization.tensor and name != operand_ref:
                 raise ValueError(
                     "structured guarded-load receipt names a different operand"
                 )
@@ -464,9 +903,15 @@ class _Evaluator:
                 active = np.logical_not(condition)
             else:
                 raise ValueError("structured guarded-load polarity is unknown")
+            outside = self.consumer_outside.get((node_ref, index))
+            fill_value = (
+                outside.value
+                if outside is not None
+                else materialization.fill_value
+            )
             try:
                 fill = np.asarray(
-                    materialization.fill_value,
+                    fill_value,
                     dtype=value.dtype,
                 )
             except (TypeError, ValueError, OverflowError) as exc:
@@ -478,24 +923,42 @@ class _Evaluator:
                 raise ValueError(
                     "structured guarded-load materialization changed operand type"
                 )
-        result = self._result_name(op)
+        result_names = _result_names(op)
+        if not result_names:
+            raise StructuredReferenceUnsupportedError(
+                f"structured op {op.op!r} requires at least one result"
+            )
+        result = result_names[0]
         axes = self.broadcast_axes.get(result, {}).get(name, ())
-        projected = value
-        for axis in sorted(axes):
-            if axis < 0 or axis > projected.ndim:
-                raise ValueError("structured broadcast axis is outside result rank")
-            projected = np.expand_dims(projected, axis=axis)
-        return projected
+        if isinstance(value, _RaggedValue):
+            if materialization is not None or axes:
+                raise StructuredReferenceUnsupportedError(
+                    "ragged descriptors cannot participate in tensor broadcast "
+                    "or guarded-load materialization"
+                )
+            return value
+        if not axes:
+            return value
+        declared_result = self._declared_type(result)
+        if declared_result is None:
+            raise StructuredReferenceUnsupportedError(
+                "structured broadcast requires one closed result type"
+            )
+        _dtype, target_shape = declared_result
+        try:
+            return _materialize_explicit_broadcast(value, target_shape, axes)
+        except ValueError as exc:
+            raise ValueError(
+                "structured broadcast value does not match its declared "
+                "result shape"
+            ) from exc
 
     def _reduce(
         self,
         op: IntentOp,
         env: Mapping[str, np.ndarray],
     ) -> np.ndarray:
-        if set(op.attrs) - {"fn", "axes", "assoc", "keepdims"}:
-            raise StructuredReferenceUnsupportedError(
-                "structured reduce has unsupported control attributes"
-            )
+        _require_operation_attrs(op)
         value = self._operand(op, env, 0)
         raw_axes = op.attrs.get("axes")
         if not isinstance(raw_axes, list) or not raw_axes:
@@ -541,7 +1004,8 @@ class _Evaluator:
         op: IntentOp,
         env: Mapping[str, np.ndarray],
     ) -> np.ndarray:
-        if set(op.attrs) != {"fn", "axis"} or len(op.operands) != 1:
+        _require_operation_attrs(op)
+        if len(op.operands) != 1:
             raise StructuredReferenceUnsupportedError(
                 "structured scan requires exactly forward inclusive fn/axis control"
             )
@@ -570,7 +1034,8 @@ class _Evaluator:
         op: IntentOp,
         env: Mapping[str, np.ndarray],
     ) -> np.ndarray:
-        if set(op.attrs) != {"axis"} or not op.operands:
+        _require_operation_attrs(op)
+        if not op.operands:
             raise StructuredReferenceUnsupportedError(
                 "structured concat requires one axis and at least one operand"
             )
@@ -616,7 +1081,8 @@ class _Evaluator:
         op: IntentOp,
         env: Mapping[str, np.ndarray],
     ) -> np.ndarray:
-        if set(op.attrs) != {"axis", "mode"} or len(op.operands) != 2:
+        _require_operation_attrs(op)
+        if len(op.operands) != 2:
             raise StructuredReferenceUnsupportedError(
                 "structured gather requires exactly axis/mode and two operands"
             )
@@ -636,14 +1102,30 @@ class _Evaluator:
             or bool(np.any(index >= data.shape[axis]))
         ):
             raise ValueError("structured gather index is outside the data extent")
-        expected = self._declared_type(self._result_name(op), op)
-        if expected is None:
+        declared_value = self._declared_value_type(self._result_name(op), op)
+        if (
+            declared_value is None
+            or not declared_value.is_tensor
+            or declared_value.dtype is None
+        ):
             raise StructuredReferenceUnsupportedError(
                 "structured gather requires one closed result type"
             )
-        expected_dtype, expected_shape = expected
-        if numpy_dtype(expected_dtype) != data.dtype:
+        if numpy_dtype(declared_value.dtype) != data.dtype:
             raise ValueError("structured gather result dtype differs from data")
+
+        def expected_shape(actual_shape: Sequence[int]) -> tuple[int, ...]:
+            expected = self._declared_type(
+                self._result_name(op),
+                op,
+                actual_shape=actual_shape,
+            )
+            if expected is None:
+                raise StructuredReferenceUnsupportedError(
+                    "structured gather result shape is unresolved"
+                )
+            return expected[1]
+
         mode = op.attrs.get("mode")
         if mode == "along_axis":
             if index.ndim == data.ndim - 1:
@@ -658,7 +1140,7 @@ class _Evaluator:
                         "structured compressed along_axis gather index must "
                         "match every non-axis data extent"
                     )
-                if expected_shape != index.shape:
+                if expected_shape(index.shape) != index.shape:
                     raise ValueError(
                         "structured compressed along_axis gather result must be "
                         "shaped like index"
@@ -672,15 +1154,16 @@ class _Evaluator:
                     "or data rank minus one"
                 )
             if any(
-                index.shape[dimension] > data.shape[dimension]
+                index.shape[dimension] != data.shape[dimension]
                 for dimension in range(data.ndim)
                 if dimension != axis
             ):
                 raise ValueError(
-                    "structured along_axis gather index exceeds a non-axis extent"
+                    "structured along_axis gather index must match every "
+                    "non-axis data extent"
                 )
             inferred_shape = index.shape
-            if expected_shape != inferred_shape:
+            if expected_shape(inferred_shape) != inferred_shape:
                 raise ValueError(
                     "structured along_axis gather result must be shaped like index"
                 )
@@ -691,7 +1174,7 @@ class _Evaluator:
                 *index.shape,
                 *data.shape[axis + 1 :],
             )
-            if expected_shape != inferred_shape:
+            if expected_shape(inferred_shape) != inferred_shape:
                 raise ValueError(
                     "structured take gather result shape differs from data/index"
                 )
@@ -704,13 +1187,67 @@ class _Evaluator:
         self,
         op: IntentOp,
         env: Mapping[str, np.ndarray],
-    ) -> np.ndarray:
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
         if (
-            set(op.attrs) != {"axis", "mode", "reduce"}
-            or len(op.operands) != 3
+            not _SCATTER_REQUIRED_ATTRS.issubset(op.attrs)
+            or set(op.attrs) - _SCATTER_ALLOWED_ATTRS
+            or len(op.operands) not in {3, 4}
         ):
             raise StructuredReferenceUnsupportedError(
-                "structured scatter requires axis/mode/reduce and three operands"
+                "structured scatter requires closed attrs and three or four operands"
+            )
+        atomic = op.attrs.get("atomic")
+        is_cas = atomic == "cas"
+        if is_cas:
+            if (
+                len(op.operands) != 4
+                or not isinstance(op.result, list)
+                or len(op.result) != 2
+            ):
+                raise StructuredReferenceUnsupportedError(
+                    "structured atomic='cas' requires four operands and two results"
+                )
+            if op.attrs.get("reduce") != "none":
+                raise ValueError("structured atomic='cas' requires reduce='none'")
+            retry = op.attrs.get("cas_retry", "single_attempt")
+            if retry not in ATOMIC_CAS_RETRIES:
+                raise StructuredReferenceUnsupportedError(
+                    "structured atomic='cas' requires a closed cas_retry"
+                )
+            if retry != "single_attempt":
+                raise StructuredReferenceUnsupportedError(
+                    "structured reference implements only single-attempt compare-exchange"
+                )
+        elif len(op.operands) != 3:
+            raise StructuredReferenceUnsupportedError(
+                "structured non-CAS scatter requires three operands"
+            )
+        if atomic is not None:
+            if atomic not in ATOMIC_KINDS:
+                raise StructuredReferenceUnsupportedError(
+                    f"structured scatter has unsupported atomic kind {atomic!r}"
+                )
+            if op.attrs.get("ordering") not in ATOMIC_ORDERINGS:
+                raise StructuredReferenceUnsupportedError(
+                    "structured atomic scatter requires a closed ordering"
+                )
+            if op.attrs.get("memory_scope") not in ATOMIC_MEMORY_SCOPES:
+                raise StructuredReferenceUnsupportedError(
+                    "structured atomic scatter requires a closed memory_scope"
+                )
+            if atomic == "add" and "cas_retry" in op.attrs:
+                raise StructuredReferenceUnsupportedError(
+                    "cas_retry is only valid for atomic='cas'"
+                )
+            if atomic == "add" and op.attrs.get("reduce") != "add":
+                raise ValueError("structured atomic='add' requires reduce='add'")
+        elif (
+            "ordering" in op.attrs
+            or "memory_scope" in op.attrs
+            or "cas_retry" in op.attrs
+        ):
+            raise StructuredReferenceUnsupportedError(
+                "ordering, memory_scope, and cas_retry require an explicit atomic scatter"
             )
         node_ref = self.node_refs_by_operation.get(id(op), op.node_id)
         update = self.logical_updates.get(node_ref)
@@ -720,7 +1257,8 @@ class _Evaluator:
             )
         data = self._operand(op, env, 0)
         index = self._operand(op, env, 1)
-        source = self._operand(op, env, 2)
+        compare = self._operand(op, env, 2) if is_cas else None
+        source = self._operand(op, env, 3 if is_cas else 2)
         axis = op.attrs.get("axis")
         if isinstance(axis, bool) or not isinstance(axis, int):
             raise StructuredReferenceUnsupportedError(
@@ -734,9 +1272,13 @@ class _Evaluator:
             )
         if index.dtype.kind not in {"i", "u"}:
             raise ValueError("structured scatter index must have an integer dtype")
-        if index.shape != source.shape or index.ndim != data.ndim:
+        if (
+            index.shape != source.shape
+            or index.ndim != data.ndim
+            or (is_cas and compare is not None and compare.shape != index.shape)
+        ):
             raise ValueError(
-                "structured scatter index/source must have one common data rank"
+                "structured scatter index/source/compare must have one common data rank"
             )
         if any(
             index.shape[dimension] > data.shape[dimension]
@@ -752,15 +1294,24 @@ class _Evaluator:
         ):
             raise ValueError("structured scatter index is outside the data extent")
 
-        if (
-            update.base != op.operands[0]
-            or update.indices != op.operands[1]
-            or update.values != op.operands[2]
-            or update.axis != axis
-        ):
+        expected_operands = [update.base, update.indices]
+        if is_cas:
+            expected_operands.extend([update.compare, update.values])
+        else:
+            expected_operands.append(update.values)
+        if expected_operands != list(op.operands) or update.axis != axis:
             raise ValueError(
                 "structured scatter operands disagree with its logical update"
             )
+        if is_cas:
+            result_names = _result_names(op)
+            if (
+                update.compare != op.operands[2]
+                or update.observed != result_names[1]
+            ):
+                raise ValueError(
+                    "structured compare-exchange bindings disagree with its logical update"
+                )
         reduce = op.attrs.get("reduce")
         expected_combiner = "overwrite" if reduce == "none" else reduce
         if update.combiner.value != expected_combiner:
@@ -780,6 +1331,28 @@ class _Evaluator:
             )
 
         result = np.array(data, copy=True)
+        if is_cas:
+            observed = np.empty(index.shape, dtype=result.dtype)
+            target_keys: list[tuple[int, ...]] = []
+            for position in np.ndindex(index.shape):
+                target = list(position)
+                target[axis] = int(index[position])
+                target_keys.append(tuple(target))
+            if update.duplicate_policy.value == "forbid" and len(
+                set(target_keys)
+            ) != len(target_keys):
+                raise ValueError(
+                    "structured atomic='cas' violates duplicate_policy='forbid'"
+                )
+            for position, target in zip(
+                np.ndindex(index.shape), target_keys, strict=True
+            ):
+                old = np.asarray(result[target]).copy()
+                observed[position] = old
+                if bool(np.equal(old, compare[position])):
+                    result[target] = source[position]
+            self.scatter_count += 1
+            return result, observed
         if reduce == "none":
             np.put_along_axis(result, index, source, axis=axis)
         elif reduce == "add":
@@ -793,12 +1366,182 @@ class _Evaluator:
         self.scatter_count += 1
         return result
 
+    def _ragged_operand(
+        self,
+        op: IntentOp,
+        env: Mapping[str, np.ndarray],
+    ) -> _RaggedValue:
+        value = self._operand(op, env, 0)
+        if not isinstance(value, _RaggedValue):
+            raise ValueError(f"structured {op.op} requires a ragged descriptor")
+        return value
+
+    def _ragged(
+        self,
+        op: IntentOp,
+        env: Mapping[str, np.ndarray],
+    ) -> _RaggedValue:
+        if op.attrs or len(op.operands) != 2:
+            raise StructuredReferenceUnsupportedError(
+                "structured ragged requires two operands and no attrs"
+            )
+        offsets = self._operand(op, env, 0)
+        indices = self._operand(op, env, 1)
+        offsets, indices = _validate_ragged_arrays(
+            offsets,
+            indices,
+            context="structured ragged",
+        )
+        declared = self._declared_value_type(self._result_name(op), op)
+        if declared is not None:
+            if not declared.is_ragged:
+                raise ValueError("structured ragged result is not a ragged type")
+            for field_name, field_value in (
+                ("offsets", offsets),
+                ("indices", indices),
+            ):
+                field_type = declared.field(field_name)
+                if not field_type.is_tensor or field_type.dtype is None:
+                    raise ValueError(
+                        f"structured ragged field {field_name!r} is not a tensor"
+                    )
+                if field_value.shape != _resolved_shape(field_type.shape, self.dims):
+                    raise ValueError(
+                        f"structured ragged field {field_name!r} shape differs "
+                        "from its operand"
+                    )
+                if field_value.dtype != numpy_dtype(field_type.dtype):
+                    raise ValueError(
+                        f"structured ragged field {field_name!r} dtype differs "
+                        "from its operand"
+                    )
+        return _RaggedValue(offsets, indices)
+
+    def _ragged_outer(
+        self,
+        op: IntentOp,
+        env: Mapping[str, np.ndarray],
+    ) -> np.ndarray:
+        if op.attrs or len(op.operands) != 1:
+            raise StructuredReferenceUnsupportedError(
+                "structured ragged_outer requires one operand and no attrs"
+            )
+        descriptor = self._ragged_operand(op, env)
+        try:
+            outer_count = ragged_outer_count(
+                descriptor.offsets,
+                descriptor.indices,
+                context="structured ragged_outer",
+            )
+        except RaggedRuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+        result = np.asarray(outer_count, dtype=descriptor.offsets.dtype)
+        declared = self._declared_type(
+            self._result_name(op),
+            op,
+            actual_shape=(),
+        )
+        if declared is None:
+            raise StructuredReferenceUnsupportedError(
+                "structured ragged_outer requires one closed scalar result type"
+            )
+        if declared[1] != () or numpy_dtype(declared[0]) != result.dtype:
+            raise ValueError("structured ragged_outer result type is not closed")
+        return result
+
+    def _ragged_member(
+        self,
+        op: IntentOp,
+        env: Mapping[str, np.ndarray],
+    ) -> np.ndarray:
+        if op.attrs or len(op.operands) != 2:
+            raise StructuredReferenceUnsupportedError(
+                "structured ragged_member requires descriptor/index operands "
+                "and no attrs"
+            )
+        descriptor = self._ragged_operand(op, env)
+        outer_index = self._operand(op, env, 1)
+        if outer_index.ndim != 0 or outer_index.dtype.kind not in {"i", "u"}:
+            raise ValueError(
+                "structured ragged_member outer index must be a rank-0 integer"
+            )
+        try:
+            length = ragged_member_length(
+                descriptor.offsets,
+                descriptor.indices,
+                outer_index,
+                context="structured ragged_member",
+            )
+        except RaggedRuntimeError as exc:
+            raise ValueError(str(exc)) from exc
+        group = int(outer_index.item())
+        start = int(descriptor.offsets[group])
+        stop = start + length
+        result = np.array(descriptor.indices[start:stop], copy=True)
+        declared = self._declared_type(
+            self._result_name(op),
+            op,
+            actual_shape=result.shape,
+        )
+        if declared is None:
+            declared_value = self._declared_value_type(self._result_name(op), op)
+            if (
+                declared_value is None
+                or not declared_value.is_tensor
+                or declared_value.dtype is None
+                or declared_value.shape != ("?",)
+            ):
+                raise StructuredReferenceUnsupportedError(
+                    "structured ragged_member requires a dynamic rank-1 result "
+                    "type"
+                )
+            declared = (declared_value.dtype, result.shape)
+        if declared[1] != result.shape:
+            raise ValueError("structured ragged_member result shape is not closed")
+        if numpy_dtype(declared[0]) != result.dtype:
+            raise ValueError("structured ragged_member result dtype differs from indices")
+        return result
+
+    def _reshape(
+        self,
+        op: IntentOp,
+        env: Mapping[str, np.ndarray],
+    ) -> np.ndarray:
+        _require_operation_attrs(op)
+        if len(op.operands) != 1:
+            raise StructuredReferenceUnsupportedError(
+                "structured reshape requires exactly shape and one operand"
+            )
+        shape = op.attrs.get("shape")
+        if not isinstance(shape, list):
+            raise StructuredReferenceUnsupportedError(
+                "structured reshape shape must be a list"
+            )
+        resolved_shape = _resolved_shape(shape, self.dims)
+        value = self._operand(op, env, 0)
+        declared = self._declared_type(self._result_name(op), op)
+        if declared is None:
+            raise StructuredReferenceUnsupportedError(
+                "structured reshape requires one closed result type"
+            )
+        dtype, expected_shape = declared
+        if expected_shape != resolved_shape:
+            raise ValueError(
+                "structured reshape result shape differs from attrs.shape"
+            )
+        if value.dtype != numpy_dtype(dtype):
+            raise ValueError("structured reshape must preserve the input dtype")
+        if value.size != math.prod(resolved_shape):
+            raise ValueError("structured reshape changes the number of elements")
+        return np.reshape(value, resolved_shape)
+
     def _tile(
         self,
         op: IntentOp,
         env: Mapping[str, np.ndarray],
     ) -> np.ndarray:
-        if set(op.attrs) != {"reps"} or len(op.operands) != 1:
+        _require_operation_attrs(op)
+        if len(op.operands) != 1:
             raise StructuredReferenceUnsupportedError(
                 "structured tile requires exactly reps and one operand"
             )
@@ -834,7 +1577,8 @@ class _Evaluator:
         return np.tile(value, tuple(reps))
 
     def _iota(self, op: IntentOp) -> np.ndarray:
-        if op.operands or set(op.attrs) not in ({"n"}, {"n", "dtype"}):
+        _require_operation_attrs(op)
+        if op.operands:
             raise StructuredReferenceUnsupportedError(
                 "structured iota requires no operands and one closed extent"
             )
@@ -884,7 +1628,8 @@ class _Evaluator:
         op: IntentOp,
         env: Mapping[str, np.ndarray],
     ) -> np.ndarray:
-        if set(op.attrs) != {"subscripts"} or len(op.operands) != 2:
+        _require_operation_attrs(op)
+        if len(op.operands) != 2:
             raise StructuredReferenceUnsupportedError(
                 "structured contraction requires exactly two operands and one "
                 "subscripts relation"
@@ -1079,11 +1824,14 @@ class _Evaluator:
             raise StructuredReferenceUnsupportedError(
                 f"structured reference has no denotation for IntentOp {op.op!r}"
             )
+        if op.op == "ragged":
+            return self._ragged(op, env)
+        if op.op == "ragged_outer":
+            return self._ragged_outer(op, env)
+        if op.op == "ragged_member":
+            return self._ragged_member(op, env)
         if op.op == "const":
-            if set(op.attrs) - {"value", "dtype", "shape"}:
-                raise StructuredReferenceUnsupportedError(
-                    "structured const has unsupported attributes"
-                )
+            _require_operation_attrs(op)
             result = self._result_name(op)
             declared = self._declared_type(result, op)
             if declared is None:
@@ -1091,7 +1839,25 @@ class _Evaluator:
                     "structured const requires one closed result type"
                 )
             dtype, shape = declared
-            return np.full(shape, op.attrs.get("value"), dtype=numpy_dtype(dtype))
+            try:
+                literal = validate_const_literal(
+                    op.attrs,
+                    result_type={"dtype": dtype, "shape": list(shape)},
+                    context="structured const",
+                )
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            runtime_dtype = numpy_dtype(dtype)
+            if literal.splat:
+                return np.full(
+                    shape,
+                    _runtime_const_literal(literal.values[0]),
+                    dtype=runtime_dtype,
+                )
+            values = [
+                _runtime_const_literal(value) for value in literal.values
+            ]
+            return np.asarray(values, dtype=runtime_dtype).reshape(shape)
         if op.op == "concat":
             return self._concat(op, env)
         if op.op == "gather":
@@ -1101,7 +1867,8 @@ class _Evaluator:
         if op.op == "iota":
             return self._iota(op)
         if op.op == "map_binary":
-            if set(op.attrs) != {"fn"} or len(op.operands) != 2:
+            _require_operation_attrs(op)
+            if len(op.operands) != 2:
                 raise StructuredReferenceUnsupportedError(
                     "structured map_binary requires exactly fn and two operands"
                 )
@@ -1111,19 +1878,48 @@ class _Evaluator:
                 raise StructuredReferenceUnsupportedError(
                     f"structured map_binary has unsupported fn {fn!r}"
                 )
+            lhs_type = self.value_types.get(op.operands[0])
+            rhs_type = self.value_types.get(op.operands[1])
+            result_name = self._result_name(op)
+            result_type = self.value_types.get(result_name)
+            if (
+                lhs_type is None
+                or rhs_type is None
+                or result_type is None
+                or not lhs_type.is_tensor
+                or not rhs_type.is_tensor
+                or not result_type.is_tensor
+                or lhs_type.dtype is None
+                or rhs_type.dtype is None
+                or result_type.dtype is None
+                or map_binary_result_dtype(
+                    fn, lhs_type.dtype, rhs_type.dtype
+                )
+                != result_type.dtype
+            ):
+                raise StructuredReferenceUnsupportedError(
+                    f"structured map_binary fn {fn!r} violates the shared "
+                    "closed dtype contract"
+                )
             left = self._operand(op, env, 0)
             right = self._operand(op, env, 1)
             declared = self._declared_type(self._result_name(op), op)
-            if fn == "div" and declared is not None:
+            if fn in {"div", "floordiv", "remainder"} and declared is not None:
                 result_dtype = np.dtype(numpy_dtype(declared[0]))
                 if np.issubdtype(result_dtype, np.integer):
-                    return _integer_divide(left, right, result_dtype)
+                    if fn == "div":
+                        return _integer_divide(left, right, result_dtype)
+                    if fn == "floordiv":
+                        return _integer_floor_divide(left, right, result_dtype)
+                    return _integer_remainder(left, right, result_dtype)
             arithmetic = {
-                "add", "sub", "mul", "div", "max", "min", "pow", "atan2"
+                "add", "sub", "mul", "div", "floordiv", "remainder",
+                "max", "min", "pow", "atan2", "copysign",
             }
             logical = {
                 "and", "or", "xor", "logical_and", "logical_or", "logical_xor"
             }
+            integer = {"left_shift", "right_shift"}
             if fn in arithmetic and declared is not None:
                 # NumPy's scalar/0-D weak-promotion rules can retain the array's
                 # lower precision (for example f16-array * f32-scalar).  J has
@@ -1135,6 +1931,14 @@ class _Evaluator:
             elif fn in logical:
                 left_value = np.asarray(left, dtype=np.bool_)
                 right_value = np.asarray(right, dtype=np.bool_)
+            elif fn in integer and declared is not None:
+                compute_dtype = np.dtype(numpy_dtype(declared[0]))
+                if not np.issubdtype(compute_dtype, np.integer):
+                    raise StructuredReferenceUnsupportedError(
+                        f"structured {fn} requires an integer result dtype"
+                    )
+                left_value = np.asarray(left, dtype=compute_dtype)
+                right_value = np.asarray(right, dtype=compute_dtype)
             else:
                 promoted = np.result_type(np.asarray(left).dtype, np.asarray(right).dtype)
                 left_value = np.asarray(left, dtype=promoted)
@@ -1144,7 +1948,8 @@ class _Evaluator:
                 result = np.asarray(result, dtype=numpy_dtype(declared[0]))
             return result
         if op.op == "map_unary":
-            if set(op.attrs) != {"fn"} or len(op.operands) != 1:
+            _require_operation_attrs(op)
+            if len(op.operands) != 1:
                 raise StructuredReferenceUnsupportedError(
                     "structured map_unary requires exactly fn and one operand"
                 )
@@ -1154,7 +1959,28 @@ class _Evaluator:
                 raise StructuredReferenceUnsupportedError(
                     f"structured map_unary has unsupported fn {fn!r}"
                 )
-            return np.asarray(implementation(self._operand(op, env, 0)))
+            operand_type = self.value_types.get(op.operands[0])
+            result_name = self._result_name(op)
+            result_type = self.value_types.get(result_name)
+            if (
+                operand_type is None
+                or result_type is None
+                or not operand_type.is_tensor
+                or not result_type.is_tensor
+                or operand_type.dtype is None
+                or result_type.dtype is None
+                or map_unary_result_dtype(fn, operand_type.dtype)
+                != result_type.dtype
+            ):
+                raise StructuredReferenceUnsupportedError(
+                    f"structured map_unary fn {fn!r} violates the shared "
+                    "closed dtype contract"
+                )
+            result = np.asarray(implementation(self._operand(op, env, 0)))
+            declared = self._declared_type(self._result_name(op), op)
+            if declared is not None:
+                result = np.asarray(result, dtype=numpy_dtype(declared[0]))
+            return result
         if op.op == "reduce":
             return self._reduce(op, env)
         if op.op == "scan":
@@ -1164,7 +1990,8 @@ class _Evaluator:
         if op.op == "contraction":
             return self._contraction(op, env)
         if op.op == "select":
-            if op.attrs or len(op.operands) != 3:
+            _require_operation_attrs(op)
+            if len(op.operands) != 3:
                 raise StructuredReferenceUnsupportedError(
                     "structured select requires three operands and no control attrs"
                 )
@@ -1179,21 +2006,20 @@ class _Evaluator:
                 )
             )
         if op.op == "cast":
-            if len(op.operands) != 1 or set(op.attrs) not in (
-                {"to_dtype"},
-                {"dtype"},
-            ):
+            _require_operation_attrs(op)
+            if len(op.operands) != 1:
                 raise StructuredReferenceUnsupportedError(
                     "structured cast requires one canonical dtype target"
                 )
-            target = op.attrs.get("to_dtype", op.attrs.get("dtype"))
+            target = op.attrs["to_dtype"]
             if not isinstance(target, str):
                 raise StructuredReferenceUnsupportedError(
                     "structured cast target must be a dtype string"
                 )
             return self._operand(op, env, 0).astype(numpy_dtype(target))
         if op.op == "transpose":
-            if len(op.operands) != 1 or set(op.attrs) != {"perm"}:
+            _require_operation_attrs(op)
+            if len(op.operands) != 1:
                 raise StructuredReferenceUnsupportedError(
                     "structured transpose requires one closed permutation"
                 )
@@ -1207,7 +2033,8 @@ class _Evaluator:
                 )
             return np.transpose(self._operand(op, env, 0), axes=tuple(perm))
         if op.op == "pad":
-            if len(op.operands) != 1 or set(op.attrs) != {"lo", "hi", "value"}:
+            _require_operation_attrs(op)
+            if len(op.operands) != 1:
                 raise StructuredReferenceUnsupportedError(
                     "structured pad requires closed lo/hi/value attributes"
                 )
@@ -1232,12 +2059,15 @@ class _Evaluator:
             )
         if op.op == "tile":
             return self._tile(op, env)
+        if op.op == "reshape":
+            return self._reshape(op, env)
         raise AssertionError(op.op)  # pragma: no cover - closed above
 
     def _carry_type(self, state: LoopStateBinding) -> tuple[str, tuple[int, ...]]:
-        if state.type is None:
+        if state.type is None or state.type.kind != "tensor" or state.type.dtype is None:
             raise StructuredReferenceUnsupportedError(
-                "structured loop carry requires one closed value type"
+                "structured loop carry requires one tensor value type; named "
+                "record carries need a record-aware reference ABI"
             )
         return state.type.dtype, _resolved_shape(state.type.shape, self.dims)
 
@@ -1333,38 +2163,114 @@ class _Evaluator:
         op: IntentOp,
         env: Mapping[str, np.ndarray],
     ) -> dict[str, np.ndarray]:
-        if op.attrs:
-            raise StructuredReferenceUnsupportedError(
-                "structured loop has unsupported ordinary attributes"
-            )
-        if len(op.operands) != len(set(op.operands)):
-            raise ValueError("structured loop capture operands must be unique")
-        if any(operand not in env for operand in op.operands):
-            raise ValueError(
-                "structured loop capture operand does not dominate the loop"
-            )
+        validate_loop_wiring(op, context="structured loop")
         if op.trip is None or not op.carry:
             raise StructuredReferenceUnsupportedError(
                 "structured loop requires one trip and typed carries"
             )
-        if op.type is not None:
-            if len(op.carry) != 1 or op.carry[0].type is None:
-                raise StructuredReferenceUnsupportedError(
-                    "structured loop ordinary result type is only defined for "
-                    "one typed carry"
-                )
-            expected = op.carry[0].type.to_json()
-            if op.type != expected:
-                raise ValueError(
-                    "structured loop ordinary result type differs from its "
-                    "unique carry type"
-                )
         if any(child.op == "loop" for child in _walk_ops(op.body)):
             raise StructuredReferenceUnsupportedError(
                 "structured reference does not implement nested loops"
             )
+        # The shared wiring validator has already established the exact result
+        # and yield order.  Keep the explicit arity assertion here because this
+        # executor consumes the list directly when it returns the final carry
+        # values.
         if not isinstance(op.result, list) or len(op.result) != len(op.carry):
             raise ValueError("structured loop results differ from carry order")
+        for state in op.carry:
+            declared = self._carry_type(state)
+            for role in (
+                state.body_argument,
+                state.next_value,
+                state.result_value,
+            ):
+                known = self.value_types.get(role)
+                if known is None:
+                    continue
+                if (
+                    not known.is_tensor
+                    or known.dtype is None
+                    or known.dtype != declared[0]
+                    or _resolved_shape(known.shape, self.dims) != declared[1]
+                ):
+                    raise ValueError(
+                        f"structured loop carry role {role!r} type differs "
+                        "from its authored carry type"
+                    )
+        carries = {
+            state.body_argument: self._carry_init(state, env)
+            for state in op.carry
+        }
+        self.loop_count += 1
+        if op.trip.is_dynamic:
+            if op.scan:
+                raise StructuredReferenceUnsupportedError(
+                    "structured dynamic value trips do not support scan inputs"
+                )
+            upper_name = op.trip.upper_bound
+            index_name = op.trip.index
+            if not isinstance(upper_name, str) or not isinstance(index_name, str):
+                raise StructuredReferenceUnsupportedError(
+                    "structured dynamic loop requires upper_bound and index"
+                )
+            try:
+                upper_value = env[upper_name]
+            except KeyError as exc:
+                raise ValueError(
+                    f"structured dynamic loop upper bound {upper_name!r} is unavailable"
+                ) from exc
+            if (
+                isinstance(upper_value, _RaggedValue)
+                or upper_value.ndim != 0
+                or upper_value.dtype.kind not in {"i", "u"}
+            ):
+                raise ValueError(
+                    "structured dynamic loop upper bound must be a rank-0 integer"
+                )
+            extent = int(upper_value.item())
+            if extent < 0:
+                raise ValueError("structured dynamic loop upper bound must be non-negative")
+            if extent == 0:
+                if len(carries) != len(op.carry):
+                    raise StructuredReferenceUnsupportedError(
+                        "zero-trip structured loop cannot return a null-initialized carry"
+                    )
+                self.zero_trip_loops += 1
+                final_carries = carries
+            else:
+                final_carries = dict(carries)
+                for iteration in range(extent):
+                    local = dict(env)
+                    local[index_name] = np.asarray(
+                        iteration,
+                        dtype=upper_value.dtype,
+                    )
+                    local.update(final_carries)
+                    local = self.sequence(op.body, local, allow_loop=False)
+                    next_carries: dict[str, np.ndarray] = {}
+                    for state in op.carry:
+                        if state.next_value not in local:
+                            raise ValueError(
+                                "structured loop body did not define "
+                                f"{state.next_value!r}"
+                            )
+                        next_carries[state.body_argument] = self._validate_value(
+                            local[state.next_value],
+                            name=state.next_value,
+                            declared=self._carry_type(state),
+                        )
+                    final_carries = next_carries
+                    self.logical_loop_steps += 1
+            return {
+                state.result_value: self._validate_value(
+                    final_carries[state.body_argument],
+                    name=state.result_value,
+                    declared=self._carry_type(state),
+                )
+                for state in op.carry
+            }
+
         trip_axis = op.trip.axis
         if trip_axis not in self.dims:
             raise StructuredReferenceUnsupportedError(
@@ -1374,11 +2280,6 @@ class _Evaluator:
         if extent < 0:
             raise ValueError("structured loop trip extent must be non-negative")
 
-        carries = {
-            state.body_argument: self._carry_init(state, env)
-            for state in op.carry
-            if state.init_value is not None
-        }
         scan_sources: list[tuple[Any, np.ndarray]] = []
         for scan in op.scan:
             try:
@@ -1395,7 +2296,6 @@ class _Evaluator:
                 )
             scan_sources.append((scan, source))
 
-        self.loop_count += 1
         if extent == 0:
             if len(carries) != len(op.carry):
                 raise StructuredReferenceUnsupportedError(
@@ -1490,7 +2390,7 @@ class _Evaluator:
                 result[name] = self._validate_value(
                     yielded,
                     name=name,
-                    declared=self._declared_type(name, op),
+                    declared=self._declared_value_type(name, op),
                 )
                 self._record_conditional_effect_stores(op, result)
                 continue
@@ -1502,13 +2402,30 @@ class _Evaluator:
                 result.update(self._loop(op, result))
                 self._record_conditional_effect_stores(op, result)
                 continue
-            name = self._result_name(op)
             value = self._ordinary(op, result)
-            result[name] = self._validate_value(
-                value,
-                name=name,
-                declared=self._declared_type(name, op),
-            )
+            names = _result_names(op)
+            if len(names) == 1:
+                name = names[0]
+                result[name] = self._validate_value(
+                    value,
+                    name=name,
+                    declared=self._declared_value_type(name, op),
+                )
+            elif len(names) > 1:
+                if not isinstance(value, tuple) or len(value) != len(names):
+                    raise StructuredReferenceUnsupportedError(
+                        f"structured {op.op} returned the wrong number of results"
+                    )
+                for name, item in zip(names, value, strict=True):
+                    result[name] = self._validate_value(
+                        item,
+                        name=name,
+                        declared=self._declared_value_type(name, op),
+                    )
+            else:
+                raise StructuredReferenceUnsupportedError(
+                    f"structured {op.op} requires at least one result"
+                )
             self._record_conditional_effect_stores(op, result)
         return result
 
@@ -1520,6 +2437,8 @@ def execute_structured_reference(
     *,
     broadcast_axes: Mapping[str, Mapping[str, Sequence[int]]] | None = None,
     access_guard_relations: Sequence[Any] = (),
+    consumer_extensions: Sequence[Any] = (),
+    update_padding_relations: Sequence[Any] = (),
     conditional_effect_stores: Sequence[Any] = (),
 ) -> CPUExecutionResult:
     """Execute the restricted typed denotation of one canonical J.
@@ -1529,6 +2448,11 @@ def execute_structured_reference(
     """
 
     j = elaborate_j(j)
+    canonical_body = _canonical_body(j)
+    try:
+        validate_ragged_region_boundaries(canonical_body)
+    except ValueError as exc:
+        raise StructuredReferenceUnsupportedError(str(exc)) from exc
     guarded_loads = tuple(
         relation
         for relation in access_guard_relations
@@ -1540,7 +2464,7 @@ def execute_structured_reference(
             "outside the scalar CPU capability"
         )
     unsupported = sorted(
-        {op.op for op in _walk_ops(j.intent.body)}
+        {op.op for op in _canonical_ops(j)}
         - (_ORDINARY_OPS | {"loop", "effect_if", "value_if"})
     )
     if unsupported:
@@ -1574,42 +2498,66 @@ def execute_structured_reference(
         for tensor, value in zip(j.intent.inputs, inputs, strict=True)
     }
     validate_value_dimension_instantiation(j, checked_dims, checked_inputs)
+    validate_ragged_runtime_invocation(
+        j.intent,
+        checked_inputs,
+        dims=checked_dims,
+    )
     evaluator = _Evaluator(
         j,
         checked_dims,
         broadcast_axes or {},
         guarded_loads,
+        consumer_extensions,
+        update_padding_relations,
         conditional_effect_stores,
     )
-    env = evaluator.sequence(j.intent.body, checked_inputs, allow_loop=True)
+    env = evaluator.sequence(canonical_body, checked_inputs, allow_loop=True)
     output_values = {
         item.output: item.value
         for item in j_elaboration(j).output_bindings
     }
     outputs: dict[str, np.ndarray] = {}
-    for tensor in j.intent.outputs:
-        if tensor.name in evaluator.effect_output_state:
-            outputs[tensor.name] = evaluator._validate_value(
-                evaluator.effect_output_state[tensor.name],
-                name=tensor.name,
-                declared=(
-                    tensor.dtype,
-                    _resolved_shape(tensor.shape, checked_dims),
-                ),
+    output_bindings = j_elaboration(j).output_bindings
+    for binding in output_bindings:
+        output = binding.output
+        output_type = binding.output_type
+        if output in evaluator.effect_output_state:
+            effect_value = evaluator.effect_output_state[output]
+            resolved_shape = _resolved_declared_shape(
+                output_type.shape,
+                checked_dims,
+                np.asarray(effect_value).shape,
+            )
+            if resolved_shape is None:
+                raise StructuredReferenceUnsupportedError(
+                    f"structured output {output!r} shape is unresolved"
+                )
+            outputs[output] = evaluator._validate_value(
+                effect_value,
+                name=output,
+                declared=(output_type.dtype, resolved_shape),
             )
             continue
-        value_ref = output_values[tensor.name]
+        value_ref = output_values[output]
         if value_ref not in env:
             raise ValueError(
-                f"structured reference did not produce output {tensor.name!r}"
+                f"structured reference did not produce output {output!r}"
             )
-        outputs[tensor.name] = evaluator._validate_value(
-            env[value_ref],
-            name=tensor.name,
-            declared=(
-                tensor.dtype,
-                _resolved_shape(tensor.shape, checked_dims),
-            ),
+        output_value = env[value_ref]
+        resolved_shape = _resolved_declared_shape(
+            output_type.shape,
+            checked_dims,
+            np.asarray(output_value).shape,
+        )
+        if resolved_shape is None:
+            raise StructuredReferenceUnsupportedError(
+                f"structured output {output!r} shape is unresolved"
+            )
+        outputs[output] = evaluator._validate_value(
+            output_value,
+            name=output,
+            declared=(output_type.dtype, resolved_shape),
         )
     return CPUExecutionResult(
         outputs,
@@ -1628,6 +2576,9 @@ def execute_structured_reference(
             "zero_trip_loop_count": evaluator.zero_trip_loops,
             "access_guard_load_materialization_count": len(
                 evaluator.access_guard_loads
+            ),
+            "update_padding_relation_count": len(
+                evaluator.update_padding_relations
             ),
             "conditional_effect_store_count": (
                 evaluator.executed_conditional_effect_store_count

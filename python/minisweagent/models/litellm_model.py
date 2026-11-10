@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -30,7 +31,7 @@ class LitellmModelConfig(BaseModel):
     model_kwargs: dict[str, Any] = {}
     """Additional arguments passed to the API."""
     litellm_model_registry: Path | str | None = os.getenv("LITELLM_MODEL_REGISTRY_PATH")
-    """Model registry for cost tracking and model metadata. See the local model guide (https://mini-swe-agent.com/latest/models/local_models/) for more details."""
+    """Optional LiteLLM registry for cost tracking and model metadata."""
     set_cache_control: Literal["default_end"] | None = None
     """Set explicit cache control markers, for example for Anthropic models"""
     cost_tracking: Literal["default", "ignore_errors"] = os.getenv("MSWEA_COST_TRACKING", "default")
@@ -76,7 +77,7 @@ class LitellmModel:
                 **(self.config.model_kwargs | kwargs),
             )
         except litellm.exceptions.AuthenticationError as e:
-            e.message += " You can permanently set your API key with `mini-extra config set KEY VALUE`."
+            e.message += " Configure credentials through the IntentIR provider settings."
             raise e
 
     def _prepare_messages_for_api(self, messages: list[dict]) -> list[dict]:
@@ -130,9 +131,8 @@ class LitellmModel:
                     f"Error calculating cost for model {self.config.model_name}: {e}, perhaps it's not registered? "
                     "You can ignore this issue from your config file with cost_tracking: 'ignore_errors' or "
                     "globally with export MSWEA_COST_TRACKING='ignore_errors'. "
-                    "Alternatively check the 'Cost tracking' section in the documentation at "
-                    "https://klieret.short.gy/mini-local-models. "
-                    " Still stuck? Please open a github issue at https://github.com/SWE-agent/mini-swe-agent/issues/new/choose!"
+                    "Otherwise add the selected model to the LiteLLM registry used "
+                    "by the IntentIR provider."
                 )
                 logger.critical(msg)
                 raise RuntimeError(msg) from e
@@ -192,11 +192,33 @@ _SECRET_KEYS = {
     "refresh_token",
 }
 
+_PRIVATE_DISPLAY_KEYS = {
+    "api_base",
+    "base_url",
+    "proxy",
+    "proxy_url",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "run_root",
+    "evidence_path",
+    "workspace",
+    "cwd",
+    "path",
+    "model",
+    "model_name",
+}
+
+_PRIVATE_URL = re.compile(r"(?i)https?://[^\s\"'<>]+")
+_PRIVATE_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9_])/(?:[^\s\"']+/){1,}[^\s\"']*")
+
 
 def _redact_secrets(value: Any, *, key: str = "") -> Any:
     """Return JSON-safe model configuration without provider credentials."""
 
     normalized_key = key.casefold().replace("-", "_")
+    if normalized_key in _PRIVATE_DISPLAY_KEYS:
+        return "<redacted>"
     if normalized_key in _SECRET_KEYS or normalized_key.endswith("_api_key"):
         return "<redacted>"
     if isinstance(value, dict):
@@ -208,4 +230,7 @@ def _redact_secrets(value: Any, *, key: str = "") -> Any:
         return [_redact_secrets(item) for item in value]
     if isinstance(value, tuple):
         return [_redact_secrets(item) for item in value]
+    if isinstance(value, str):
+        value = _PRIVATE_URL.sub("<redacted-url>", value)
+        value = _PRIVATE_ABSOLUTE_PATH.sub("<redacted-path>", value)
     return value

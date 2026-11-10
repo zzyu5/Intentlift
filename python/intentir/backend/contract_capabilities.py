@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from intentir.backend.materialize import MaterializedJ
+from intentir.ir.canonical_j import j_elaboration
 from intentir.verify.gate1.model import EffectKind, ParameterMode
 
 
@@ -39,19 +40,21 @@ def derive_search_capabilities(base: MaterializedJ) -> tuple[str, ...]:
     # unrelated unused tensor suppress whole-graph fusion for every live input.
     # Walk every structured region so this projection is derived from J itself,
     # never from a runtime sample or kernel-name allowlist.
-    dag_operands: set[str] = set()
-
-    def visit(operations) -> None:
-        for operation in operations:
-            dag_operands.update(operation.operands)
-            visit(operation.body)
-            for branch in (operation.positive, operation.negative):
-                if branch is not None:
-                    visit(branch.body)
-
-    visit(j.intent.body)
+    typed_rows = j_elaboration(j).typed_operation_rows
+    if typed_rows is None:
+        # Capability derivation is a compiler permission boundary.  An
+        # incomplete canonical view must not acquire permissions from a raw
+        # body walk.
+        return ()
+    dag_operands = {
+        operand
+        for _path, operation in typed_rows
+        for operand in operation.operands
+    }
     observable_inputs = {
-        output.name for output in j.intent.outputs if output.name in input_names
+        binding.output
+        for binding in j_elaboration(j).output_bindings
+        if binding.output in input_names
     }
     active_input_names = {
         name

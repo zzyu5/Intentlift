@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import tempfile
 import threading
 import time
@@ -17,21 +16,18 @@ from intentir.extraction.providers.codex_cli import (
     CODEX_CLI_AGENT_RUNTIME,
     CODEX_CLI_TOOL_BRIDGE_ROOT_NAME,
     CodexCLICancelled,
-    CodexCLIDiagnosticReady,
+    CodexCLISubmissionRejected,
     CodexCLIError,
     CodexCLISubmissionAccepted,
     CodexCLISession,
     CodexCLIToolBridge,
     CodexCLITurn,
 )
-from intentir.extraction.providers.provider import ProviderConfig, get_provider
+from intentir.extraction.providers.provider import get_provider
 from intentir.verify.scrc_runner import CandidateLiftError
-from minisweagent.config.intentir_schema_query import schema_sections
-
 from .miniswe import MiniSWELiftAdapter, _input_files, _trajectory_bytes
 from .compiler_observation import (
     SOURCE_TTIR_RECONCILE_PROTOCOL,
-    observe_anonymous_source_ttir,
     reconcile_candidate_source_ttir,
 )
 from .scrc import (
@@ -42,12 +38,17 @@ from .scrc import (
     SourceIdentifierPrivacyError,
     check_scrc_lift_candidate,
     decode_scrc_lift_artifact,
+    _construct_scrc_candidate,
+    _source_ttir_observation_for_request,
     prepare_scrc_lift,
+    scrc_candidate_delta_receipt,
     scrc_candidate_check_context,
+)
+from .scrc_schema import (
+    canonical_wire_bundle,
 )
 CODEX_CLI_LIFT_BACKEND = "openai.codex-cli.intentir-lift.v41"
 CODEX_CLI_LIFT_KNOWLEDGE = "intentir.lift-knowledge.v101"
-CODEX_CLI_TURN_TIMEOUT_SECONDS = 900.0
 
 _FEEDBACK_CATEGORY_NAMES = (
     "interface",
@@ -57,64 +58,35 @@ _FEEDBACK_CATEGORY_NAMES = (
     "reduction",
 )
 
-_INITIAL_PROMPT = """You are the sole source-aware IntentIR Lift owner for this branch.
-Work only under the isolated /workspace; input/ is immutable and output/, work/,
-and tmp/ are writable. There is no repository or network.
+_INITIAL_PROMPT = """Own one fresh isolated IntentIR Lift in /workspace. Input is
+immutable; `output/candidate.json` is the only submission. Read the semantic
+authoring entry and anonymous Source first; query one exact missing operation contract
+only when the entry requires it.
 
-Act like a coding agent, not a staged JSON generator. Start with the one compact
-`source-brief` command in input/README.md, then read input/source.py. The brief includes
-the complete compact Harness ABI ledger and exact Source/compiler navigation; you
-decide all meaning. Query an exact compiler-observer section or TTIR slice only when
-the current draft needs it. When Source or the brief exposes a fused operation or
-explicit numeric extension/truncation, its focused TTIR query is mandatory before
-authoring that typed numeric subgraph; never guess fused operand width from surface
-operand declarations. Query schema leaves, operation contracts and ownership
-terms through `python .agents/intentir_agent_tool.py lift_reference ...`; complete
-references are deliberately not mounted as readable workspace files. Do not dump
-input/source_ttir.json or broad reference material into the thread.
+Submit one JSON semantic candidate, never prose or a completed artifact. Author only
+Source `t*`, local `op*/r*/dim*/access*`, semantic ops/attrs/types/SSA, boundary
+access/predicate/fill meaning, structured control, and ordered output `{value}`.
+`access_ref` names one local `accessN`. Schema, C, ABI, canonical handles, attachments,
+returns, bounds, and pi are host-owned.
 
-You alone author the complete output/candidate.json. J owns all logical semantics;
-C owns only implementation choices; pi is only the typed Gate1 normalization
-witness in the supplied schema. It has no realization graph. Author only closed direct
-program/iteration/control/materialization/access-representation relations bound to
-existing J axes, values, accesses and C slots. Query `realization-ledger` and the exact
-pi schema leaves when needed; never copy a physical Source SSA id or target recipe into
-pi. A relation whose fixed unary recognizer cannot prove remains hard.
-Fixed code must not choose or fill any field, handle, relation, operation, or shape.
-Preserve anonymous ABI order, parametric shape identities, logical control/time and
-effects in J. Use dense declaration-ordered opaque handles and never copy Source
-identifiers into the artifact.
+The transfer ledger is the occurrence authority: retain every proven load/store,
+predicate, and fill; do not invent capacity iota or gather semantics. Never emit
+canonical `n*/v*/x*/p*/c*/a*/e*`, C/ABI rows, returns, or pi bindings. CandidateCheck
+and SourceReconcile fail closed. Every attempt starts from the semantic entry; prior
+candidates and rejected drafts are never templates. Submit once, then never claim Replay
+or Gate success."""
 
-Every inout tensor requires explicit pre-state access/effect, post-state access/effect,
-and output_mapping. A static affine inout store is owned by that boundary access/effect
-and an identity output mapping; do not invent semantic scatter/update nodes merely to
-rebuild the full tensor. Use scatter only for a data-dependent J index whose closed
-index/source shapes agree at the data rank. Treat the Harness grid as fixed U_f: do not
-move a logical program coordinate to an absent launch axis. Preserve J access multiplicity; address recompute
-relations may change pointer construction but never tensor, logical index, mask, value,
-or effect. After J accesses exist, compare the ordered raw memory ledger with
-`candidate-attachments`: when tensor root, transfer kind, ordinal, logical index,
-predicate, and effect give a unique one-to-one correspondence, author the closed
-`address_recomputed` row for that access instead of forcing one pointer spelling.
 
-If output/candidate.json already exists, it is the exact preceding model-authored
-candidate: read input/feedback_frontier.json and input/feedback_detail.json first, then
-inspect and patch that candidate rather than recreating it. Otherwise write one meaningful
-complete candidate early. Do not postpone authoring until after exhaustive reading. As
-soon as the first complete JSON exists, run
-`python .agents/intentir_agent_tool.py submit_candidate` before manual rereading or
-broad TTIR/schema inspection. Let its closed diagnostics drive focused patches.
-Organize scratch under work/ however useful. The final J/C/pi and every semantic
-field remain entirely your work. This transaction first runs the source-free CandidateCheck and then the
-reject-only necessary-condition SourceReconcile on the same exact bytes. Repair the returned diagnostics
-and invoke it again. The host then runs the public Source-vs-J semantic probe on
-those exact passing bytes and returns a same-thread diagnostic if they diverge.
-That probe never certifies or edits the candidate: repair only when the evidence
-shows your J is wrong, rerun submit_candidate, and leave small floating deltas or
-unsupported execution as diagnostics. The host independently reruns Decode and
-TypeCheck, then starts fresh source-blind Replay and the formal gates. Do not claim
-certification.
-"""
+def _canonical_authoring_prompt() -> str:
+    """Return the compact instruction; mounted schema entry is the only wire.
+
+    The CLI adapter is an optional transport, not a second provider-facing
+    contract.  Its workspace already mounts the schema-derived semantic entry,
+    so pasting the skeleton and operation namespace into every provider prompt
+    only duplicates bytes and lets the two render paths drift.
+    """
+
+    return _INITIAL_PROMPT
 
 
 def _observer_diff_from_diagnostics(
@@ -139,8 +111,9 @@ def _codex_feedback_files(feedback_text: str) -> dict[str, str]:
     """Partition exact closed feedback without exposing one bulk relift object.
 
     Category names already belong to the Gate1 diagnostic protocol.  This only
-    separates bytes by that existing label and removes the duplicate previous
-    artifact, which the persistent owner already has in output/candidate.json.
+    separates bytes by that existing label and removes previous-artifact and
+    repair-base compatibility fields. Fresh attempts never mount either one;
+    this detail file must never become a candidate authority.
     """
 
     feedback = json.loads(feedback_text)
@@ -168,7 +141,11 @@ def _codex_feedback_files(feedback_text: str) -> dict[str, str]:
         detail = {
             str(key): value
             for key, value in feedback.items()
-            if key not in {"previous_artifact", "diagnostics"}
+            if key not in {
+                "previous_artifact",
+                "repair_base",
+                "diagnostics",
+            }
         }
         diagnostics = feedback.get("diagnostics")
         if isinstance(diagnostics, Mapping):
@@ -222,10 +199,60 @@ def _codex_feedback_files(feedback_text: str) -> dict[str, str]:
 
 
 
+def _codex_frontend_guidance(frontend: str | None, source_kind: str) -> str:
+    """Describe the selected branch's own source/compiler observer."""
+
+    selected = str(frontend or "triton").casefold()
+    if selected == "triton":
+        return (
+            "This is the Triton/TTIR branch. When an exact source observer is "
+            "mounted, use source-observer and focused source-ttir queries; do "
+            "not load the complete observer into the conversation."
+        )
+    if selected == "cuda":
+        return (
+            "This is the native CUDA C++ branch. Use the selected CUDA source, "
+            "harness-abi, source-outline, source-find, and CUDA compiler facts. "
+            "source_ttir.json is not applicable and must not be queried."
+        )
+    if selected == "cute":
+        return (
+            "This is the independent CuTe branch. Use the CuTe source and its "
+            "MLIR/PTX compiler evidence supplied by the CuTe path. Triton TTIR "
+            "queries are not applicable."
+        )
+    if selected == "tilelang":
+        return (
+            "This is the independent TileLang branch. Use the TileLang Python/TIR "
+            "source, harness-abi, source-outline, source-find, and TileLang "
+            "compiler facts. Triton TTIR queries are not applicable."
+        )
+    return (
+        f"This is the {selected} frontend branch with source_kind={source_kind}. "
+        "Use only its selected source/compiler evidence; do not assume Triton TTIR."
+    )
+
+
+def _codex_frontend_prompt(
+    base: str,
+    *,
+    frontend: str | None,
+    source_kind: str,
+) -> str:
+    return (
+        base
+        + "\n\n<frontend-branch-guidance>\n"
+        + _codex_frontend_guidance(frontend, source_kind)
+        + "\n</frontend-branch-guidance>"
+    )
+
+
 def _codex_input_files(
     request: Any,
     *,
     source_ttir_observation: Mapping[str, Any] | None,
+    frontend: str | None = None,
+    source_kind: str | None = None,
 ) -> tuple[dict[str, str], dict[str, str]]:
     """Build a small ordinary coding workspace for the source-aware owner."""
 
@@ -233,293 +260,156 @@ def _codex_input_files(
         request,
         source_ttir_observation=source_ttir_observation,
     )
+    packet = json.loads(request.user_input)
+    selected_frontend = str(
+        frontend or packet.get("frontend") or "triton"
+    ).casefold()
+    selected_source_kind = str(
+        source_kind or packet.get("source_kind") or "python"
+    )
+    branch_guidance = _codex_frontend_guidance(
+        selected_frontend,
+        selected_source_kind,
+    )
+    semantic_entry = packet.get("semantic_authoring_entry")
+    if not isinstance(semantic_entry, Mapping):
+        raise TypeError("Codex Lift request lacks canonical semantic authoring entry")
+    observer_instructions = (
+        "For an exact Triton compiler fact, use source-observer, "
+        "source-ttir-outline, source-ttir-find, or source-ttir-def-use."
+        if selected_frontend == "triton"
+        else "For an exact branch compiler fact, use source-outline, source-find, "
+        "harness, or harness-abi; do not use Triton source-ttir commands."
+    )
+    realization_instructions = (
+        "Use Source/compiler observations only as read-only evidence for semantic "
+        "operations and accesses; the host derives all C ownership and pi bindings."
+    )
     files = {
         "source.py": complete["source.py"],
-        "harness_view.json": complete["harness_view.json"],
+        "semantic_authoring_entry.json": (
+            json.dumps(
+                dict(semantic_entry),
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            + "\n"
+        ),
         "feedback_frontier.json": complete["feedback_frontier.json"],
         "README.md": (
             "# IntentIR Lift workspace\n\n"
-            "J owns logical semantics, C only implementation choices, and pi only "
-            "contains closed direct normalization relations bound to J/C. "
-            "You author every "
-            "semantic field; fixed code only projects evidence, checks, and rejects.\n\n"
-            "Start once with:\n"
-            "`python input/tools/context_query.py --input-root input --output-root output source-brief`\n\n"
-            "If that brief reports any compiler.sensitive_numeric_index operation, "
-            "query each exact operation in Source TTIR before authoring the typed "
-            "arithmetic graph; fused-operation operand promotion and cast placement "
-            "must not be guessed from Source surface operand dtypes.\n\n"
-            "Then read `input/source.py`. For an exact compiler fact, use the same tool "
-            "with `source-observer --path fingerprint.NAME`, `source-ttir-outline`, "
-            "`source-ttir-find`, or `source-ttir-def-use`. For wire syntax, use:\n"
-            "`python .agents/intentir_agent_tool.py lift_reference authoring-brief`\n"
-            "Then request only `section NAME`, `op NAME`, or `contract TERM` needed by "
-            "the current draft. Complete references are not readable files.\n\n"
-            "After J/C exists, run `python input/tools/context_query.py --input-root input "
-            "--output-root output realization-ledger` and `candidate-attachments` before "
-            "authoring pi. These are read-only raw facts and never choose a relation.\n\n"
-            "Use `lift_reference contract TERM` only when ownership is unclear. Write "
-            "`output/candidate.json` early and patch it in "
-            "place. Run `python .agents/intentir_agent_tool.py submit_candidate`; the "
-            "host supplies the public semantic probe after a mechanically passing draft.\n"
+            "`semantic_authoring_entry.json` is the sole schema-derived semantic and "
+            "Source-transfer navigation. Author unresolved J only; host rebuilds C/pi "
+            "before fail-closed validation.\n\n"
+            "For a `compiler.sensitive_numeric_index`, query exact selected-frontend "
+            "evidence before typed arithmetic; never guess promotion or casts.\n\n"
+            "Read `input/source.py` and `input/semantic_authoring_entry.json`. "
+            + observer_instructions
+            + " For a missing operation contract, use exactly:\n"
+            "`python .agents/intentir_agent_tool.py lift_reference op NAME`\n"
+            "The entry is the sole semantic wire; do not request final-artifact "
+            "sections or ownership prose.\n\n"
+            + realization_instructions
+            + " These facts never choose a relation.\n\n"
+            + branch_guidance
+            + "\n\n"
+            + "Write `output/candidate.json`, then run "
+            "`python .agents/intentir_agent_tool.py submit_candidate`. The host exposes "
+            "a public probe only after mechanical acceptance.\n"
         ),
-        "tools/context_query.py": complete["tools/context_query.py"],
-        "candidate_check.json": "null\n",
-        "source_reconcile.json": "null\n",
-        "semantic_probe.json": "null\n",
     }
     files.update(_codex_feedback_files(complete["feedback.json"]))
     if "source_ttir.json" in complete:
-        files["source_ttir.json"] = complete["source_ttir.json"]
-    references = {
-        "schema": complete["schema/artifact.schema.json"],
-        "contract": complete["knowledge/lift_contract.md"],
-        "operations": complete["knowledge/intent_ops.md"],
-        "preflight": complete["knowledge/preflight.md"],
-    }
-    return files, references
-
-
-_REFERENCE_OP_HEADING = re.compile(r"^  ([a-z][a-z0-9_]*)\s*:")
-
-
-def _reference_operation_sections(reference: str) -> dict[str, str]:
-    lines = reference.splitlines()
-    starts: list[tuple[int, str]] = []
-    for index, line in enumerate(lines):
-        match = _REFERENCE_OP_HEADING.match(line)
-        if match:
-            starts.append((index, match.group(1)))
-    return {
-        name: "\n".join(
-            lines[
-                start : (
-                    starts[position + 1][0]
-                    if position + 1 < len(starts)
-                    else len(lines)
-                )
-            ]
-        ).rstrip()
-        for position, (start, name) in enumerate(starts)
-    }
+        # The host observation carries canonical SourceFacts solely so the
+        # post-submission reconciler can prove its own lineage.  That record
+        # contains host allocator/ABI material and is not compiler evidence
+        # the semantic provider may author against.  Mount only the selected
+        # frontend facts used to understand Source operations.
+        raw_observation = json.loads(complete["source_ttir.json"])
+        if not isinstance(raw_observation, Mapping):
+            raise TypeError("Source TTIR observation must be an object")
+        provider_observation_fields = (
+            "protocol",
+            "authority",
+            "function",
+            "status",
+            "diagnostic",
+            "ttir",
+            "source_runtime_parameter_uses",
+            "python_interface",
+            "compiler",
+            "target",
+            "elapsed_ms",
+            "cache_hit",
+        )
+        provider_observation = {
+            key: raw_observation[key]
+            for key in provider_observation_fields
+            if key in raw_observation
+        }
+        files["source_ttir.json"] = (
+            json.dumps(
+                provider_observation,
+                indent=2,
+                sort_keys=True,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        )
+    return files, {}
 
 
 def _lift_reference_query(
-    references: Mapping[str, str], arguments: tuple[str, ...]
+    references: Mapping[str, str],
+    arguments: tuple[str, ...],
+    *,
+    frontend: str | None = "triton",
 ) -> Mapping[str, Any]:
-    """Return one bounded exact reference fragment without mounting bulk files."""
+    """Return one semantic operation leaf from the canonical wire authority."""
 
-    if not arguments:
-        raise ValueError(
-            "lift_reference requires authoring-brief, section NAME, op NAME, or contract TERM"
-        )
-    schema = json.loads(references["schema"])
-    if not isinstance(schema, Mapping):
-        raise TypeError("Lift schema root must be an object")
-    sections = schema_sections(dict(schema))
-    root_properties = schema["properties"]
-    j_schema = root_properties["j"]
-    j_properties = j_schema["properties"]
-    intent_schema = j_properties["intent"]
-    intent_properties = intent_schema["properties"]
-    intent_function_schema = intent_properties["intent_function"]
-    boundary_schema = j_properties["boundary"]
-    signature_schema = j_properties["signature"]
-    c_schema = root_properties["c"]
-    pi_schema = root_properties["pi"]
-    sections.update(
-        {
-            "node_ids": j_properties["node_ids"],
-            "dimension_constraint": j_properties["dimension_constraints"]["items"],
-        }
-    )
-    operations = _reference_operation_sections(references["operations"])
-    command = arguments[0]
-    result: Any
-    if command == "authoring-brief" and len(arguments) == 1:
-        def object_shape(value: Mapping[str, Any]) -> dict[str, Any]:
-            return {
-                "required": value.get("required", []),
-                "fields": list(value.get("properties", {})),
-            }
-
-        result = {
-            "object_shapes": {
-                "root": object_shape(schema),
-                "j": object_shape(j_schema),
-                "j.intent": object_shape(intent_schema),
-                "j.intent.intent_function": object_shape(intent_function_schema),
-                "j.boundary": object_shape(boundary_schema),
-                "j.signature": object_shape(signature_schema),
-                "c": object_shape(c_schema),
-                "pi": object_shape(pi_schema),
-            },
-            "closed_field_schemas": {
-                "root.schema": root_properties["schema"],
-                "j.kernel_id": j_properties["kernel_id"],
-                "j.node_ids": j_properties["node_ids"],
-                "pi.schema": pi_schema["properties"]["schema"],
-            },
-            "sections": sorted(sections),
-            "ordinary_operations": sorted(operations),
-            "structured_operations": ["loop", "effect_if", "value_if"],
-            "mandatory_numeric_authoring": [
-                "Treat Source-TTIR math.fma as one typed fused event. Query its exact "
-                "def-use and operand/result types before decomposing it into available J ops.",
-                "When J has no scalar fma op, explicit cast nodes must reproduce the "
-                "observed fused operand width before the primary mul; do not infer that "
-                "mul width from the unfused source operand dtypes.",
-                "Keep a separately computed addend producer at its observed dtype and "
-                "placement before its conversion into the fused event.",
-                "If the fused addend is one direct negation or zero-minus value, author "
-                "the final J arithmetic as sub(primary_product, positive_value), not "
-                "const-zero + neg + add. This is the canonical direct fma expansion.",
-                "Keep iota/index arithmetic at the exact Source-TTIR integer width. "
-                "Never widen logical indices merely because an unrelated ABI stride "
-                "carrier or pointer representation uses i64.",
-            ],
-        }
-    elif command == "section" and len(arguments) == 2:
-        name = arguments[1]
-        if name not in sections:
-            raise ValueError(f"unknown schema section {name!r}; choose {sorted(sections)}")
-        result = sections[name]
-    elif command == "op" and len(arguments) == 2:
-        name = arguments[1]
-        if name in {"loop", "effect_if", "value_if"}:
-            variants = schema["$defs"]["intent_op"]["anyOf"]
-            result = next(
-                variant
-                for variant in variants
-                if name in variant.get("properties", {}).get("op", {}).get("enum", [])
-            )
-        elif name in operations:
-            result = operations[name]
-        else:
-            raise ValueError(f"unknown Intent operation {name!r}")
-    elif command == "contract" and len(arguments) >= 2:
-        needle = " ".join(arguments[1:]).casefold()
-        matches: list[dict[str, Any]] = []
-        for label in ("contract", "preflight"):
-            lines = references[label].splitlines()
-            for index, line in enumerate(lines):
-                if needle not in line.casefold():
-                    continue
-                start = max(0, index - 3)
-                end = min(len(lines), index + 4)
-                matches.append(
-                    {
-                        "source": label,
-                        "line_start": start + 1,
-                        "text": "\n".join(lines[start:end]),
-                    }
-                )
-                if len(matches) >= 8:
-                    break
-            if len(matches) >= 8:
-                break
-        result = matches
-    else:
-        raise ValueError(
-            "lift_reference accepts authoring-brief, section NAME, op NAME, or contract TERM"
-        )
-    encoded = json.dumps(result, ensure_ascii=False, sort_keys=True)
-    if len(encoded) > 12_000:
-        raise ValueError("reference result exceeds 12000 characters; request a narrower item")
+    del references, frontend
+    if len(arguments) != 2 or arguments[0] != "op":
+        raise ValueError("lift_reference requires exactly one semantic op NAME query")
+    operations = canonical_wire_bundle()["profile"][
+        "semantic_operation_contracts"
+    ]
+    name = arguments[1]
+    result = operations.get(name) if isinstance(operations, Mapping) else None
+    if not isinstance(result, Mapping):
+        raise ValueError(f"unknown semantic operation {name!r}")
     return {
         "status": "pass",
-        "query": list(arguments),
-        "result": result,
-        "authority": "exact source-neutral reference fragment; no J/C/pi field is generated",
+        "query": ["op", name],
+        "result": dict(result),
+        "authority": "canonical semantic provider operation contract",
     }
 
 
-_EXTERNAL_CONTINUATION_PROMPT = """The same branch-local source-aware Lift task continues in the same workspace and thread.
-Read input/feedback_frontier.json first. Open only a named
-input/feedback_category_NAME.json when its bounded frontier is insufficient; that
-file contains the exact differences for the named category.
-input/feedback_detail.json contains exact non-observer diagnostics. The previous
-artifact already exists at output/candidate.json and is never duplicated in input.
-After a formal Gate1 failure, only the bounded typed observer diff is returned.
-The preceding Replay source, Replay TTIR, agent context, and implementation choices
-remain hidden; repair J/C only when Source plus the typed frontier proves that the
-current artifact is incomplete. Otherwise resubmit the unchanged artifact for a fresh
-source-blind Replay.
-Your own prior formal candidates are immutable under work/candidate_history/;
-consult or restore them when a repair regresses, but decide every edit yourself.
-Treat the first exact missing/extra operation only as an entry point: inspect its
-typed Source-TTIR neighborhood and the bounded anonymous local frontier against the
-current J node and boundary. The frontier describes a mismatch but does not expose
-the Replay implementation that produced it. Preserve cast order and operation spelling when they are semantic. If J
-already states the complete logical fact but Replay failed to realize it, do not add a
-pi escape hatch; resubmit the unchanged artifact for a fresh source-blind Replay.
-If independent fresh Replays vary only in addptr/address topology while the Source raw
-memory ledger and current J access attachments have a unique tensor/kind/ordinal/index/
-predicate/effect correspondence, that is precisely the closed
-`access_representation_bindings.address_recomputed` case. Bind the existing accesses;
-do not edit J semantics or encode a Source pointer recipe in pi.
-Before editing local operations, check whether one omitted Source-visible loop,
-effect_if, early terminal branch, continuation, or effect region explains the
-downstream op/dataflow/predicate differences; if so, repair that complete J scope
-rather than its symptoms. Change pi only when Source evidence and an existing J/C
-anchor select one closed normalization relation; a row never licenses an arbitrary
-diff. Conversely, when
-the current J/B/C already authors the exact logical fact and Source-local boundary fact
-but the preceding Replay alone failed to consume it, do not mutate the artifact to
-imitate that Replay: resubmit the unchanged artifact for a fresh source-blind Replay.
-Use the compact source query only where the named feedback needs exact Source or
-compiler evidence, then revise the complete model-authored J/C/pi in place. If a
-named relation's ownership is unclear, query only that term through
-`python .agents/intentir_agent_tool.py lift_reference contract TERM`. Treat feedback as a compiler counterexample, not
-as a semantic patch. Run `python .agents/intentir_agent_tool.py submit_candidate`;
-the host automatically probes the exact passing J and returns any public divergence
-to this same thread. The host alone runs formal gates.
-"""
-
-_CANDIDATE_CHECK_CONTINUATION_PROMPT = """The host submission preflight rejected the current exact candidate bytes.
-Read input/candidate_check.json and repair output/candidate.json in this same
-thread. Make coordinated J/C/pi changes when required. Rerun
-`python .agents/intentir_agent_tool.py submit_candidate` and finish immediately
-after the complete candidate passes. Query a rejected relation's exact field name with
-`lift_reference contract TERM` when its ownership is unclear. The transaction is diagnostic-only.
-"""
-
-_SOURCE_RECONCILE_CONTINUATION_PROMPT = """The source-aware necessary-condition preflight rejected the current exact candidate bytes.
-Read input/source_reconcile.json and revise only the model-authored J/C/pi facts whose
-closed obligations disagree with the immutable anonymous Source syntax or Source TTIR
-observation. A recurrence/control/mask presence diagnostic states only that the whole
-J-owned construct is absent: recover its complete trip/carries/body/control/predicate
-from Source yourself; the host has not supplied a formula or patch. Pi has no
-occurrence/route graph: correct only a closed direct relation bound to existing J/C
-handles, or revise J when your authorship was wrong. Never invent a source recipe or
-allowed diff.
-This diagnostic supplies no artifact field or repair. Rerun
-`python .agents/intentir_agent_tool.py submit_candidate` and finish immediately
-after it passes. Formal TypeCheck, Replay, and Gate1 remain external.
-"""
-
-_SEMANTIC_PROBE_CONTINUATION_PROMPT = """The current exact candidate passed CandidateCheck and SourceReconcile, and the host ran the public Source-vs-J semantic probe.
-Read input/semantic_probe.json in this same thread. It is diagnostic-only and does
-not accept, reject, certify, or edit J. If the observed divergence exposes an error
-in your authored J, patch output/candidate.json and rerun submit_candidate. An unavailable
-J reference construction/execution is a fixed-consumer capability diagnostic, not a J
-counterexample; leave the already checked candidate unchanged. If the remaining delta is
-only an expected floating reduction difference, also leave it unchanged and finish. Do
-not claim Gate membership.
-"""
-
-
-def _source_aware_startup_context(workspace: Any, *, fresh_owner: bool) -> dict[str, Any]:
+def _source_aware_startup_context(
+    workspace: Any,
+    *,
+    fresh_owner: bool,
+    frontend: str | None = "triton",
+    source_kind: str = "python",
+) -> dict[str, Any]:
     """Return a path-only receipt; exact task state stays in ordinary files."""
 
+    selected_frontend = str(frontend or "triton").casefold()
     return {
         "protocol": "intentir.codex-lift-startup-view.v2",
         "fresh_owner": fresh_owner,
+        "frontend": selected_frontend,
+        "source_kind": source_kind,
         "paths": {
             "source": "input/source.py",
-            "harness": "input/harness_view.json",
-            "source_observer": "input/source_ttir.json",
-            "source_query": "input/tools/context_query.py",
+            "semantic_authoring_entry": "input/semantic_authoring_entry.json",
+            "source_observer": (
+                "input/source_ttir.json"
+                if selected_frontend == "triton"
+                else None
+            ),
             "bounded_reference_query": (
                 "python .agents/intentir_agent_tool.py lift_reference"
             ),
@@ -529,15 +419,13 @@ def _source_aware_startup_context(workspace: Any, *, fresh_owner: bool) -> dict[
                 f"input/feedback_category_{name}.json"
                 for name in _FEEDBACK_CATEGORY_NAMES
             ],
-            "candidate_check": "input/candidate_check.json",
-            "source_reconcile": "input/source_reconcile.json",
-            "semantic_probe": "input/semantic_probe.json",
             "candidate": "output/candidate.json",
-            "candidate_history": "work/candidate_history/",
         },
         "authority": (
             "path manifest only; exact bytes remain in files and no artifact "
-            "field, semantic classification, or repair is generated"
+            "field, semantic classification, or repair is generated. The "
+            "semantic authoring entry and bounded operation query are the only "
+            "provider-visible wire authorities."
         ),
     }
 
@@ -558,22 +446,6 @@ def _atomic_write_text(path: Path, text: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def _atomic_write_json(path: Path, value: Mapping[str, Any] | None) -> None:
-    text = (
-        json.dumps(
-            value,
-            indent=2,
-            sort_keys=True,
-            ensure_ascii=False,
-            allow_nan=False,
-        )
-        + "\n"
-        if value is not None
-        else "null\n"
-    )
-    _atomic_write_text(path, text)
-
-
 def _aggregate_usage(turns: list[CodexCLITurn]) -> dict[str, int]:
     totals: dict[str, int] = {}
     for turn in turns:
@@ -585,43 +457,51 @@ def _aggregate_usage(turns: list[CodexCLITurn]) -> dict[str, int]:
 
 @dataclass
 class CodexCLILiftAdapter(MiniSWELiftAdapter):
-    """Persistent source-aware Codex owner across formal Gate1 continuations."""
+    """Run one isolated source-aware Codex owner per Lift invocation."""
 
     session_factory: Callable[..., Any] = field(
         default=CodexCLISession,
         repr=False,
     )
-    repair_effort: str | None = None
     semantic_probe: Callable[[Any], Mapping[str, Any]] | None = field(
         default=None,
         repr=False,
     )
     _codex_session: Any = field(default=None, init=False, repr=False)
-    _source_ttir_observation: dict[str, Any] | None = field(
-        default=None, init=False, repr=False
-    )
+    _invocation_active_elapsed_ms: float = field(default=0.0, init=False)
+    _invocation_cli_turns: int = field(default=0, init=False)
+    _invocation_model_segments: int = field(default=0, init=False)
 
     def close(self) -> None:
         session = self._codex_session
         self._codex_session = None
         if session is not None:
             session.close()
-        self._source_ttir_observation = None
+        self._invocation_active_elapsed_ms = 0.0
+        self._invocation_cli_turns = 0
+        self._invocation_model_segments = 0
         super().close()
 
-    def _remaining_seconds(self) -> float:
-        if self.session_wall_time_limit_seconds <= 0:
-            raise ValueError("Lift owner session wall-time limit must be positive")
-        return self.session_wall_time_limit_seconds - (
-            self._session_active_elapsed_ms / 1000.0
-        )
+    def _remaining_seconds(self) -> float | None:
+        limit = self.session_wall_time_limit_seconds
+        if limit is None:
+            return None
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, (int, float))
+            or limit <= 0
+        ):
+            raise ValueError(
+                "Lift owner session wall-time limit must be None or positive"
+            )
+        return float(limit) - (self._invocation_active_elapsed_ms / 1000.0)
 
     def _terminal_time_error(self, round_index: int) -> Exception:
         diagnostic = {
             "diagnostic": "branch-local Codex Lift owner wall-time exhausted",
             "failure_class": "lift_owner_time_exhausted",
             "session_id": self._session_id,
-            "active_elapsed_ms": self._session_active_elapsed_ms,
+            "active_elapsed_ms": self._invocation_active_elapsed_ms,
         }
         self._records.append(
             SCRCReliftRecord(
@@ -632,13 +512,8 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     "runtime": CODEX_CLI_AGENT_RUNTIME,
                     "owner_session_id": self._session_id,
                     "thread_id": getattr(self._codex_session, "thread_id", None),
-                    "session_active_elapsed_ms": self._session_active_elapsed_ms,
+                    "owner_active_elapsed_ms": self._invocation_active_elapsed_ms,
                 },
-                continuation_candidate=(
-                    self._read_continuation_candidate(self._session_workspace)
-                    if self._session_workspace is not None
-                    else None
-                ),
             )
         )
         return CandidateLiftError(
@@ -661,45 +536,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             ],
         }
 
-    @staticmethod
-    def _archive_formal_candidate(workspace: Any, feedback: Any) -> None:
-        """Preserve this owner's exact formal candidates without selecting one."""
-
-        formal_round = getattr(feedback, "formal_round", None)
-        artifact = getattr(feedback, "previous_artifact", None)
-        kind = getattr(getattr(feedback, "kind", None), "value", None)
-        if (
-            kind != "gate1"
-            or not isinstance(formal_round, int)
-            or isinstance(formal_round, bool)
-            or formal_round < 1
-            or artifact is None
-        ):
-            return
-        payload = getattr(artifact, "to_json", None)
-        if not callable(payload):
-            return
-        encoded = (
-            json.dumps(
-                payload(),
-                indent=2,
-                sort_keys=True,
-                ensure_ascii=False,
-                allow_nan=False,
-            )
-            + "\n"
-        )
-        history_dir = workspace.scratch_dir / "candidate_history"
-        history_dir.mkdir(parents=True, exist_ok=True)
-        destination = history_dir / f"gate1_round_{formal_round:03d}.json"
-        if destination.exists():
-            if destination.read_text(encoding="utf-8") != encoded:
-                raise ValueError(
-                    "branch-local formal candidate history changed for one round"
-                )
-            return
-        _atomic_write_text(destination, encoded)
-
     def lift(self, request: Any, feedback: Any) -> Any:
         if self.workflow != "single":
             raise ValueError("Codex CLI Lift supports only the single-owner workflow")
@@ -707,51 +543,72 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
         source = getattr(source_program, "text", None)
         if not isinstance(source, str) or not source:
             raise TypeError("Codex CLI Lift requires SourceProgram.text")
-        source_sha256 = hashlib.sha256(source.encode()).hexdigest()
-        if self._session_source_sha256 is None:
-            self._session_source_sha256 = source_sha256
-        elif self._session_source_sha256 != source_sha256:
-            raise ValueError("one Codex Lift owner cannot cross Source programs")
+        # Close the previous CLI thread and disposable workspace before
+        # constructing this invocation, just as the Responses/MiniSWE path
+        # does. The fresh worker receives only compressed rule-level guidance.
+        self._begin_fresh_agent_invocation()
 
         provider = self.provider or get_provider()
         effective_effort = self.effort or provider.reasoning_effort
+        relift_context = self._relift_context(feedback)
         prepared = prepare_scrc_lift(
             source,
             compiler_view=self.compiler_view,
-            relift_context=self._relift_context(feedback),
-            source_symbol=self.source_symbol,
+            relift_context=relift_context,
+            source_symbol=getattr(
+                source_program, "lift_source_symbol", self.source_symbol
+            ),
+            source_kind=getattr(
+                source_program, "lift_source_kind", self.source_kind
+            ),
+            source_parameter_order=tuple(
+                getattr(
+                    source_program,
+                    "lift_parameter_order",
+                    self.source_parameter_order,
+                )
+            ),
+            source_to_opaque=(
+                dict(
+                    getattr(
+                        source_program,
+                        "lift_source_to_opaque",
+                        self.source_to_opaque,
+                    )
+                )
+                if getattr(
+                    source_program,
+                    "lift_source_to_opaque",
+                    self.source_to_opaque,
+                ) is not None
+                else None
+            ),
+            frontend=getattr(request, "frontend", "triton"),
+            source_facts=getattr(request, "source_facts", None),
+            construction=getattr(request, "construction", None),
         )
         candidate_check_context = scrc_candidate_check_context(prepared)
         round_index = len(self._records) + 1
-        if self._source_ttir_observation is None:
-            prepared_packet = json.loads(prepared.user_input)
-            anonymous_source = prepared_packet.get("anonymous_source")
-            anonymous_view = prepared_packet.get("harness_compiler_view")
-            self._source_ttir_observation = observe_anonymous_source_ttir(
-                anonymous_source,
-                anonymous_view,
-            )
+        prepared_packet = json.loads(prepared.user_input)
+        selected_frontend = str(
+            getattr(request, "frontend", None)
+            or prepared_packet.get("frontend")
+            or "triton"
+        ).casefold()
+        selected_source_kind = str(
+            prepared_packet.get("source_kind", "python")
+        )
+        source_ttir_observation: dict[str, Any] | None = None
+        if selected_frontend == "triton":
+            source_ttir_observation = _source_ttir_observation_for_request(prepared)
         files, references = _codex_input_files(
             prepared,
-            source_ttir_observation=self._source_ttir_observation,
+            source_ttir_observation=source_ttir_observation,
+            frontend=selected_frontend,
+            source_kind=selected_source_kind,
         )
         try:
-            fresh_workspace = self._create_or_refresh_session_workspace(
-                files,
-                mutable_paths=frozenset(
-                    {
-                        "feedback_frontier.json",
-                        "feedback_detail.json",
-                        *{
-                            f"feedback_category_{name}.json"
-                            for name in _FEEDBACK_CATEGORY_NAMES
-                        },
-                        "candidate_check.json",
-                        "source_reconcile.json",
-                        "semantic_probe.json",
-                    }
-                ),
-            )
+            fresh_workspace = self._create_session_workspace(files)
         except ImportError as exc:
             from intentir.verify.scrc_runner import SCRCInfrastructureError
 
@@ -762,32 +619,16 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
         workspace = self._session_workspace
         if workspace is None:
             raise RuntimeError("Codex Lift workspace was not created")
-        self._archive_formal_candidate(workspace, feedback)
+        candidate_path = workspace.candidate_path
+        if candidate_path.exists():
+            candidate_path.unlink()
         fresh_owner = self._codex_session is None
-        previous_artifact = getattr(feedback, "previous_artifact", None)
-        candidate_path = workspace.output_dir / "candidate.json"
-        if fresh_owner and previous_artifact is not None and not candidate_path.exists():
-            # Cross-process continuation still starts a fresh isolated coding
-            # session, but it must not force the model to reserialize the last
-            # complete artifact from prose.  This is an exact copy of the prior
-            # model-authored candidate; fixed code neither edits nor completes it.
-            _atomic_write_text(
-                candidate_path,
-                json.dumps(
-                    previous_artifact.to_json(),
-                    indent=2,
-                    sort_keys=True,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-                + "\n",
-            )
         call_turns: list[CodexCLITurn] = []
         check_results: list[dict[str, Any]] = []
         source_reconcile_results: list[dict[str, Any]] = []
+        deterministic_repairs: list[dict[str, Any]] = []
         semantic_probe_results: list[dict[str, Any]] = []
         semantic_probe_by_candidate: dict[str, dict[str, Any]] = {}
-        semantic_probe_feedback_delivered: set[str] = set()
         timeout_events: list[dict[str, Any]] = []
         accepted_submission_interrupts: list[dict[str, Any]] = []
         diagnostic_ready_interrupts: list[dict[str, Any]] = []
@@ -808,6 +649,92 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             {initial_candidate} if initial_candidate is not None else set()
         )
 
+        def safe_check_receipt(value: Mapping[str, Any] | None) -> dict[str, Any] | None:
+            if not isinstance(value, Mapping):
+                return None
+            diagnostics: list[dict[str, str]] = []
+            raw_diagnostics = value.get("diagnostics")
+            if isinstance(raw_diagnostics, list):
+                for raw in raw_diagnostics[:20]:
+                    if not isinstance(raw, Mapping):
+                        continue
+                    rule_code = raw.get("rule_code")
+                    path = raw.get("path")
+                    if isinstance(rule_code, str) and isinstance(path, str):
+                        diagnostics.append(
+                            {
+                                "rule_code": rule_code[:2048],
+                                "path": path[:2048],
+                            }
+                        )
+            receipt: dict[str, Any] = {
+                "status": value.get("status"),
+                "diagnostics": diagnostics,
+            }
+            protocol = value.get("protocol")
+            if isinstance(protocol, str):
+                receipt["protocol"] = protocol
+            applicable = value.get("applicable")
+            if isinstance(applicable, bool):
+                receipt["applicable"] = applicable
+            return receipt
+
+        def current_candidate_delta() -> dict[str, Any] | None:
+            if candidate_text is None:
+                return None
+            try:
+                payload = json.loads(candidate_text)
+            except (TypeError, ValueError, RecursionError):
+                return None
+            return scrc_candidate_delta_receipt(
+                payload if isinstance(payload, Mapping) else None
+            )
+
+        def reject_current_candidate(
+            *,
+            failure_class: str,
+            candidate_check: Mapping[str, Any] | None,
+            source_reconcile: Mapping[str, Any] | None,
+            semantic_probe_result: Mapping[str, Any] | None = None,
+        ) -> None:
+            diagnostics: dict[str, Any] = {
+                "diagnostic": failure_class,
+                "failure_class": failure_class,
+                "candidate_present": candidate_text is not None,
+            }
+            safe_candidate_check = safe_check_receipt(candidate_check)
+            safe_source_reconcile = safe_check_receipt(source_reconcile)
+            if safe_candidate_check is not None:
+                diagnostics["candidate_check"] = safe_candidate_check
+            if safe_source_reconcile is not None:
+                diagnostics["source_reconcile"] = safe_source_reconcile
+            if isinstance(semantic_probe_result, Mapping):
+                diagnostics["semantic_probe"] = {
+                    key: semantic_probe_result[key]
+                    for key in ("protocol", "status", "repairable")
+                    if isinstance(semantic_probe_result.get(key), (str, bool))
+                }
+            evidence = {
+                "backend": CODEX_CLI_LIFT_BACKEND,
+                "runtime": CODEX_CLI_AGENT_RUNTIME,
+                "owner_session_id": self._session_id,
+                "fresh_session": True,
+                "candidate_check": safe_candidate_check,
+                "source_reconcile": safe_source_reconcile,
+            }
+            self._records.append(
+                SCRCReliftRecord(
+                    round_index,
+                    diagnostic=failure_class,
+                    backend_evidence=evidence,
+                )
+            )
+            raise CandidateLiftError(
+                diagnostics,
+                physical_calls=self._invocation_model_segments,
+                candidate_delta=current_candidate_delta(),
+            )
+
         def check_current_candidate(*, trigger: str) -> dict[str, Any]:
             nonlocal candidate_text
             try:
@@ -818,32 +745,67 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     f"{type(exc).__name__}: {exc}"
                 )
             else:
-                check = check_scrc_lift_candidate(
-                    candidate_text,
-                    candidate_check_context,
-                )
-                if check["status"] == "pass":
-                    try:
-                        # CandidateCheck intentionally remains source-free.  The
-                        # adjacent submission boundary additionally enforces
-                        # anonymity before a passing draft may leave this owner.
-                        decode_scrc_lift_artifact(candidate_text, prepared)
-                    except SourceIdentifierPrivacyError as exc:
-                        check = {
-                            "protocol": CANDIDATE_CHECK_PROTOCOL,
-                            "status": "fail",
-                            "diagnostics": [
-                                {
-                                    "rule_code": "source_identifier_privacy",
-                                    "path": exc.path,
-                                    "observed_refs_or_types": [
-                                        "replace this free-form Source spelling "
-                                        "with the correct anonymous handle or a "
-                                        "source-neutral closed protocol value"
-                                    ],
-                                }
-                            ],
-                        }
+                try:
+                    constructed_text, repairs = _construct_scrc_candidate(
+                        candidate_text,
+                        prepared,
+                        observation=source_ttir_observation,
+                        relift_context=relift_context,
+                    )
+                except Exception as exc:
+                    constructed_text = candidate_text
+                    repairs = ()
+                    check = {
+                        "protocol": CANDIDATE_CHECK_PROTOCOL,
+                        "status": "fail",
+                        "diagnostics": [
+                            {
+                                "rule_code": "candidate_repair_failed",
+                                "path": "<candidate>",
+                                "observed_refs_or_types": [
+                                    f"{type(exc).__name__}: {exc}"
+                                ],
+                            }
+                        ],
+                    }
+                else:
+                    if constructed_text != candidate_text:
+                        _atomic_write_text(workspace.candidate_path, constructed_text)
+                        candidate_text = workspace.read_candidate()
+                        if candidate_text != constructed_text:
+                            raise RuntimeError(
+                                "candidate changed while deterministic repair was "
+                                "being committed"
+                            )
+                    deterministic_repairs.extend(
+                        dict(item) for item in repairs if isinstance(item, Mapping)
+                    )
+                    check = check_scrc_lift_candidate(
+                        candidate_text,
+                        candidate_check_context,
+                    )
+                    if check["status"] == "pass":
+                        try:
+                            # CandidateCheck remains source-free.  This adjacent
+                            # decode only enforces the privacy boundary over the
+                            # same exact bytes; it never rewrites the artifact.
+                            decode_scrc_lift_artifact(candidate_text, prepared)
+                        except SourceIdentifierPrivacyError as exc:
+                            check = {
+                                "protocol": CANDIDATE_CHECK_PROTOCOL,
+                                "status": "fail",
+                                "diagnostics": [
+                                    {
+                                        "rule_code": "source_identifier_privacy",
+                                        "path": exc.path,
+                                        "observed_refs_or_types": [
+                                            "replace this free-form Source spelling "
+                                            "with the correct anonymous handle or a "
+                                            "source-neutral closed protocol value"
+                                        ],
+                                    }
+                                ],
+                            }
             check_results.append(
                 {
                     "trigger": trigger,
@@ -883,14 +845,32 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                         ],
                     }
                 else:
-                    result = reconcile_candidate_source_ttir(
-                        candidate_text,
-                        self._source_ttir_observation,
+                    result = (
+                        reconcile_candidate_source_ttir(
+                            candidate_text,
+                            source_ttir_observation,
+                            construction=prepared.construction,
+                        )
+                        if source_ttir_observation is not None
+                        else {
+                            "status": "pass",
+                            "applicable": False,
+                            "diagnostics": [],
+                        }
                     )
             else:
-                result = reconcile_candidate_source_ttir(
-                    candidate_text,
-                    self._source_ttir_observation,
+                result = (
+                    reconcile_candidate_source_ttir(
+                        candidate_text,
+                        source_ttir_observation,
+                        construction=prepared.construction,
+                    )
+                    if source_ttir_observation is not None
+                    else {
+                        "status": "pass",
+                        "applicable": False,
+                        "diagnostics": [],
+                    }
                 )
             source_reconcile_results.append(
                 {
@@ -912,9 +892,9 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 and result["status"] == "pass"
                 and candidate_text is not None
             ):
-                # Exact LLM-authored bytes only.  This checkpoint has passed both
-                # source-free CandidateCheck (enforced by callers) and the
-                # source-aware reject-only occurrence preflight.
+                # Exact bytes currently in the candidate file.  They may include
+                # only the bounded deterministic ingress repairs recorded above;
+                # both checks below consume this same byte sequence.
                 last_checked_good = candidate_text
             return result
 
@@ -940,6 +920,11 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 )
                 if passed:
                     accepted_submission_event.set()
+                else:
+                    # The first rejected submission terminates this fresh
+                    # owner. It must not receive the rejected candidate back
+                    # as an editable repair base in another CLI turn.
+                    diagnostic_ready_event.set()
             return {
                 "protocol": "intentir.codex-cli.lift-submit.v1",
                 "status": "pass" if passed else "fail",
@@ -982,7 +967,7 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             formal-round candidate is ignored until the owner changes its bytes.
             """
 
-            nonlocal candidate_text, last_checked_good
+            nonlocal last_checked_good
             observed_candidate: str | None = None
             stable_since = 0.0
             while not live_checkpoint_stop.wait(0.25):
@@ -1037,22 +1022,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 if passed:
                     accepted_submission_event.set()
                     return
-                if checked_text == observed_text:
-                    if candidate_check["status"] != "pass":
-                        _atomic_write_json(
-                            workspace.input_dir / "candidate_check.json",
-                            candidate_check,
-                        )
-                    elif source_reconcile is not None:
-                        _atomic_write_json(
-                            workspace.input_dir / "source_reconcile.json",
-                            source_reconcile,
-                        )
-                    # A failing passive checkpoint must not split one coding-agent
-                    # tool loop into a new provider turn.  The owner receives the
-                    # same closed diagnostics synchronously through its explicit
-                    # ``submit_candidate`` tool and can patch/recheck in the current
-                    # turn.  Only a passing checkpoint may interrupt early.
 
         def semantic_probe_tool() -> Mapping[str, Any]:
             """Execute one public Source-vs-J diagnostic over exact candidate bytes."""
@@ -1101,33 +1070,32 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             semantic_probe_results.append(dict(result))
             if candidate_sha256 is not None:
                 semantic_probe_by_candidate[candidate_sha256] = dict(result)
-            _atomic_write_json(
-                workspace.input_dir / "semantic_probe.json",
-                result,
-            )
+            if (
+                result.get("status") == "diverged"
+                or result.get("repairable") is True
+            ):
+                diagnostic_ready_event.set()
             return result
 
-        def semantic_probe_needs_owner_turn() -> bool:
-            """Run one public probe per exact passing draft and surface divergence."""
+        def actionable_semantic_probe() -> Mapping[str, Any] | None:
+            """Return one Source/J rejection without reopening this owner."""
 
             if candidate_text is None:
-                return False
+                return None
             candidate_sha256 = hashlib.sha256(candidate_text.encode()).hexdigest()
             result = semantic_probe_by_candidate.get(candidate_sha256)
             if result is None:
                 result = dict(semantic_probe_tool())
-            # Only an executed Source-vs-J mismatch is a counterexample for the
-            # Lift owner.  RefJ construction ``unavailable`` reports a consumer
-            # capability gap; feeding it back makes J conform to an incomplete
-            # evaluator and can overwrite an already well-typed semantic artifact.
-            actionable = result.get("status") == "diverged"
+            # An executed Source-vs-J mismatch is a counterexample. Most RefJ
+            # construction ``unavailable`` results remain a consumer capability
+            # gap, but the probe may narrowly mark one directly expressible J
+            # omission as repairable. Do not feed back any other unsupported form.
             if (
-                actionable
-                and candidate_sha256 not in semantic_probe_feedback_delivered
+                result.get("status") == "diverged"
+                or result.get("repairable") is True
             ):
-                semantic_probe_feedback_delivered.add(candidate_sha256)
-                return True
-            return False
+                return result
+            return None
 
         bridge = CodexCLIToolBridge(
             workspace.scratch_dir / CODEX_CLI_TOOL_BRIDGE_ROOT_NAME,
@@ -1137,7 +1105,9 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             },
             argument_handlers={
                 "lift_reference": lambda arguments: _lift_reference_query(
-                    references, arguments
+                    references,
+                    arguments,
+                    frontend=selected_frontend,
                 )
             },
         )
@@ -1161,10 +1131,17 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     effort=effective_effort,
                 )
             startup_context = _source_aware_startup_context(
-                workspace, fresh_owner=fresh_owner
+                workspace,
+                fresh_owner=fresh_owner,
+                frontend=selected_frontend,
+                source_kind=selected_source_kind,
             )
             prompt = (
-                (_INITIAL_PROMPT if fresh_owner else _EXTERNAL_CONTINUATION_PROMPT)
+                _codex_frontend_prompt(
+                    _canonical_authoring_prompt(),
+                    frontend=selected_frontend,
+                    source_kind=selected_source_kind,
+                )
                 + "\n\n<source-aware-startup>\n"
                 + json.dumps(
                     startup_context,
@@ -1175,30 +1152,32 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 )
                 + "\n</source-aware-startup>\n"
             )
-            selected_effort = effective_effort
             while True:
                 remaining = self._remaining_seconds()
-                if remaining <= 0:
+                if remaining is not None and remaining <= 0:
                     raise self._terminal_time_error(round_index)
-                turn_timeout = min(
-                    remaining,
-                    self.model_timeout_seconds or CODEX_CLI_TURN_TIMEOUT_SECONDS,
-                )
+                turn_timeout = self.model_timeout_seconds
+                if remaining is not None:
+                    turn_timeout = (
+                        remaining
+                        if turn_timeout is None
+                        else min(remaining, turn_timeout)
+                    )
                 try:
                     turn = self._codex_session.run(
                         prompt,
                         timeout_seconds=turn_timeout,
-                        effort=selected_effort,
+                        effort=effective_effort,
                         stop_requested=self.stop_requested,
                         submission_accepted=accepted_submission_event.is_set,
-                        diagnostic_ready=diagnostic_ready_event.is_set,
+                        submission_rejected=diagnostic_ready_event.is_set,
                     )
                     accepted_submission_event.clear()
                     diagnostic_ready_event.clear()
                 except CodexCLICancelled as exc:
-                    self._session_active_elapsed_ms += exc.elapsed_ms
-                    self._session_model_turns += 1
-                    self._session_physical_provider_calls += exc.physical_calls
+                    self._invocation_active_elapsed_ms += exc.elapsed_ms
+                    self._invocation_cli_turns += 1
+                    self._invocation_model_segments += exc.physical_calls
                     cancellation_evidence = {
                         "backend": CODEX_CLI_LIFT_BACKEND,
                         "runtime": CODEX_CLI_AGENT_RUNTIME,
@@ -1213,6 +1192,7 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                         "turns": [item.to_evidence() for item in call_turns],
                         "candidate_check": list(check_results),
                         "source_reconcile": list(source_reconcile_results),
+                        "deterministic_repairs": list(deterministic_repairs),
                         "semantic_probe": list(semantic_probe_results),
                         "live_checkpoint": list(live_checkpoint_events),
                         "tool_bridge": bridge.evidence,
@@ -1222,9 +1202,6 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                             round_index,
                             diagnostic=str(exc),
                             backend_evidence=cancellation_evidence,
-                            continuation_candidate=(
-                                self._read_continuation_candidate(workspace)
-                            ),
                         )
                     )
                     raise CandidateLiftError(
@@ -1236,9 +1213,9 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                         physical_calls=exc.physical_calls,
                     ) from exc
                 except CodexCLISubmissionAccepted as exc:
-                    self._session_active_elapsed_ms += exc.elapsed_ms
-                    self._session_model_turns += 1
-                    self._session_physical_provider_calls += exc.physical_calls
+                    self._invocation_active_elapsed_ms += exc.elapsed_ms
+                    self._invocation_cli_turns += 1
+                    self._invocation_model_segments += exc.physical_calls
                     accepted_submission_event.clear()
                     diagnostic_ready_event.clear()
                     accepted_submission_interrupts.append(
@@ -1268,22 +1245,26 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     accepted_submission_interrupts[-1]["recovery"] = (
                         "exact_checkpoint_restored"
                     )
-                    if semantic_probe_needs_owner_turn():
-                        prompt = _SEMANTIC_PROBE_CONTINUATION_PROMPT
-                        selected_effort = self.repair_effort or effective_effort
-                        continue
+                    semantic_rejection = actionable_semantic_probe()
+                    if semantic_rejection is not None:
+                        reject_current_candidate(
+                            failure_class="semantic_probe_rejected",
+                            candidate_check=check,
+                            source_reconcile=source_reconcile,
+                            semantic_probe_result=semantic_rejection,
+                        )
                     break
-                except CodexCLIDiagnosticReady as exc:
-                    self._session_active_elapsed_ms += exc.elapsed_ms
-                    self._session_model_turns += 1
-                    self._session_physical_provider_calls += exc.physical_calls
+                except CodexCLISubmissionRejected as exc:
+                    self._invocation_active_elapsed_ms += exc.elapsed_ms
+                    self._invocation_cli_turns += 1
+                    self._invocation_model_segments += exc.physical_calls
                     diagnostic_ready_event.clear()
                     accepted_submission_event.clear()
                     diagnostic_ready_interrupts.append(
                         {
                             "elapsed_ms": exc.elapsed_ms,
                             "thread_id": exc.thread_id,
-                            "recovery": "same_thread_closed_diagnostic",
+                            "recovery": "fresh_attempt_required",
                         }
                     )
                     check, source_reconcile = host_preflight(
@@ -1295,117 +1276,46 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                         and source_reconcile["status"] == "pass"
                         and candidate_text is not None
                     ):
-                        if semantic_probe_needs_owner_turn():
-                            prompt = _SEMANTIC_PROBE_CONTINUATION_PROMPT
-                            selected_effort = self.repair_effort or effective_effort
-                            continue
+                        semantic_rejection = actionable_semantic_probe()
+                        if semantic_rejection is not None:
+                            reject_current_candidate(
+                                failure_class="semantic_probe_rejected",
+                                candidate_check=check,
+                                source_reconcile=source_reconcile,
+                                semantic_probe_result=semantic_rejection,
+                            )
                         break
-                    if check["status"] != "pass":
-                        _atomic_write_json(
-                            workspace.input_dir / "candidate_check.json",
-                            check,
-                        )
-                        prompt = _CANDIDATE_CHECK_CONTINUATION_PROMPT
-                    else:
-                        assert source_reconcile is not None
-                        _atomic_write_json(
-                            workspace.input_dir / "source_reconcile.json",
-                            source_reconcile,
-                        )
-                        prompt = _SOURCE_RECONCILE_CONTINUATION_PROMPT
-                    selected_effort = self.repair_effort or effective_effort
-                    continue
+                    reject_current_candidate(
+                        failure_class=(
+                            "candidate_rejected"
+                            if check["status"] != "pass"
+                            else "source_reconcile_rejected"
+                        ),
+                        candidate_check=check,
+                        source_reconcile=source_reconcile,
+                    )
                 except CodexCLIError as exc:
                     if "wall-time limit" in str(exc):
-                        elapsed = turn_timeout * 1000.0
-                        self._session_active_elapsed_ms += elapsed
-                        self._session_model_turns += 1
-                        self._session_physical_provider_calls += 1
+                        elapsed = (turn_timeout or 0.0) * 1000.0
+                        self._invocation_active_elapsed_ms += elapsed
+                        self._invocation_cli_turns += 1
+                        self._invocation_model_segments += 1
                         timed_out_calls += 1
                         timed_out_elapsed_ms += elapsed
-                        timeout_event = {
-                            "turn_timeout_seconds": turn_timeout,
-                            "thread_id": getattr(
-                                self._codex_session, "thread_id", None
-                            ),
-                            "recovery": None,
-                        }
-                        timeout_events.append(timeout_event)
-
-                        check, source_reconcile = host_preflight(
-                            trigger="host_timeout_recheck"
+                        timeout_events.append(
+                            {
+                                "turn_timeout_seconds": turn_timeout,
+                                "thread_id": getattr(
+                                    self._codex_session, "thread_id", None
+                                ),
+                                "recovery": "fresh_attempt_required",
+                            }
                         )
-                        if (
-                            check["status"] == "pass"
-                            and source_reconcile is not None
-                            and source_reconcile["status"] == "pass"
-                            and candidate_text is not None
-                        ):
-                            if semantic_probe_needs_owner_turn():
-                                timeout_event["recovery"] = (
-                                    "current_exact_candidate_semantic_probe"
-                                )
-                                prompt = _SEMANTIC_PROBE_CONTINUATION_PROMPT
-                                selected_effort = self.repair_effort or effective_effort
-                                continue
-                            timeout_event["recovery"] = "current_exact_candidate"
-                            break
-                        if last_checked_good is not None:
-                            _atomic_write_text(
-                                workspace.candidate_path, last_checked_good
-                            )
-                            check, source_reconcile = host_preflight(
-                                trigger="host_timeout_checkpoint_restore"
-                            )
-                            if (
-                                check["status"] == "pass"
-                                and source_reconcile is not None
-                                and source_reconcile["status"] == "pass"
-                                and candidate_text is not None
-                            ):
-                                if semantic_probe_needs_owner_turn():
-                                    timeout_event["recovery"] = (
-                                        "checkpoint_semantic_probe"
-                                    )
-                                    prompt = _SEMANTIC_PROBE_CONTINUATION_PROMPT
-                                    selected_effort = self.repair_effort or effective_effort
-                                    continue
-                                timeout_event["recovery"] = (
-                                    "same_invocation_checked_checkpoint"
-                                )
-                                break
-
-                        remaining_after_timeout = self._remaining_seconds()
-                        if remaining_after_timeout <= 0:
-                            timeout_event["recovery"] = "owner_time_exhausted"
-                            raise self._terminal_time_error(round_index) from exc
-                        if getattr(self._codex_session, "thread_id", None) is None:
-                            timeout_event["recovery"] = "no_resumable_thread"
-                            raise CodexCLIError(
-                                "initial Codex Lift turn timed out without a "
-                                "resumable thread or checked candidate"
-                            ) from exc
-                        if check["status"] != "pass":
-                            _atomic_write_json(
-                                workspace.input_dir / "candidate_check.json",
-                                check,
-                            )
-                            prompt = _CANDIDATE_CHECK_CONTINUATION_PROMPT
-                        else:
-                            assert source_reconcile is not None
-                            _atomic_write_json(
-                                workspace.input_dir / "source_reconcile.json",
-                                source_reconcile,
-                            )
-                            prompt = _SOURCE_RECONCILE_CONTINUATION_PROMPT
-                        timeout_event["recovery"] = "same_thread_continuation"
-                        selected_effort = self.repair_effort or effective_effort
-                        continue
                     raise
                 call_turns.append(turn)
-                self._session_active_elapsed_ms += turn.elapsed_ms
-                self._session_model_turns += 1
-                self._session_physical_provider_calls += turn.model_segments
+                self._invocation_active_elapsed_ms += turn.elapsed_ms
+                self._invocation_cli_turns += 1
+                self._invocation_model_segments += turn.model_segments
 
                 check, source_reconcile = host_preflight(trigger="host_post_turn")
                 if (
@@ -1414,25 +1324,24 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                     and source_reconcile["status"] == "pass"
                     and candidate_text is not None
                 ):
-                    if semantic_probe_needs_owner_turn():
-                        prompt = _SEMANTIC_PROBE_CONTINUATION_PROMPT
-                        selected_effort = self.repair_effort or effective_effort
-                        continue
+                    semantic_rejection = actionable_semantic_probe()
+                    if semantic_rejection is not None:
+                        reject_current_candidate(
+                            failure_class="semantic_probe_rejected",
+                            candidate_check=check,
+                            source_reconcile=source_reconcile,
+                            semantic_probe_result=semantic_rejection,
+                        )
                     break
-                if check["status"] != "pass":
-                    _atomic_write_json(
-                        workspace.input_dir / "candidate_check.json",
-                        check,
-                    )
-                    prompt = _CANDIDATE_CHECK_CONTINUATION_PROMPT
-                else:
-                    assert source_reconcile is not None
-                    _atomic_write_json(
-                        workspace.input_dir / "source_reconcile.json",
-                        source_reconcile,
-                    )
-                    prompt = _SOURCE_RECONCILE_CONTINUATION_PROMPT
-                selected_effort = self.repair_effort or effective_effort
+                reject_current_candidate(
+                    failure_class=(
+                        "candidate_rejected"
+                        if check["status"] != "pass"
+                        else "source_reconcile_rejected"
+                    ),
+                    candidate_check=check,
+                    source_reconcile=source_reconcile,
+                )
         except Exception as exc:
             if isinstance(exc, CandidateLiftError):
                 raise
@@ -1447,25 +1356,23 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 "turns": [turn.to_evidence() for turn in call_turns],
                 "candidate_check": list(check_results),
                 "source_reconcile": list(source_reconcile_results),
-                        "semantic_probe": list(semantic_probe_results),
-                        "live_checkpoint": list(live_checkpoint_events),
-                        "timeout_events": list(timeout_events),
-                        "accepted_submission_interrupts": list(
-                            accepted_submission_interrupts
-                        ),
-                        "diagnostic_ready_interrupts": list(
-                            diagnostic_ready_interrupts
-                        ),
-                        "tool_bridge": bridge.evidence,
+                "deterministic_repairs": list(deterministic_repairs),
+                "semantic_probe": list(semantic_probe_results),
+                "live_checkpoint": list(live_checkpoint_events),
+                "timeout_events": list(timeout_events),
+                "accepted_submission_interrupts": list(
+                    accepted_submission_interrupts
+                ),
+                "diagnostic_ready_interrupts": list(
+                    diagnostic_ready_interrupts
+                ),
+                "tool_bridge": bridge.evidence,
             }
             self._records.append(
                 SCRCReliftRecord(
                     round_index,
                     diagnostic=f"{type(exc).__name__}: {exc}",
                     backend_evidence=evidence,
-                    continuation_candidate=self._read_continuation_candidate(
-                        workspace
-                    ),
                 )
             )
             raise SCRCInfrastructureError(
@@ -1488,10 +1395,12 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
         trajectory = {
             "protocol": CODEX_CLI_AGENT_RUNTIME,
             "backend": CODEX_CLI_LIFT_BACKEND,
+            "reasoning_effort": effective_effort,
             "thread_id": self._codex_session.thread_id,
             "turns": [turn.to_evidence() for turn in call_turns],
             "candidate_check": list(check_results),
             "source_reconcile": list(source_reconcile_results),
+            "deterministic_repairs": list(deterministic_repairs),
             "semantic_probe": list(semantic_probe_results),
             "live_checkpoint": list(live_checkpoint_events),
             "timeout_events": list(timeout_events),
@@ -1502,11 +1411,15 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
                 diagnostic_ready_interrupts
             ),
             "tool_bridge": bridge.evidence,
-            "source_ttir_observation": {
-                key: value
-                for key, value in self._source_ttir_observation.items()
-                if key not in {"ttir", "fingerprint"}
-            },
+            "source_ttir_observation": (
+                {
+                    key: value
+                    for key, value in source_ttir_observation.items()
+                    if key not in {"ttir", "fingerprint", "source_facts"}
+                }
+                if source_ttir_observation is not None
+                else None
+            ),
             "isolation": {
                 "outer": "bubblewrap-host-fs-v1",
                 "input": "read-only",
@@ -1560,6 +1473,7 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             provenance,
             prepared.harness_binding,
             source,
+            prepared.construction,
         )
         backend_evidence = {
             "backend": CODEX_CLI_LIFT_BACKEND,
@@ -1567,8 +1481,8 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             "runtime": CODEX_CLI_AGENT_RUNTIME,
             "fresh_session": fresh_owner,
             "fresh_workspace": fresh_workspace,
-            "persistent_owner": True,
-            "persistent_workspace": True,
+            "persistent_owner": False,
+            "persistent_workspace": False,
             "owner_session_id": self._session_id,
             "thread_id": self._codex_session.thread_id,
             "cli_turns": (
@@ -1583,6 +1497,7 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             "usage": usage,
             "candidate_check": list(check_results),
             "source_reconcile": list(source_reconcile_results),
+            "deterministic_repairs": list(deterministic_repairs),
             "semantic_probe": list(semantic_probe_results),
             "live_checkpoint": list(live_checkpoint_events),
             "timeout_events": list(timeout_events),
@@ -1615,13 +1530,14 @@ class CodexCLILiftAdapter(MiniSWELiftAdapter):
             }
             | {
                 "model": provider.model,
+                "reasoning_effort": effective_effort,
                 "artifact_schema": artifact.wire_schema,
                 "decode_protocol": candidate_check_context.decode_protocol,
                 "typecheck_protocol": candidate_check_context.typecheck_protocol,
-                "session_active_elapsed_ms": self._session_active_elapsed_ms,
-                "session_cli_turns": self._session_model_turns,
-                "session_model_segments_lower_bound": (
-                    self._session_physical_provider_calls
+                "owner_active_elapsed_ms": self._invocation_active_elapsed_ms,
+                "owner_cli_turns": self._invocation_cli_turns,
+                "owner_model_segments_lower_bound": (
+                    self._invocation_model_segments
                 ),
                 "physical_provider_call_observability": (
                     "Codex CLI exposes model segments, not raw HTTP request count"

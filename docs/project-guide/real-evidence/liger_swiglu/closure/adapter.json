@@ -1,0 +1,91 @@
+{
+  "buffers": [
+    {
+      "dtype": "f32",
+      "formal": "a_ptr",
+      "initializer": "random",
+      "output_key": null,
+      "role": "input",
+      "shape": [
+        2,
+        127
+      ],
+      "shape_contract": [
+        "h0",
+        "h1"
+      ],
+      "strides": null
+    },
+    {
+      "dtype": "f32",
+      "formal": "b_ptr",
+      "initializer": "random",
+      "output_key": null,
+      "role": "input",
+      "shape": [
+        2,
+        127
+      ],
+      "shape_contract": [
+        "h0",
+        "h1"
+      ],
+      "strides": null
+    },
+    {
+      "dtype": "f32",
+      "formal": "c_ptr",
+      "initializer": null,
+      "output_key": "c",
+      "role": "output",
+      "shape": [
+        2,
+        127
+      ],
+      "shape_contract": [
+        "h0",
+        "h1"
+      ],
+      "strides": null
+    }
+  ],
+  "c_values": {
+    "BLOCK_SIZE": 128
+  },
+  "case_id": "high_performance:liger_swiglu",
+  "compiler_options": {},
+  "grid": [
+    2
+  ],
+  "grid_contract": [
+    "rows"
+  ],
+  "grid_shape_coordinates": [
+    "h0"
+  ],
+  "input_profile": "capture-seed-v1",
+  "none_arguments": [],
+  "protocol": "intentir.scrc.triton-workload-adapter.v6",
+  "scalars": [
+    {
+      "dtype": "i64",
+      "formal": "stride",
+      "shape_coordinate": null,
+      "value": 127
+    },
+    {
+      "dtype": "f32",
+      "formal": "gate_multiplier",
+      "shape_coordinate": null,
+      "value": 1.0
+    }
+  ],
+  "seed": 103,
+  "semantic_constexpr_shape_coordinates": {
+    "n_cols": "h1"
+  },
+  "semantic_constexprs": {
+    "n_cols": 127
+  },
+  "vararg_arity": null
+}

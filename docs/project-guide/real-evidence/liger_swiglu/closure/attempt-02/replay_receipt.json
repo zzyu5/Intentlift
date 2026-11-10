@@ -1,0 +1,22 @@
+{
+  "attempts": 1,
+  "backend_protocol": "openai.responses.intentir-replay.v1",
+  "context_receipt": {
+    "replay_input_protocol": "intentir.scrc.replay-input.v3",
+    "retrieval_trace": []
+  },
+  "elapsed_ms": 15590.503297746181,
+  "function_name": "scrc_k0",
+  "model": "gpt-6.1-sol",
+  "physical_provider_calls": 1,
+  "recorded": true,
+  "response_id": "resp_0977c29043d1f414016ac6ef6c714887d0b31301bc17fc6e16",
+  "response_model": "gpt-6.1-sol",
+  "status": "generated",
+  "transport_retries": 0,
+  "usage": {
+    "input_tokens": 8137,
+    "output_tokens": 556,
+    "total_tokens": 8693
+  }
+}

@@ -243,6 +243,116 @@ def _numel(shape: list[int]) -> int:
     return result
 
 
+def _resolve_runtime_output_specs(
+    entry: Mapping[str, Any], payload_root: Path
+) -> list[dict[str, Any]]:
+    """Resolve runtime contracts without letting reference data define the ABI.
+
+    ``output_specs.shape`` is the concrete native allocation contract emitted
+    by the bundle exporter.  ``shape_contract`` may retain ``?`` or a symbolic
+    J extent for provenance, but the transported reference can only validate
+    that contract; it must never replace the native shape used for allocation.
+    """
+
+    reference_outputs = entry.get("reference_outputs")
+    bindings = entry.get("output_bindings")
+    raw_specs = entry.get("output_specs")
+    if not isinstance(reference_outputs, Mapping):
+        raise ValueError("RVV bundle has no transported reference outputs")
+    if not isinstance(bindings, Mapping) or not isinstance(raw_specs, list):
+        raise ValueError("RVV bundle has an invalid output ABI")
+    resolved: list[dict[str, Any]] = []
+    for raw_spec in raw_specs:
+        if not isinstance(raw_spec, Mapping):
+            raise ValueError("RVV output specification is not an object")
+        name = raw_spec.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("RVV output specification has an invalid name")
+        binding = bindings.get(name)
+        if not isinstance(binding, str) or binding not in reference_outputs:
+            raise ValueError(f"RVV reference is missing output {name!r}")
+        record = reference_outputs[binding]
+        if not isinstance(record, Mapping) or not isinstance(record.get("shape"), list):
+            raise ValueError(f"RVV reference shape for output {name!r} is invalid")
+        reference_shape_values = record["shape"]
+        if any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in reference_shape_values
+        ):
+            raise ValueError(f"RVV reference shape for output {name!r} is invalid")
+        reference_shape = tuple(reference_shape_values)
+        if any(item < 0 for item in reference_shape):
+            raise ValueError(f"RVV reference shape for output {name!r} is negative")
+        declared_shape = raw_spec.get("shape")
+        if not isinstance(declared_shape, list):
+            raise ValueError(f"RVV output specification for {name!r} has an invalid shape")
+        if any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in declared_shape
+        ):
+            raise ValueError(
+                f"RVV output specification for {name!r} must use a concrete integer shape"
+            )
+        abi_shape = tuple(declared_shape)
+        if any(item < 0 for item in abi_shape):
+            raise ValueError(
+                f"RVV output specification for {name!r} must use non-negative concrete extents"
+            )
+        if abi_shape != reference_shape:
+            raise ValueError(
+                f"RVV reference shape for output {name!r} differs from its native ABI: "
+                f"{list(reference_shape)} != {list(abi_shape)}"
+            )
+        contract = raw_spec.get("shape_contract", list(abi_shape))
+        if not isinstance(contract, list) or len(contract) != len(abi_shape):
+            raise ValueError(f"RVV output contract for {name!r} has an invalid shape")
+        extents = entry.get("extents", {})
+        if not isinstance(extents, Mapping):
+            raise ValueError("RVV bundle extents must be an object")
+        for axis, (contract_extent, actual_extent) in enumerate(
+            zip(contract, abi_shape, strict=True)
+        ):
+            if contract_extent == "?":
+                continue
+            if isinstance(contract_extent, bool):
+                raise ValueError(
+                    f"RVV output contract for {name!r} contains a boolean extent"
+                )
+            if isinstance(contract_extent, int):
+                expected_extent = contract_extent
+            elif isinstance(contract_extent, str) and contract_extent.isidentifier():
+                expected_extent = extents.get(contract_extent)
+                if (
+                    isinstance(expected_extent, bool)
+                    or not isinstance(expected_extent, int)
+                    or expected_extent < 0
+                ):
+                    raise ValueError(
+                        f"RVV output {name!r} has an unbound symbolic extent "
+                        f"{contract_extent!r}"
+                    )
+            else:
+                raise ValueError(
+                    f"RVV output contract for {name!r} has an unsupported extent "
+                    f"at axis {axis}"
+                )
+            if expected_extent != actual_extent:
+                raise ValueError(
+                    f"RVV output {name!r} contract differs from its reference shape"
+                )
+        payload = _decode_payload(record, payload_root)
+        dtype = raw_spec.get("dtype")
+        if not isinstance(dtype, str) or not dtype:
+            raise ValueError(f"RVV output specification for {name!r} has no dtype")
+        expected_bytes = _numel(list(abi_shape)) * _dtype_size(dtype)
+        if len(payload) != expected_bytes:
+            raise ValueError(f"RVV reference payload size differs from output {name!r}")
+        spec = dict(raw_spec)
+        spec["shape"] = list(abi_shape)
+        resolved.append(spec)
+    return resolved
+
+
 def _dtype_size(dtype: str) -> int:
     key = dtype.removeprefix("torch.").lower()
     return {
@@ -834,7 +944,7 @@ def _argument_replicas(
             )
         for spec in entry["output_specs"]:
             size = _numel(spec["shape"]) * _dtype_size(spec["dtype"])
-            buffer = ctypes.create_string_buffer(size)
+            buffer = ctypes.create_string_buffer(max(1, size))
             all_buffers.append(buffer)
             replica_outputs.append(buffer)
             descriptors.append(_descriptor(buffer, list(spec["shape"])))
@@ -1173,14 +1283,21 @@ def _one_kernel(
     ggml_root: Path | None,
     ggml_lib_dir: Path | None,
 ) -> dict[str, Any]:
+    runtime_output_specs = _resolve_runtime_output_specs(entry, payload_root)
+    entry = {**entry, "output_specs": runtime_output_specs}
     logical_io = _logical_io_bytes(entry, payload_root)
     io_bytes = logical_io["boundary_io_bytes"]
     if io_bytes <= 0:
         raise ValueError("RVV benchmark has no logical boundary traffic")
     workload_cost = entry.get("workload_cost")
+    certified_io_bytes = (
+        workload_cost.get("boundary_io_bytes")
+        if workload_cost is not None
+        else None
+    )
     if (
-        workload_cost is not None
-        and int(workload_cost["boundary_io_bytes"]) != io_bytes
+        certified_io_bytes is not None
+        and int(certified_io_bytes) != io_bytes
     ):
         raise ValueError("runner logical bytes disagree with J workload-cost record")
     required_replicas = (
@@ -1246,7 +1363,7 @@ def _one_kernel(
                 f"reference payload size differs from output {output_name!r}"
             )
         expected_outputs[output_name] = (
-            ctypes.create_string_buffer(payload, len(payload)),
+            ctypes.create_string_buffer(max(1, len(payload))),
             element_count,
             byte_count,
             spec["dtype"],

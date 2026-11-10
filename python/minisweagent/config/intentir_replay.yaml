@@ -1,76 +1,69 @@
 agent:
   system_template: |
-    You are the sole compiler owner for one fresh source-blind IntentIR Replay
-    episode. Read the deterministic cross-reference `/input/compiler-index.intent`
-    and the complete read-only semantic program S_J from
-    `/input/semantic-program.intent`; read `/input/frontend.json` and
-    `/input/mask-c.json` for the callable ABI. Exact J and MaskC(C) remain available
-    in `/input/packet.json`. No Source, pi,
-    Harness valuation, Gate result, previous Replay, repository, or network exists.
+    Own one fresh source-blind IntentIR Replay. Read compiler index, complete
+    S_J, frontend, and accepted C when present; packet holds exact J/C. No
+    Source, pi, non-C Harness fact, Gate result, prior Replay, repo, or network
+    exists.
 
-    J/S_J is the sole semantic authority. Program mapping, layout, loops, control,
-    carrier representation, target API, and materialization are source-blind compiler
-    choices; they may not add or alter J-owned value semantics. Follow
-    `/input/REPLAY_CONTRACT.md`.
+    J/S_J and `/input/REPLAY_CONTRACT.md` are the sole semantic authority.
+    Choose mapping, layout, loops, control, carriers, APIs, and materialization
+    without changing J. Preserve each access/effect; domain guards remain
+    separate from access predicates. Factor shared, tensor-specific, and C-tiled
+    axes. A tile permits local tiling only, never a grid cardinality or extra
+    `program_id`; C never supplies J semantics or callable constexpr `c*`.
 
-    `compiler-index.intent` only places existing J dependency sets beside anonymous
-    MaskC attachments. It is not a schedule: preserve each authored access/effect,
-    keep logical domain guards distinct from access-local predicates, and choose every
-    target realization yourself. First factor J effect axes into axes shared across
-    affected tensors, tensor-specific alternatives, and C-tiled axes. A tile attachment
-    permits local tiling but supplies no launch cardinality; do not infer
-    `program_id * tile` or an extra program axis from that attachment alone.
-
-    Compile the whole S_J into one complete target program at
-    `/output/replay.source`. You may globally choose target APIs, addressing,
-    layouts, loops, control, synchronization, fusion, and code structure while
-    preserving J semantics. Do not fill holes, produce
-    per-node bindings, or wait for fixed code to assemble fragments.
-
-    Work as a coding agent in this same episode: write an early complete draft,
-    compile it, inspect only its own IR, patch it, and submit the exact final bytes.
-    Keep inactive constexpr computations inside their branch.
-    ReplayCheck and compile-check diagnose construction only; they neither generate
-    code nor establish Gate1/Gate2. Model/tool counts are telemetry; wall time governs
-    the episode. Keep prose short and never claim certification.
+    Compile all S_J into one complete `/output/replay.source`, not fragments or
+    holes. Two orientation turns precede the first complete `submit_replay`.
+    Then at most three unchanged inspections/queries may precede only an exact
+    patch or complete submission. Inspect/compile only owned source; after
+    preflight rejection patch that source before resubmission. Keep inactive
+    constexpr work in its branch. ReplayCheck/compile-check only diagnose;
+    they neither generate code nor establish Gate1/Gate2. No certification prose.
 
   instance_template: |
-    The startup object below contains paths and byte counts only. Read
-    `/input/compiler-index.intent`, `/input/semantic-program.intent`,
-    `/input/frontend.json`, and `/input/mask-c.json` first, then
-    `/input/REPLAY_CONTRACT.md` and `/input/TOOL.md`.
-    Query only to cross-reference one named handle; do not reload the whole packet.
+    The startup object is paths and byte counts only. Read its compiler index,
+    S_J, frontend, accepted C when present, then contract and tool. Query one
+    named handle at a time; do not reload the packet.
 
     <persistent-workspace-mirror>
     {{ replay_startup_context }}
     </persistent-workspace-mirror>
 
-    Use `intentir_semantic_query overview|ownership|node REF|value REF|boundary NAME START COUNT`
-    only for a local S_J lookup. Use `intentir_packet_query abi`, `graph`, `find`, or
-    `section PATH` for exact local J/C facts. These are read-only projections, not plans.
+    `intentir_semantic_query` is only local S_J lookup; `intentir_packet_query`
+    only exact local J/C facts. Both are read-only, not plans. First submit a
+    complete source; then use exact patch or full replacement, never bash.
+    Compile-check and inspect owned J/C IR; requery only one concrete J duty,
+    remove non-J work, and patch before resubmission. Gate1 stays external.
 
-    Submit a complete source with `submit_replay(source_text)` or by writing the
-    single output file and calling `intentir_replay_submit /output/replay.source`.
-    Use `intentir_replay_compile_check /output/replay.source`, then call the
-    `replay_ttir_inspect jc` command documented in TOOL.md. Reinspect your own IR when
-    one concrete J obligation remains; prefer targeted raw/find/observer lookups over
-    dumping the full fingerprint. Remove work not authorized by S_J. Submission reruns closed
-    construction checks; formal Gate1 remains outside and invisible.
-
-  step_limit: 0
+  # This is a logical-turn ceiling, independent of the physical transport cap
+  # below. It permits orientation, a complete first submission, and bounded
+  # exact repairs, but cannot be extended by continuously changing source.
+  step_limit: 24
   cost_limit: 0
-  wall_time_limit_seconds: 1800
+  # Replay has no framework owner wall-time cap. Provider failures,
+  # cancellation, step limits, and formal ingress/Gate authorities remain
+  # independent fail-closed boundaries.
+  wall_time_limit_seconds: 0
   max_consecutive_format_errors: 0
   # This is not a call budget: only three consecutive identical requests with
   # identical Replay bytes and identical closed output terminate as a stall.
   max_consecutive_stagnant_steps: 3
-  # Total calls remain uncapped.  These timers only detect elapsed time with no
-  # exact Replay/work-file byte change.
-  material_progress_advisory_seconds: 120
-  material_progress_stall_seconds: 600
+  # A source-blind Replay that has stopped changing its owned source cannot
+  # gain Gate evidence by continuing to inspect the same immutable packet.
+  # No elapsed-time heuristic terminates an active owner. Explicit step and
+  # semantic ingress boundaries remain the only local lifecycle limits.
+  material_progress_advisory_seconds: 0
+  material_progress_stall_seconds: 0
 
 model:
-  max_tool_calls_per_response: 4
+  # Replay environment batches are safe only for independent immutable-input
+  # queries.  Writes, inspections, compile checks, commits, and submission
+  # must each receive the preceding observation, so one model turn owns one
+  # tool call.  This keeps the model/runtime contract aligned instead of
+  # allowing a mixed batch to be rejected atomically after the model has
+  # already spent a reasoning turn.
+  max_tool_calls_per_response: 1
+  enable_bash_tool: true
   enable_replay_patch_tool: true
   enable_submit_replay_tool: true
   compact_tool_history: true
@@ -80,12 +73,18 @@ model:
   # facts stay in the immutable workspace and enter context only through bounded
   # read-only query results selected by the Replay owner.
   compact_workspace_mirrors: false
-  compact_response_history_keep_recent: 3
-  use_previous_response_id: true
-  # Initial J/MaskC interpretation keeps the requested effort. Only ordinary
+  # Keep only the latest response group in the provider packet; the full
+  # Replay trajectory remains local and older groups become deterministic receipts.
+  compact_response_history_keep_recent: 1
+  # Send the exact locally compacted history directly across selectable
+  # transports; no continuation identifier crosses a Replay turn.
+  use_previous_response_id: false
+  # Initial J/source-bound-C interpretation keeps the requested effort. Only ordinary
   # own-source inspection, construction-check and exact repair turns use low.
   routine_reasoning_effort: low
-  routine_timeout_seconds: 180
+  # Do not impose a framework per-turn provider deadline. A provider failure
+  # or incomplete stream remains fail-closed and cannot become Replay source.
+  routine_timeout_seconds: null
   # Turn 1 reads immutable J files; turn 2 is the first turn that can actually
   # compile them.  Keep both at the requested effort, then use low only for
   # ordinary own-source compile repair.
@@ -98,17 +97,29 @@ model:
     {%- endif %}
   format_error_template: |
     Tool call error: {{ error }}
-    Use one to four bash calls for the next bounded action. Multiple calls must
-    be independent and read-only; use exactly one call for every write, inspect
-    after write, check, commit, rollback, or direct submit.
+    Use exactly one bash call for the next bounded action. Every write, inspect,
+    check, commit, rollback, or direct submit must be its own model turn so its
+    result is observed before the next action.
   model_kwargs:
     drop_params: true
     num_retries: 0
     max_retries: 0
-    parallel_tool_calls: true
+    parallel_tool_calls: false
   # Same source-blind episode and exact message packet; no new semantic input.
-  retry_attempts: 3
-  retry_timeouts: true
+  # A retryable SSE/stream-incomplete failure may use two additional physical
+  # requests in this same logical turn. The third consecutive failed SSE
+  # attempt is fail-closed and cannot become Replay source.
+  retry_attempts: 1
+  # Non-SSE provider failures remain terminal. Only the dedicated SSE budget
+  # below may repeat the same exact Replay turn without changing its source.
+  transient_retry_attempts: 0
+  # Hard per-episode transport budgets. They are enforced immediately before
+  # each real provider request, including retry/fallback calls inside one
+  # logical turn; exhaustion ends Replay fail-closed.
+  physical_provider_call_limit: 32
+  transport_retry_limit: 2
+  sse_retry_attempts: 2
+  retry_timeouts: false
   use_global_model_stats: false
   cost_tracking: ignore_errors
 
@@ -119,3 +130,8 @@ environment:
   replay_submission_check_limit: 0
   replay_compile_check_limit: 0
   replay_source_inspect_limit: 0
+  # Consecutive submission preflights for the same exact replay.source and
+  # sanitized diagnostic may be repaired only this many times. The third
+  # occurrence terminates the episode; it never becomes a semantic acceptance
+  # or repair base.
+  same_preflight_repair_limit: 2

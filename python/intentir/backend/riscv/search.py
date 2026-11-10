@@ -7,26 +7,112 @@ admission nor the executable states available to the search.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import re
 import statistics
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from intentir.backend.materialize import BackendSearchState, CPrior
 from intentir.backend.riscv.compile import (
     RiscvLoweringCandidate,
     RiscvSchedule,
     RiscvTransformationState,
+    ragged_schedule_supported,
 )
+from intentir.backend.riscv.contract import (
+    RiscvContractError,
+    derive_riscv_contract_view,
+    riscv_allowed_authorizations,
+    validate_riscv_target_contract,
+)
+from intentir.ir.canonical_j import j_elaboration
+from intentir.ir.layer_c import (
+    ImplementationChoice,
+    LayerCBinding,
+    LayerCExtensionPoint,
+    LayerCInterface,
+    TargetLowering,
+    TargetParallelMapping,
+    TargetPipeline,
+    TargetRealizationContract,
+    TargetSplit,
+    TargetLayerCPlugin,
+    layer_c_content_digest,
+    validate_layer_c_attachments,
+)
+from intentir.backend.protocol import (
+    TargetBindingContext,
+    TargetExtensionMapping,
+    TargetPluginArtifact,
+    bind_target,
+    deserialize_target_plugin,
+    serialize_target_plugin,
+    validate_target_plugin,
+)
+from intentir.verify.gate1.model import SemanticArchive
 
 
 RVV_SEARCH_PLAN_PROTOCOL = "intentir.backend.riscv.search-plan.v11"
 RVV_C_PROJECTION_PROTOCOL = "intentir.backend.riscv.c-projection.v1"
+RVV_LAYER_C_BACKEND_KIND = "riscv"
 
 _PARALLEL_TILES = (1, 2, 4, 8, 16, 32, 64, 128)
 _REDUCTION_TILES = (1, 2, 4, 8, 16, 32, 64, 128)
 _JOINT_TILES = ((1, 4), (2, 8), (4, 16), (8, 32), (16, 64), (32, 128))
+
+
+def _canonical_pattern_records(
+    j: SemanticArchive,
+) -> tuple[Any, tuple[Mapping[str, Any], ...], tuple[Mapping[str, Any], ...]]:
+    """Return the one elaborated operation/boundary view for RVV matching.
+
+    Search features are admissibility hints, but they still must not rebuild a
+    second interpretation by walking raw ``intent_function.body``.  The
+    elaboration's construction bundle owns lexical paths, typed values, output
+    order and boundary rows, so every structural matcher below receives only
+    projections from that bundle.
+    """
+
+    elaboration = j_elaboration(j)
+    all_records = tuple(elaboration.operation_records)
+    if any(
+        not isinstance(record, Mapping)
+        or not isinstance(record.get("wire"), Mapping)
+        for record in all_records
+    ):
+        raise RiscvContractError(
+            "RISC-V search requires complete canonical operation records"
+        )
+    top_level = tuple(
+        record
+        for record in all_records
+        if re.fullmatch(r"body\[\d+\]", str(record.get("path")))
+    )
+    return elaboration, top_level, all_records
+
+
+def _record_type(
+    elaboration: Any,
+    value: Any,
+) -> Any | None:
+    return (
+        elaboration.value_type_by_name.get(value)
+        if isinstance(value, str)
+        else None
+    )
+
+
+def _record_result(record: Mapping[str, Any]) -> str | None:
+    results = record.get("results")
+    return (
+        results[0]
+        if isinstance(results, (tuple, list))
+        and len(results) == 1
+        and isinstance(results[0], str)
+        else None
+    )
 
 
 def _schedule_universe() -> tuple[RiscvSchedule, ...]:
@@ -263,7 +349,7 @@ def _dtype_bits(dtype: str) -> int | None:
 
 
 def _operation_facts(
-    value: Any,
+    j: SemanticArchive,
 ) -> tuple[set[tuple[int, ...]], bool, list[int], bool, bool]:
     reduction_axes: set[tuple[int, ...]] = set()
     has_scan = False
@@ -271,39 +357,29 @@ def _operation_facts(
     has_reassociable_float_reduction = False
     has_contraction = False
 
-    def visit(item: Any) -> None:
-        nonlocal has_scan, has_reassociable_float_reduction, has_contraction
-        if isinstance(item, Mapping):
-            dtype = item.get("dtype")
-            if isinstance(dtype, str):
-                bits = _dtype_bits(dtype)
-                if bits is not None:
-                    float_bits.append(bits)
-            op = item.get("op")
-            has_contraction = has_contraction or op == "contraction"
-            if op in {"reduce", "scan"}:
-                has_scan = has_scan or op == "scan"
-                attrs = item.get("attrs", {})
-                if (
-                    op == "reduce"
-                    and isinstance(attrs, Mapping)
-                    and attrs.get("assoc") == "float_nondeterministic"
-                ):
-                    has_reassociable_float_reduction = True
-                raw_axes = attrs.get("axes", [attrs.get("axis")]) if isinstance(
-                    attrs, Mapping
-                ) else []
-                if isinstance(raw_axes, list) and all(
-                    isinstance(axis, int) for axis in raw_axes
-                ):
-                    reduction_axes.add(tuple(int(axis) for axis in raw_axes))
-            for child in item.values():
-                visit(child)
-        elif isinstance(item, (list, tuple)):
-            for child in item:
-                visit(child)
-
-    visit(value)
+    elaboration, _top_level, records = _canonical_pattern_records(j)
+    for value_type in elaboration.value_type_by_name.values():
+        dtype = getattr(value_type, "dtype", None)
+        if isinstance(dtype, str):
+            bits = _dtype_bits(dtype)
+            if bits is not None:
+                float_bits.append(bits)
+    for record in records:
+        op = record.get("op")
+        has_contraction = has_contraction or op == "contraction"
+        if op not in {"reduce", "scan"}:
+            continue
+        has_scan = has_scan or op == "scan"
+        attrs = record.get("attrs")
+        if not isinstance(attrs, Mapping):
+            continue
+        if op == "reduce" and attrs.get("assoc") == "float_nondeterministic":
+            has_reassociable_float_reduction = True
+        raw_axes = attrs.get("axes", [attrs.get("axis")])
+        if isinstance(raw_axes, list) and all(
+            isinstance(axis, int) for axis in raw_axes
+        ):
+            reduction_axes.add(tuple(int(axis) for axis in raw_axes))
     return (
         reduction_axes,
         has_scan,
@@ -313,111 +389,72 @@ def _operation_facts(
     )
 
 
-def _has_typed_rowmask_graph(value: Mapping[str, Any]) -> bool:
-    intent = value.get("intent")
-    if not isinstance(intent, Mapping):
-        return False
-    function = intent.get("intent_function")
-    if not isinstance(function, Mapping):
-        return False
-    inputs = function.get("inputs")
-    body = function.get("body")
-    outputs = function.get("outputs")
-    if not isinstance(inputs, list) or not isinstance(body, list) or not isinstance(outputs, list):
-        return False
-    input_by_name = {
-        item.get("name"): item
-        for item in inputs
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    if len(body) != 2 or len(outputs) != 1:
+def _has_typed_rowmask_graph(j: SemanticArchive) -> bool:
+    elaboration, body, _records = _canonical_pattern_records(j)
+    if len(body) != 2 or len(elaboration.output_bindings) != 1:
         return False
     cast, product = body
-    if not isinstance(cast, Mapping) or not isinstance(product, Mapping):
-        return False
     cast_operands = cast.get("operands")
     product_operands = product.get("operands")
-    cast_type = cast.get("type")
-    product_type = product.get("type")
+    cast_result = _record_result(cast)
+    product_result = _record_result(product)
+    cast_type = _record_type(elaboration, cast_result)
+    product_type = _record_type(elaboration, product_result)
     attrs = product.get("attrs")
     if (
         cast.get("op") != "cast"
         or not isinstance(cast_operands, list)
         or len(cast_operands) != 1
-        or not isinstance(cast_type, Mapping)
-        or cast_type.get("dtype") != "f32"
-        or cast.get("result") is None
+        or getattr(cast_type, "dtype", None) != "f32"
+        or cast_result is None
         or product.get("op") != "map_binary"
         or not isinstance(attrs, Mapping)
         or attrs.get("fn", "mul") != "mul"
         or not isinstance(product_operands, list)
         or len(product_operands) != 2
-        or cast.get("result") not in product_operands
-        or not isinstance(product_type, Mapping)
-        or product_type.get("dtype") != "f32"
+        or cast_result not in product_operands
+        or getattr(product_type, "dtype", None) != "f32"
     ):
         return False
-    mask = input_by_name.get(cast_operands[0])
+    mask = _record_type(elaboration, cast_operands[0])
     data_name = next(
-        (operand for operand in product_operands if operand != cast.get("result")),
+        (operand for operand in product_operands if operand != cast_result),
         None,
     )
-    data = input_by_name.get(data_name)
-    mask_shape = mask.get("shape") if isinstance(mask, Mapping) else None
-    data_shape = data.get("shape") if isinstance(data, Mapping) else None
-    result_shape = product_type.get("shape")
-    output = outputs[0]
+    data = _record_type(elaboration, data_name)
+    mask_shape = getattr(mask, "shape", None)
+    data_shape = getattr(data, "shape", None)
+    result_shape = getattr(product_type, "shape", None)
+    output = elaboration.output_bindings[0]
     return bool(
-        isinstance(mask, Mapping)
-        and mask.get("dtype") == "i1"
-        and isinstance(mask_shape, list)
+        getattr(mask, "dtype", None) == "i1"
+        and isinstance(mask_shape, tuple)
         and len(mask_shape) == 1
-        and isinstance(data, Mapping)
-        and data.get("dtype") == "f32"
-        and isinstance(data_shape, list)
+        and getattr(data, "dtype", None) == "f32"
+        and isinstance(data_shape, tuple)
         and len(data_shape) == 2
         and data_shape[0] == mask_shape[0]
         and result_shape == data_shape
-        and isinstance(output, Mapping)
-        and output.get("name") == product.get("result")
-        and output.get("dtype") == "f32"
-        and output.get("shape") == data_shape
+        and output.value == product_result
+        and output.output_type.dtype == "f32"
+        and output.output_type.shape == data_shape
     )
 
 
-def _has_typed_gather_chain(value: Mapping[str, Any]) -> bool:
-    intent = value.get("intent")
-    if not isinstance(intent, Mapping):
-        return False
-    function = intent.get("intent_function")
-    if not isinstance(function, Mapping):
-        return False
-    inputs = function.get("inputs")
-    body = function.get("body")
-    outputs = function.get("outputs")
-    if (
-        not isinstance(inputs, list)
-        or not isinstance(body, list)
-        or not isinstance(outputs, list)
-        or len(body) != 2
-        or len(outputs) != 1
-    ):
+def _has_typed_gather_chain(j: SemanticArchive) -> bool:
+    elaboration, body, _records = _canonical_pattern_records(j)
+    if len(body) != 2 or len(elaboration.output_bindings) != 1:
         return False
     first, second = body
-    if not isinstance(first, Mapping) or not isinstance(second, Mapping):
-        return False
     first_operands = first.get("operands")
     second_operands = second.get("operands")
     first_attrs = first.get("attrs")
     second_attrs = second.get("attrs")
-    first_type = first.get("type")
-    second_type = second.get("type")
-    output = outputs[0]
-    input_by_name = {
-        item.get("name"): item
-        for item in inputs
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
+    first_result = _record_result(first)
+    second_result = _record_result(second)
+    first_type = _record_type(elaboration, first_result)
+    second_type = _record_type(elaboration, second_result)
+    output = elaboration.output_bindings[0]
     if (
         first.get("op") != "gather"
         or second.get("op") != "gather"
@@ -425,109 +462,54 @@ def _has_typed_gather_chain(value: Mapping[str, Any]) -> bool:
         or len(first_operands) != 2
         or not isinstance(second_operands, list)
         or len(second_operands) != 2
-        or second_operands[0] != first.get("result")
+        or second_operands[0] != first_result
         or not isinstance(first_attrs, Mapping)
         or first_attrs.get("mode") != "take"
         or first_attrs.get("axis") != 0
         or not isinstance(second_attrs, Mapping)
         or second_attrs.get("mode") != "along_axis"
         or second_attrs.get("axis") != 1
-        or not isinstance(first_type, Mapping)
-        or first_type.get("dtype") != "f32"
-        or not isinstance(second_type, Mapping)
-        or second_type.get("dtype") != "f32"
-        or not isinstance(output, Mapping)
-        or output.get("name") != second.get("result")
+        or getattr(first_type, "dtype", None) != "f32"
+        or getattr(second_type, "dtype", None) != "f32"
+        or output.value != second_result
     ):
         return False
-    data = input_by_name.get(first_operands[0])
-    rows = input_by_name.get(first_operands[1])
-    columns = input_by_name.get(second_operands[1])
+    data = _record_type(elaboration, first_operands[0])
+    rows = _record_type(elaboration, first_operands[1])
+    columns = _record_type(elaboration, second_operands[1])
     return bool(
-        isinstance(data, Mapping)
-        and data.get("dtype") == "f32"
-        and isinstance(data.get("shape"), list)
-        and len(data["shape"]) == 2
-        and isinstance(rows, Mapping)
-        and rows.get("dtype") == "i32"
-        and isinstance(rows.get("shape"), list)
-        and len(rows["shape"]) == 1
-        and isinstance(columns, Mapping)
-        and columns.get("dtype") == "i32"
-        and columns.get("shape") == rows.get("shape")
-        and second_type.get("shape") == rows.get("shape")
+        getattr(data, "dtype", None) == "f32"
+        and isinstance(getattr(data, "shape", None), tuple)
+        and len(data.shape) == 2
+        and getattr(rows, "dtype", None) == "i32"
+        and isinstance(getattr(rows, "shape", None), tuple)
+        and len(rows.shape) == 1
+        and getattr(columns, "dtype", None) == "i32"
+        and columns.shape == rows.shape
+        and second_type.shape == rows.shape
     )
 
 
-def _has_two_public_outputs(value: Mapping[str, Any]) -> bool:
-    intent = value.get("intent")
-    if not isinstance(intent, Mapping):
-        return False
-    function = intent.get("intent_function")
-    if not isinstance(function, Mapping):
-        return False
-    outputs = function.get("outputs")
-    return bool(
-        isinstance(outputs, list)
-        and len(outputs) == 2
-        and all(isinstance(output, Mapping) for output in outputs)
-    )
+def _has_two_public_outputs(j: SemanticArchive) -> bool:
+    return len(j_elaboration(j).output_bindings) == 2
 
 
-def _has_typed_flash_attention_graph(value: Mapping[str, Any]) -> bool:
+def _has_typed_flash_attention_graph(j: SemanticArchive) -> bool:
     """Match the closed structured stable-attention J without kernel names."""
 
-    intent = value.get("intent")
-    boundary = value.get("boundary")
-    constraints = value.get("dimension_constraints")
+    elaboration, top_level_operations, all_records = _canonical_pattern_records(j)
+    boundary = elaboration.boundary_record
+    constraints = tuple(j.dimension_constraints)
     if (
-        not isinstance(intent, Mapping)
-        or not isinstance(boundary, Mapping)
-        or not isinstance(constraints, list)
+        not isinstance(boundary, Mapping)
         or boundary.get("aliases") not in (None, [])
     ):
         return False
-    function = intent.get("intent_function")
-    if not isinstance(function, Mapping):
+    # Physical public outputs are owned by the construction output rows; do
+    # not re-read ``intent.outputs`` as a second ABI declaration.
+    if len(elaboration.output_bindings) != 3 or not top_level_operations:
         return False
-    inputs = function.get("inputs")
-    outputs = function.get("outputs")
-    body = function.get("body")
-    if (
-        not isinstance(inputs, list)
-        or not isinstance(outputs, list)
-        or not isinstance(body, list)
-        or len(inputs) != 6
-        or len(outputs) != 3
-    ):
-        return False
-
-    input_by_name = {
-        item.get("name"): item
-        for item in inputs
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    output_by_name = {
-        item.get("name"): item
-        for item in outputs
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
-    operations: list[Mapping[str, Any]] = []
-
-    def visit(items: Any) -> None:
-        if not isinstance(items, list):
-            return
-        for item in items:
-            if not isinstance(item, Mapping):
-                continue
-            operations.append(item)
-            visit(item.get("body"))
-            for arm in ("positive", "negative"):
-                region = item.get(arm)
-                if isinstance(region, Mapping):
-                    visit(region.get("body"))
-
-    visit(body)
+    operations = list(all_records)
     contractions = [item for item in operations if item.get("op") == "contraction"]
     loops = [item for item in operations if item.get("op") == "loop"]
     scatters = [item for item in operations if item.get("op") == "scatter"]
@@ -568,7 +550,8 @@ def _has_typed_flash_attention_graph(value: Mapping[str, Any]) -> bool:
         or len(pv_operands) != 2
     ):
         return False
-    scans = loops[0].get("scan")
+    loop_wire = loops[0].get("wire")
+    scans = loop_wire.get("scan") if isinstance(loop_wire, Mapping) else None
     scan_sources = {
         item.get("name"): item.get("from")
         for item in scans
@@ -578,22 +561,22 @@ def _has_typed_flash_attention_graph(value: Mapping[str, Any]) -> bool:
     } if isinstance(scans, list) else {}
 
     def boundary_input(name: Any) -> Any:
-        return input_by_name.get(scan_sources.get(name, name))
+        return _record_type(elaboration, scan_sources.get(name, name))
 
     query = boundary_input(qk_operands[0])
     key = boundary_input(qk_operands[1])
     value_input = boundary_input(pv_operands[1])
-    if not all(isinstance(item, Mapping) for item in (query, key, value_input)):
+    if any(item is None for item in (query, key, value_input)):
         return False
-    query_shape = query.get("shape")
-    key_shape = key.get("shape")
-    value_shape = value_input.get("shape")
+    query_shape = query.shape
+    key_shape = key.shape
+    value_shape = value_input.shape
     if (
-        query.get("dtype") != "f16"
-        or key.get("dtype") != "f16"
-        or value_input.get("dtype") != "f16"
-        or not isinstance(query_shape, list)
-        or not isinstance(key_shape, list)
+        query.dtype != "f16"
+        or key.dtype != "f16"
+        or value_input.dtype != "f16"
+        or not isinstance(query_shape, tuple)
+        or not isinstance(key_shape, tuple)
         or len(query_shape) != 4
         or len(key_shape) != 4
         or value_shape != key_shape
@@ -601,31 +584,36 @@ def _has_typed_flash_attention_graph(value: Mapping[str, Any]) -> bool:
         or query_shape[2:] != key_shape[2:]
     ):
         return False
+    output_types = [item.output_type for item in elaboration.output_bindings]
     rank_four_outputs = [
-        item
-        for item in output_by_name.values()
-        if item.get("dtype") == "f16" and item.get("shape") == query_shape
+        item for item in output_types
+        if item.dtype == "f16" and item.shape == query_shape
     ]
     rank_three_outputs = [
-        item
-        for item in output_by_name.values()
-        if item.get("dtype") == "f32"
-        and isinstance(item.get("shape"), list)
-        and len(item["shape"]) == 3
-        and item["shape"][:2] == [query_shape[0], query_shape[2]]
+        item for item in output_types
+        if item.dtype == "f32"
+        and len(item.shape) == 3
+        and item.shape[:2] == (query_shape[0], query_shape[2])
+    ]
+    output_only = {
+        item.output
+        for item in elaboration.output_bindings
+        if item.abi_parameter_mode == "output"
+    }
+    input_types = [
+        value_type
+        for name, value_type in elaboration.value_type_by_name.items()
+        if name.startswith("t") and name not in output_only
     ]
     scalar_f32_inputs = [
-        item
-        for item in input_by_name.values()
-        if item.get("dtype") == "f32" and item.get("shape") == []
+        item for item in input_types
+        if item.dtype == "f32" and item.shape == ()
     ]
     scratch_inputs = [
-        item
-        for item in input_by_name.values()
-        if item.get("dtype") == "f32"
-        and isinstance(item.get("shape"), list)
-        and len(item["shape"]) == 3
-        and item["shape"][:2] == [query_shape[0], query_shape[2]]
+        item for item in input_types
+        if item.dtype == "f32"
+        and len(item.shape) == 3
+        and item.shape[:2] == (query_shape[0], query_shape[2])
     ]
     if (
         len(rank_four_outputs) != 1
@@ -634,7 +622,7 @@ def _has_typed_flash_attention_graph(value: Mapping[str, Any]) -> bool:
         or len(scratch_inputs) != 1
     ):
         return False
-    loop_trip = loops[0].get("trip")
+    loop_trip = loop_wire.get("trip") if isinstance(loop_wire, Mapping) else None
     if not isinstance(loop_trip, Mapping) or loop_trip.get("axis") != key_shape[1]:
         return False
     reduction_facts = {
@@ -680,7 +668,7 @@ def _has_typed_flash_attention_graph(value: Mapping[str, Any]) -> bool:
         )
     ):
         return False
-    padded = scratch_inputs[0]["shape"][2]
+    padded = scratch_inputs[0].shape[2]
     return any(
         isinstance(item, str)
         and item.replace(" ", "")
@@ -693,14 +681,7 @@ def _has_typed_flash_attention_graph(value: Mapping[str, Any]) -> bool:
 
 
 def _target_vlen_bits(state: BackendSearchState) -> int:
-    values = []
-    for feature in state.target.features:
-        match = re.fullmatch(r"vlen([0-9]+)", feature.lower())
-        if match is not None:
-            values.append(int(match.group(1)))
-    if len(set(values)) > 1:
-        raise ValueError("RVV target declares conflicting VLEN features")
-    return values[0] if values else 128
+    return validate_riscv_target_contract(state)
 
 
 def _power_of_two_floor(value: float) -> int:
@@ -714,9 +695,8 @@ def _project_c_priors(
     tuple[dict[str, Any], ...],
     dict[str, Any],
 ]:
-    payload = state.base.j.to_json()
     reduction_axes, has_scan, float_bits, _has_reassociation, _has_contraction = (
-        _operation_facts(payload)
+        _operation_facts(state.base.j)
     )
     vlen_bits = _target_vlen_bits(state)
     element_bits = max(float_bits, default=32)
@@ -745,18 +725,11 @@ def _project_c_priors(
                 {**prior.to_record(), "reason": "non_positive_numeric_value"}
             )
             continue
-        axis_ref = prior.axis_ref if isinstance(prior.axis_ref, int) else None
-        if prior.role == "reduction_tile_extent" and axis_ref is not None:
-            maps_to_reduction = any(axis_ref in axes for axes in reduction_axes)
-            if not maps_to_reduction:
-                ignored.append(
-                    {
-                        **prior.to_record(),
-                        "reason": "reduction_tile_axis_is_not_a_reduction_axis",
-                    }
-                )
-                continue
-        elif prior.role == "reduction_tile_extent" and len(reduction_axes) == 1:
+        # CPrior is deliberately target-neutral and carries no Layer-C axis
+        # attachment.  Keep the projection explicit instead of referring to
+        # a non-existent per-prior axis field.
+        axis_ref = None
+        if prior.role == "reduction_tile_extent" and len(reduction_axes) == 1:
             maps_to_reduction = True
         elif prior.role == "reduction_tile_extent" and not reduction_axes:
             ignored.append(
@@ -808,6 +781,7 @@ def _project_c_priors(
     projection = {
         "protocol": RVV_C_PROJECTION_PROTOCOL,
         "target_vlen_bits": vlen_bits,
+        "target_identity": state.target.to_dict(),
         "element_bits": element_bits,
         "vector_lanes": vector_lanes,
         "reduction_axes": [list(item) for item in sorted(reduction_axes)],
@@ -1000,6 +974,362 @@ class RiscvSearchPlan:
         }
 
 
+def _riscv_loop_attachment(
+    j: SemanticArchive,
+) -> tuple[str, int | str | None] | None:
+    if not isinstance(j, SemanticArchive):
+        raise TypeError("RISC-V Layer-C interface requires SemanticArchive")
+    typed_rows = j_elaboration(j).typed_operation_rows
+    if typed_rows is None:
+        raise RiscvContractError(
+            "RISC-V structured loop requires canonical typed operation records"
+        )
+    records = {
+        record["path"]: record
+        for record in j_elaboration(j).operation_records
+    }
+    authored_by_path = j_elaboration(j).authored_node_by_path(j.node_ids)
+    loops: list[tuple[str, Any]] = []
+    for path, operation in typed_rows:
+        if "." in path or not path.startswith("body["):
+            continue
+        if operation.op != "loop":
+            continue
+        record = records.get(path)
+        node_id = record.get("id") if isinstance(record, Mapping) else None
+        if not isinstance(node_id, str):
+            raise RiscvContractError(
+                "RISC-V structured loop lacks a stable J node attachment"
+            )
+        if authored_by_path.get(path, node_id) != node_id:
+            raise RiscvContractError(
+                "RISC-V structured loop node id disagrees with canonical J"
+            )
+        if operation.node_id is not None and operation.node_id != node_id:
+            raise RiscvContractError(
+                "RISC-V structured loop typed id disagrees with canonical J"
+            )
+        loops.append((node_id, operation))
+    if not loops:
+        return None
+    if len(loops) != 1:
+        raise RiscvContractError(
+            "RISC-V Layer-C currently requires at most one top-level loop"
+        )
+    node_id, loop = loops[0]
+    if loop.trip is None:
+        raise RiscvContractError("RISC-V structured loop lacks a trip axis")
+    # Dynamic value trips have no semantic dimension axis.  Keep the loop
+    # subject available for target pipeline provenance, but do not expose a
+    # fake tile attachment to RVV search or the target plugin grammar.
+    return node_id, loop.trip.axis
+
+
+def riscv_layer_c_interface(j: SemanticArchive) -> LayerCInterface:
+    """Declare only J-addressed values consumed before RVV search/lowering."""
+
+    if not isinstance(j, SemanticArchive):
+        raise TypeError("RISC-V Layer-C interface requires SemanticArchive")
+    attachment = _riscv_loop_attachment(j)
+    if attachment is None:
+        return LayerCInterface()
+    subject_ref, axis_ref = attachment
+    if axis_ref is None:
+        return LayerCInterface()
+    return LayerCInterface(
+        (
+            LayerCExtensionPoint(
+                slot="loop_schedule_tile",
+                role="loop_schedule_tile",
+                value_type="i64",
+                required=False,
+                subject_ref=subject_ref,
+                axis_ref=axis_ref,
+            ),
+        )
+    )
+
+
+def _riscv_plugin_bindings(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+) -> tuple[LayerCBinding, ...]:
+    del state, candidate
+    # No currently registered RiscvLoweringCandidate requests pre-M0 scan
+    # strip-mining.  The optional point remains declared for a future closed
+    # candidate kind, while today's plugins deliberately leave it unbound and
+    # consume the deterministic full-axis J-only materialization.
+    return ()
+
+
+def _riscv_target_realization_contract(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+    choice: ImplementationChoice,
+) -> TargetRealizationContract:
+    """Project one admitted RVV schedule into the shared typed grammar."""
+
+    attachment = _riscv_loop_attachment(state.base.j)
+    subject_ref, axis_ref = attachment if attachment is not None else (None, None)
+    schedule = candidate.schedule
+    transformation = candidate.transformation
+    if (attachment is None or axis_ref is None) and (
+        schedule.parallel_tile or schedule.reduction_tile
+    ):
+        raise RiscvContractError(
+            "RISC-V tiled schedule requires a static-axis J-attached top-level loop"
+        )
+    parallel_mapping: tuple[TargetParallelMapping, ...] = ()
+    split: tuple[TargetSplit, ...] = ()
+    if subject_ref is not None and axis_ref is not None:
+        if schedule.parallel_tile:
+            parallel_mapping = (
+                TargetParallelMapping(
+                    slot=None,
+                    subject_ref=subject_ref,
+                    axis_ref=axis_ref,
+                    mapping="parallel",
+                    factor=schedule.parallel_tile,
+                ),
+            )
+        if schedule.reduction_tile:
+            split = (
+                TargetSplit(
+                    slot=None,
+                    subject_ref=subject_ref,
+                    axis_ref=axis_ref,
+                    factor=schedule.reduction_tile,
+                ),
+            )
+    return TargetRealizationContract(
+        parallel_mapping=parallel_mapping,
+        pipeline=(
+            TargetPipeline(
+                stage=transformation.lowering_path_kind,
+                depth=1,
+                subject_ref=subject_ref,
+                axis_ref=axis_ref,
+            ),
+        ),
+        split=split,
+        lowering=TargetLowering(
+            backend_kind=choice.backend_kind,
+            candidate_key=choice.candidate_key,
+            candidate_digest=choice.candidate_digest,
+        ),
+    )
+
+
+def _riscv_target_binding_context(
+    state: BackendSearchState,
+    contract_view: Any,
+    *,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+) -> TargetBindingContext:
+    target_interface = riscv_layer_c_interface(state.base.j)
+    return TargetBindingContext(
+        j=state.base.j,
+        target=state.target,
+        interface=target_interface,
+        capabilities=contract_view.capabilities,
+        allowed_authorizations=riscv_allowed_authorizations(state),
+        # C_target is not Source-C.  Shared E_C is populated only when the
+        # backend caller supplies it explicitly; omission means this context
+        # binds a target-only plugin.
+        e_c=e_c,
+    )
+
+
+def riscv_candidate_digest(candidate: RiscvLoweringCandidate) -> str:
+    """Digest the complete internal candidate, never caller-authored payload."""
+
+    if not isinstance(candidate, RiscvLoweringCandidate):
+        raise TypeError("RISC-V candidate digest requires RiscvLoweringCandidate")
+    return layer_c_content_digest(candidate.to_dict())
+
+
+def riscv_candidate_key(candidate: RiscvLoweringCandidate) -> str:
+    """Return a bounded opaque registry coordinate for one internal candidate."""
+
+    digest = riscv_candidate_digest(candidate)
+    return "riscv.candidate." + hashlib.sha256(
+        (candidate.candidate_id + ":" + digest).encode("utf-8")
+    ).hexdigest()
+
+
+def _required_authorizations(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+) -> tuple[str, ...]:
+    # The current registered RVV candidates do not consume a standalone
+    # realization-authorization payload.  Reassociation admission comes from
+    # the typed reduce ``assoc`` contract inspected by plan_riscv_search; other
+    # transforms are exact closed compiler states.  Keeping this empty is
+    # deliberate: a plugin that injects even a J-declared but irrelevant u*
+    # reference is rejected by resolve_riscv_target_plugin below.
+    del state, candidate
+    return ()
+
+
+def build_riscv_target_plugin(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+    *,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+) -> TargetLayerCPlugin:
+    """Freeze one plan-admitted RVV candidate as a closed target plugin."""
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("RISC-V plugin construction requires BackendSearchState")
+    if not isinstance(candidate, RiscvLoweringCandidate):
+        raise TypeError("RISC-V plugin construction requires RiscvLoweringCandidate")
+    contract = derive_riscv_contract_view(state)
+    plan = plan_riscv_search(state, enable_b_transformations=True)
+    matches = [item for item in plan.universe if item == candidate]
+    if len(matches) != 1:
+        raise RiscvContractError(
+            "RISC-V candidate is absent or ambiguous in the rebuilt search universe"
+        )
+    required_capabilities = tuple(
+        sorted(candidate.transformation.required_b_capabilities)
+    )
+    missing = set(required_capabilities) - set(contract.capabilities)
+    if missing:
+        raise RiscvContractError(
+            "RISC-V candidate lacks internally derived capabilities: "
+            + ", ".join(sorted(missing))
+        )
+    choice = ImplementationChoice(
+        backend_kind=RVV_LAYER_C_BACKEND_KIND,
+        candidate_key=riscv_candidate_key(candidate),
+        candidate_digest=riscv_candidate_digest(candidate),
+        authorization_refs=_required_authorizations(state, candidate),
+    )
+    target_contract = _riscv_target_realization_contract(
+        state,
+        candidate,
+        choice,
+    )
+    return bind_target(
+        _riscv_target_binding_context(state, contract, e_c=e_c),
+        bindings=_riscv_plugin_bindings(state, candidate),
+        choice=choice,
+        required_capabilities=required_capabilities,
+        contract=target_contract,
+    )
+
+
+def build_riscv_target_artifact(
+    state: BackendSearchState,
+    candidate: RiscvLoweringCandidate,
+    *,
+    e_c: LayerCInterface | Mapping[str, Any] | None = None,
+    e_c_mapping: Sequence[TargetExtensionMapping | Mapping[str, Any]] | None = None,
+) -> TargetPluginArtifact:
+    """Build the complete explicitly typed RVV target handoff."""
+
+    target_interface = riscv_layer_c_interface(state.base.j)
+    shared_e_c = (
+        LayerCInterface()
+        if e_c is None
+        else (
+            e_c
+            if isinstance(e_c, LayerCInterface)
+            else LayerCInterface.from_dict(e_c)
+        )
+    )
+    validate_layer_c_attachments(state.base.j, shared_e_c)
+    plugin = build_riscv_target_plugin(state, candidate, e_c=shared_e_c)
+    if e_c_mapping is None:
+        if shared_e_c == plugin.interface:
+            e_c_mapping = tuple(
+                TargetExtensionMapping(item.slot, item.slot)
+                for item in shared_e_c.points
+            )
+        elif not shared_e_c.points:
+            e_c_mapping = ()
+        else:
+            raise RiscvContractError(
+                "RISC-V shared E_C and target interface differ; an explicit "
+                "e_c_mapping is required"
+            )
+    return TargetPluginArtifact(
+        e_c=shared_e_c,
+        plugin=plugin,
+        e_c_mapping=tuple(e_c_mapping),
+    )
+
+
+def resolve_riscv_target_plugin(
+    state: BackendSearchState,
+    plugin: TargetLayerCPlugin,
+) -> RiscvLoweringCandidate:
+    """Rebuild plan/universe and resolve exactly one key+digest; never fallback."""
+
+    if not isinstance(state, BackendSearchState):
+        raise TypeError("RISC-V plugin resolution requires BackendSearchState")
+    if not isinstance(plugin, TargetLayerCPlugin):
+        raise TypeError("RISC-V lowering requires TargetLayerCPlugin")
+    contract_view = derive_riscv_contract_view(state)
+    context = _riscv_target_binding_context(state, contract_view)
+    plugin = deserialize_target_plugin(
+        context,
+        serialize_target_plugin(plugin),
+    )
+    if plugin.choice.backend_kind != RVV_LAYER_C_BACKEND_KIND:
+        raise RiscvContractError("RISC-V plugin has the wrong backend kind")
+    plan = plan_riscv_search(state, enable_b_transformations=True)
+    matches = [
+        item
+        for item in plan.universe
+        if riscv_candidate_key(item) == plugin.choice.candidate_key
+        and riscv_candidate_digest(item) == plugin.choice.candidate_digest
+    ]
+    if len(matches) != 1:
+        raise RiscvContractError(
+            "RISC-V plugin candidate key+digest is absent or ambiguous for this J/target"
+        )
+    candidate = matches[0]
+    expected_bindings = _riscv_plugin_bindings(state, candidate)
+    if plugin.bindings != expected_bindings:
+        raise RiscvContractError(
+            "RISC-V plugin bindings do not match the rebuilt candidate requirements"
+        )
+    required_capabilities = tuple(
+        sorted(candidate.transformation.required_b_capabilities)
+    )
+    if plugin.required_capabilities != required_capabilities:
+        raise RiscvContractError(
+            "RISC-V plugin capability requirements do not match the rebuilt candidate"
+        )
+    if plugin.choice.authorization_refs != _required_authorizations(state, candidate):
+        raise RiscvContractError(
+            "RISC-V plugin authorizations do not match the rebuilt candidate"
+        )
+    expected_choice = ImplementationChoice(
+        backend_kind=RVV_LAYER_C_BACKEND_KIND,
+        candidate_key=riscv_candidate_key(candidate),
+        candidate_digest=riscv_candidate_digest(candidate),
+        authorization_refs=_required_authorizations(state, candidate),
+    )
+    expected_contract = _riscv_target_realization_contract(
+        state,
+        candidate,
+        expected_choice,
+    )
+    try:
+        validate_target_plugin(
+            context,
+            plugin,
+            expected_choice=expected_choice,
+            expected_bindings=expected_bindings,
+            expected_contract=expected_contract,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RiscvContractError(str(exc)) from exc
+    return candidate
+
+
 def plan_riscv_search(
     state: BackendSearchState,
     *,
@@ -1007,19 +1337,19 @@ def plan_riscv_search(
 ) -> RiscvSearchPlan:
     if not isinstance(state, BackendSearchState):
         raise TypeError("RVV search planning requires BackendSearchState")
-    j_payload = state.base.j.to_json()
+    contract = derive_riscv_contract_view(state)
     reduction_axes, _has_scan, _float_bits, has_reassociation, has_contraction = (
-        _operation_facts(j_payload)
+        _operation_facts(state.base.j)
     )
-    has_typed_rowmask = _has_typed_rowmask_graph(j_payload)
-    has_typed_gather_chain = _has_typed_gather_chain(j_payload)
+    has_typed_rowmask = _has_typed_rowmask_graph(state.base.j)
+    has_typed_gather_chain = _has_typed_gather_chain(state.base.j)
     has_paired_rotation = (
         'intent.paired_rotation = "interleaved"' in state.base.intent_mlir
         and "intentir.paired-last-axis-rotation.v1" in state.base.intent_mlir
     )
-    has_streaming_attention = _has_typed_flash_attention_graph(j_payload)
+    has_streaming_attention = _has_typed_flash_attention_graph(state.base.j)
     has_sibling_outputs = (
-        _has_two_public_outputs(j_payload)
+        _has_two_public_outputs(state.base.j)
         and not reduction_axes
         and not has_paired_rotation
     )
@@ -1032,6 +1362,40 @@ def plan_riscv_search(
         enable_sibling_output_fusion=has_sibling_outputs,
         enable_paired_rotation=has_paired_rotation,
         enable_streaming_attention=has_streaming_attention,
+    )
+    has_ragged = bool(contract.ragged_ops)
+    has_dynamic_ragged_member = contract.dynamic_ragged_member_output
+    ragged_schedule_rejections = 0
+    if has_dynamic_ragged_member:
+        # Ragged values have a data-dependent result extent.  Keep the
+        # materialized carrier-tensor realization as the sole C++/RVV path;
+        # vector/fusion/tiled candidates are flat-tensor transformations and
+        # must not be selected around a dynamic output ABI.  The predicate is
+        # shared with the compile boundary so search and execution cannot
+        # disagree about the admitted schedule.
+        before = len(raw_universe)
+        raw_universe = tuple(
+            item
+            for item in raw_universe
+            if (
+                item.transformation == RiscvTransformationState(False)
+                and ragged_schedule_supported(item.schedule)
+            )
+        )
+        ragged_schedule_rejections = before - len(raw_universe)
+    target_vlen_bits = int(projection["target_vlen_bits"])
+    incompatible_vlen_schedules_rejected = sum(
+        item.schedule.vectorize
+        and not item.schedule.scalable_vectorization
+        and item.schedule.vector_bits != target_vlen_bits
+        for item in raw_universe
+    )
+    raw_universe = tuple(
+        item
+        for item in raw_universe
+        if not item.schedule.vectorize
+        or item.schedule.scalable_vectorization
+        or item.schedule.vector_bits == target_vlen_bits
     )
     minimum_reduction_tile = int(projection["vector_lanes"])
     subvector_reduction_schedules_rejected = sum(
@@ -1051,10 +1415,32 @@ def plan_riscv_search(
             and item.schedule.reduction_tile >= minimum_reduction_tile
         )
     )
+    schedule_attachment = _riscv_loop_attachment(state.base.j)
+    schedule_attachment_rejections = 0
+    # A dynamic value loop is a valid J control construct, but it has no
+    # semantic axis for RVV strip-mining or reduction tiling.  Remove those
+    # candidates before scoring/admission so search and target-contract
+    # validation see the same closed universe.
+    if schedule_attachment is None or schedule_attachment[1] is None:
+        before = len(universe)
+        universe = tuple(
+            item
+            for item in universe
+            if item.schedule.parallel_tile == 0
+            and item.schedule.reduction_tile == 0
+        )
+        schedule_attachment_rejections = before - len(universe)
     projection = {
         **projection,
         "minimum_reduction_tile": minimum_reduction_tile,
         "target_schedule_rejections": len(raw_universe) - len(universe),
+        "incompatible_vlen_schedules_rejected": (
+            incompatible_vlen_schedules_rejected
+        ),
+        "fixed_schedule_vlen_rule": (
+            "fixed-vector candidates must match target vlenN exactly; "
+            "other targets use scalable candidates"
+        ),
         "subvector_reduction_schedules_rejected": (
             subvector_reduction_schedules_rejected
         ),
@@ -1064,6 +1450,16 @@ def plan_riscv_search(
         "generic_contraction_reduction_tiling_admitted": not has_contraction,
         "generic_contraction_reduction_schedules_rejected": (
             contraction_reduction_schedules_rejected
+        ),
+        "schedule_attachment_rejections": schedule_attachment_rejections,
+        "ragged_schedule_rejections": ragged_schedule_rejections,
+        "ragged_schedule_rule": (
+            "only scalar, untiled, single-thread schedules may carry the "
+            "dynamic ragged_member output ABI"
+        ) if has_dynamic_ragged_member else (
+            "ragged_outer keeps the ordinary RVV schedule universe; no "
+            "dynamic member output ABI is present"
+            if has_ragged else "not_applicable"
         ),
     }
     scores = {
@@ -1185,7 +1581,14 @@ def plan_riscv_search(
 __all__ = [
     "RVV_SEARCH_PLAN_PROTOCOL",
     "RVV_C_PROJECTION_PROTOCOL",
+    "RVV_LAYER_C_BACKEND_KIND",
     "RiscvSearchPlan",
+    "build_riscv_target_plugin",
+    "build_riscv_target_artifact",
     "enumerate_riscv_candidates",
     "plan_riscv_search",
+    "resolve_riscv_target_plugin",
+    "riscv_candidate_digest",
+    "riscv_candidate_key",
+    "riscv_layer_c_interface",
 ]

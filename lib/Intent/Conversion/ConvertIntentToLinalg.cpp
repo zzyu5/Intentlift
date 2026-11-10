@@ -15,13 +15,16 @@
 #include "Intent/IntentOps.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
@@ -42,6 +45,35 @@ using namespace intent;
 
 namespace {
 
+/// MLIR arith integer operations consume signless integers.  J's unsigned
+/// tensor types remain unsigned at the Intent/ABI boundary; these no-op
+/// conversion casts expose the same bit pattern to arith and restore the
+/// declared element type at the linalg yield boundary.
+static bool isUnsignedInteger(Type type) {
+  auto integer = dyn_cast<IntegerType>(type);
+  return integer && integer.isUnsigned();
+}
+
+static Value toSignlessInteger(OpBuilder &b, Location loc, Value value) {
+  auto integer = dyn_cast<IntegerType>(value.getType());
+  if (!integer || integer.isSignless())
+    return value;
+  Type signless = IntegerType::get(value.getContext(), integer.getWidth());
+  return b.create<UnrealizedConversionCastOp>(loc, TypeRange{signless},
+                                              ValueRange{value})
+      .getResult(0);
+}
+
+static Value fromSignlessInteger(OpBuilder &b, Location loc, Value value,
+                                 Type target) {
+  auto integer = dyn_cast<IntegerType>(target);
+  if (!integer || integer.isSignless() || value.getType() == target)
+    return value;
+  return b.create<UnrealizedConversionCastOp>(loc, TypeRange{target},
+                                              ValueRange{value})
+      .getResult(0);
+}
+
 /// Coerce a scalar to an i1 truthiness (x != 0), used by the logical fns.
 /// i1 passes through; floats use unordered-not-equal-0; integers use ne-0.
 static Value truthy(OpBuilder &b, Location loc, Value v) {
@@ -52,8 +84,11 @@ static Value truthy(OpBuilder &b, Location loc, Value v) {
     Value z = b.create<arith::ConstantOp>(loc, b.getFloatAttr(t, 0.0));
     return b.create<arith::CmpFOp>(loc, arith::CmpFPredicate::UNE, v, z);
   }
-  Value z = b.create<arith::ConstantOp>(loc, b.getIntegerAttr(t, 0));
-  return b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, v, z);
+  Value integer = toSignlessInteger(b, loc, v);
+  Type integerType = integer.getType();
+  Value z = b.create<arith::ConstantOp>(
+      loc, b.getIntegerAttr(integerType, 0));
+  return b.create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, integer, z);
 }
 
 /// Scalar comparison over float OR integer/i1 operands -> an i1. Float uses the
@@ -71,14 +106,27 @@ static Value emitScalarCmp(OpBuilder &b, Location loc, StringRef fn, Value a,
     else                 p = arith::CmpFPredicate::UNE; // ne
     return b.create<arith::CmpFOp>(loc, p, a, c);
   }
+  bool unsignedComparison = isUnsignedInteger(a.getType());
+  Value lhs = toSignlessInteger(b, loc, a);
+  Value rhs = toSignlessInteger(b, loc, c);
   arith::CmpIPredicate p;
-  if (fn == "gt")      p = arith::CmpIPredicate::sgt;
-  else if (fn == "ge") p = arith::CmpIPredicate::sge;
-  else if (fn == "lt") p = arith::CmpIPredicate::slt;
-  else if (fn == "le") p = arith::CmpIPredicate::sle;
-  else if (fn == "eq") p = arith::CmpIPredicate::eq;
-  else                 p = arith::CmpIPredicate::ne;
-  return b.create<arith::CmpIOp>(loc, p, a, c);
+  if (fn == "gt")
+    p = unsignedComparison ? arith::CmpIPredicate::ugt
+                           : arith::CmpIPredicate::sgt;
+  else if (fn == "ge")
+    p = unsignedComparison ? arith::CmpIPredicate::uge
+                           : arith::CmpIPredicate::sge;
+  else if (fn == "lt")
+    p = unsignedComparison ? arith::CmpIPredicate::ult
+                           : arith::CmpIPredicate::slt;
+  else if (fn == "le")
+    p = unsignedComparison ? arith::CmpIPredicate::ule
+                           : arith::CmpIPredicate::sle;
+  else if (fn == "eq")
+    p = arith::CmpIPredicate::eq;
+  else
+    p = arith::CmpIPredicate::ne;
+  return b.create<arith::CmpIOp>(loc, p, lhs, rhs);
 }
 
 /// True for the map_binary fns that yield an i1 result: the comparisons plus the
@@ -94,12 +142,15 @@ static bool isI1BinaryFn(StringRef fn) {
 static bool hasScalarBinary(StringRef fn, Type elementType) {
   if (isa<IntegerType>(elementType))
     return fn == "add" || fn == "sub" || fn == "mul" || fn == "div" ||
-           fn == "max" || fn == "min" || fn == "gt" || fn == "ge" ||
-           fn == "lt" || fn == "le" || fn == "eq" || fn == "ne" ||
-           fn == "logical_and" || fn == "logical_or" || fn == "logical_xor" ||
-           fn == "and" || fn == "or" || fn == "xor";
+           fn == "floordiv" || fn == "remainder" || fn == "max" ||
+           fn == "min" || fn == "left_shift" || fn == "right_shift" ||
+           fn == "gt" || fn == "ge" || fn == "lt" || fn == "le" ||
+           fn == "eq" || fn == "ne" || fn == "logical_and" ||
+           fn == "logical_or" || fn == "logical_xor" || fn == "and" ||
+           fn == "or" || fn == "xor";
   return fn == "add" || fn == "sub" || fn == "mul" || fn == "div" ||
-         fn == "max" || fn == "min" || fn == "pow" || fn == "atan2" ||
+         fn == "floordiv" || fn == "remainder" || fn == "max" ||
+         fn == "min" || fn == "pow" || fn == "atan2" || fn == "copysign" ||
          isI1BinaryFn(fn);
 }
 
@@ -107,29 +158,72 @@ static bool hasScalarBinary(StringRef fn, Type elementType) {
 /// Returns nullptr for fns that have no scalar form here yet.
 static Value emitScalarBinary(OpBuilder &b, Location loc, StringRef fn, Value a,
                               Value c) {
-  if (isa<IntegerType>(a.getType())) {
+  if (auto integer = dyn_cast<IntegerType>(a.getType())) {
+    bool unsignedArithmetic = integer.isUnsigned();
+    Value lhs = toSignlessInteger(b, loc, a);
+    Value rhs = toSignlessInteger(b, loc, c);
+    Value result;
     if (fn == "add")
-      return b.create<arith::AddIOp>(loc, a, c);
-    if (fn == "sub")
-      return b.create<arith::SubIOp>(loc, a, c);
-    if (fn == "mul")
-      return b.create<arith::MulIOp>(loc, a, c);
-    if (fn == "div")
-      return b.create<arith::DivSIOp>(loc, a, c);
-    if (fn == "max")
-      return b.create<arith::MaxSIOp>(loc, a, c);
-    if (fn == "min")
-      return b.create<arith::MinSIOp>(loc, a, c);
-    if (fn == "gt" || fn == "ge" || fn == "lt" || fn == "le" ||
-        fn == "eq" || fn == "ne")
+      result = b.create<arith::AddIOp>(loc, lhs, rhs);
+    else if (fn == "sub")
+      result = b.create<arith::SubIOp>(loc, lhs, rhs);
+    else if (fn == "mul")
+      result = b.create<arith::MulIOp>(loc, lhs, rhs);
+    else if (fn == "div")
+      result = unsignedArithmetic
+                   ? Value(b.create<arith::DivUIOp>(loc, lhs, rhs))
+                   : Value(b.create<arith::DivSIOp>(loc, lhs, rhs));
+    else if (fn == "floordiv")
+      result = unsignedArithmetic
+                   ? Value(b.create<arith::DivUIOp>(loc, lhs, rhs))
+                   : Value(b.create<arith::FloorDivSIOp>(loc, lhs, rhs));
+    else if (fn == "remainder") {
+      if (unsignedArithmetic) {
+        result = b.create<arith::RemUIOp>(loc, lhs, rhs);
+      } else {
+        Value remainder = b.create<arith::RemSIOp>(loc, lhs, rhs);
+        Type signedType = lhs.getType();
+        Value zero = b.create<arith::ConstantOp>(
+            loc, b.getIntegerAttr(signedType, 0));
+        Value lhsNegative = b.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::slt, lhs, zero);
+        Value rhsNegative = b.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::slt, rhs, zero);
+        Value differentSigns = b.create<arith::XOrIOp>(
+            loc, lhsNegative, rhsNegative);
+        Value nonzero = b.create<arith::CmpIOp>(
+            loc, arith::CmpIPredicate::ne, remainder, zero);
+        Value adjust = b.create<arith::AndIOp>(
+            loc, differentSigns, nonzero);
+        Value adjusted = b.create<arith::AddIOp>(loc, remainder, rhs);
+        result = b.create<arith::SelectOp>(loc, adjust, adjusted, remainder);
+      }
+    } else if (fn == "max")
+      result = unsignedArithmetic
+                   ? Value(b.create<arith::MaxUIOp>(loc, lhs, rhs))
+                   : Value(b.create<arith::MaxSIOp>(loc, lhs, rhs));
+    else if (fn == "min")
+      result = unsignedArithmetic
+                   ? Value(b.create<arith::MinUIOp>(loc, lhs, rhs))
+                   : Value(b.create<arith::MinSIOp>(loc, lhs, rhs));
+    else if (fn == "left_shift")
+      result = b.create<arith::ShLIOp>(loc, lhs, rhs);
+    else if (fn == "right_shift")
+      result = unsignedArithmetic
+                   ? Value(b.create<arith::ShRUIOp>(loc, lhs, rhs))
+                   : Value(b.create<arith::ShRSIOp>(loc, lhs, rhs));
+    else if (fn == "gt" || fn == "ge" || fn == "lt" || fn == "le" ||
+             fn == "eq" || fn == "ne")
       return emitScalarCmp(b, loc, fn, a, c);
-    if (fn == "logical_and" || fn == "and")
+    else if (fn == "logical_and" || fn == "and")
       return b.create<arith::AndIOp>(loc, truthy(b, loc, a), truthy(b, loc, c));
-    if (fn == "logical_or" || fn == "or")
+    else if (fn == "logical_or" || fn == "or")
       return b.create<arith::OrIOp>(loc, truthy(b, loc, a), truthy(b, loc, c));
-    if (fn == "logical_xor" || fn == "xor")
+    else if (fn == "logical_xor" || fn == "xor")
       return b.create<arith::XOrIOp>(loc, truthy(b, loc, a), truthy(b, loc, c));
-    return nullptr;
+    else
+      return nullptr;
+    return fromSignlessInteger(b, loc, result, a.getType());
   }
   if (fn == "add")
     return b.create<arith::AddFOp>(loc, a, c);
@@ -139,6 +233,16 @@ static Value emitScalarBinary(OpBuilder &b, Location loc, StringRef fn, Value a,
     return b.create<arith::MulFOp>(loc, a, c);
   if (fn == "div")
     return b.create<arith::DivFOp>(loc, a, c);
+  if (fn == "floordiv") {
+    Value quotient = b.create<arith::DivFOp>(loc, a, c);
+    return b.create<math::FloorOp>(loc, quotient);
+  }
+  if (fn == "remainder") {
+    Value quotient = b.create<arith::DivFOp>(loc, a, c);
+    Value floored = b.create<math::FloorOp>(loc, quotient);
+    return b.create<arith::SubFOp>(
+        loc, a, b.create<arith::MulFOp>(loc, floored, c));
+  }
   if (fn == "max")
     return b.create<arith::MaximumFOp>(loc, a, c);
   if (fn == "min")
@@ -149,6 +253,8 @@ static Value emitScalarBinary(OpBuilder &b, Location loc, StringRef fn, Value a,
   // uses the libdevice-safe minimax atan2 in MapEmit.h). angle=atan2(imag,real).
   if (fn == "atan2")
     return b.create<math::Atan2Op>(loc, a, c);
+  if (fn == "copysign")
+    return b.create<math::CopySignOp>(loc, a, c);
   if (fn == "gt" || fn == "ge" || fn == "lt" || fn == "le" || fn == "eq" ||
       fn == "ne")
     return emitScalarCmp(b, loc, fn, a, c);
@@ -192,14 +298,34 @@ static Value emitScalarUnary(OpBuilder &b, Location loc, StringRef fn, Value x) 
     return b.create<math::LogOp>(loc, x);
   if (fn == "log2")
     return b.create<math::Log2Op>(loc, x);
-  if (fn == "abs")
+  if (fn == "abs") {
+    // Unsigned absolute value is already non-negative.
+    if (isUnsignedInteger(x.getType()))
+      return x;
+    if (isa<IntegerType>(x.getType())) {
+      return b.create<math::AbsIOp>(loc, x);
+    }
     return b.create<math::AbsFOp>(loc, x);
+  }
   if (fn == "sqrt")
     return b.create<math::SqrtOp>(loc, x);
   if (fn == "rsqrt")
     return b.create<math::RsqrtOp>(loc, x);
-  if (fn == "neg")
+  if (fn == "neg") {
+    if (isUnsignedInteger(x.getType())) {
+      Value integer = toSignlessInteger(b, loc, x);
+      Value zero = b.create<arith::ConstantOp>(
+          loc, b.getIntegerAttr(integer.getType(), 0));
+      Value result = b.create<arith::SubIOp>(loc, zero, integer);
+      return fromSignlessInteger(b, loc, result, x.getType());
+    }
+    if (isa<IntegerType>(x.getType())) {
+      Value zero = b.create<arith::ConstantOp>(
+          loc, b.getIntegerAttr(x.getType(), 0));
+      return b.create<arith::SubIOp>(loc, zero, x);
+    }
     return b.create<arith::NegFOp>(loc, x);
+  }
   if (fn == "recip") {
     Value one = b.create<arith::ConstantOp>(loc, b.getFloatAttr(x.getType(), 1.0));
     return b.create<arith::DivFOp>(loc, one, x);
@@ -223,6 +349,75 @@ static Value emitScalarUnary(OpBuilder &b, Location loc, StringRef fn, Value x) 
     return b.create<math::AtanOp>(loc, x);
   if (fn == "erf")
     return b.create<math::ErfOp>(loc, x);
+  if (fn == "erfc") {
+    Value one = b.create<arith::ConstantOp>(loc, b.getFloatAttr(x.getType(), 1.0));
+    return b.create<arith::SubFOp>(loc, one, b.create<math::ErfOp>(loc, x));
+  }
+  if (fn == "acos")
+    return b.create<math::AcosOp>(loc, x);
+  if (fn == "asin")
+    return b.create<math::AsinOp>(loc, x);
+  if (fn == "cbrt")
+    return b.create<math::CbrtOp>(loc, x);
+  if (fn == "ceil")
+    return b.create<math::CeilOp>(loc, x);
+  if (fn == "floor")
+    return b.create<math::FloorOp>(loc, x);
+  if (fn == "round")
+    return b.create<math::RoundOp>(loc, x);
+  if (fn == "roundeven")
+    return b.create<math::RoundEvenOp>(loc, x);
+  if (fn == "trunc")
+    return b.create<math::TruncOp>(loc, x);
+  if (fn == "sign") {
+    if (isUnsignedInteger(x.getType())) {
+      Value integer = toSignlessInteger(b, loc, x);
+      Type integerType = integer.getType();
+      Value zero = b.create<arith::ConstantOp>(
+          loc, b.getIntegerAttr(integerType, 0));
+      Value positive = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::ugt, integer, zero);
+      Value one = b.create<arith::ConstantOp>(
+          loc, b.getIntegerAttr(integerType, 1));
+      Value result = b.create<arith::SelectOp>(loc, positive, one, zero);
+      return fromSignlessInteger(b, loc, result, x.getType());
+    }
+    Value zero;
+    Value negative;
+    Value positive;
+    if (isa<FloatType>(x.getType())) {
+      zero = b.create<arith::ConstantOp>(loc, b.getFloatAttr(x.getType(), 0.0));
+      negative = b.create<arith::CmpFOp>(
+          loc, arith::CmpFPredicate::OLT, x, zero);
+      positive = b.create<arith::CmpFOp>(
+          loc, arith::CmpFPredicate::OGT, x, zero);
+    } else {
+      zero = b.create<arith::ConstantOp>(
+          loc, b.getIntegerAttr(x.getType(), 0));
+      negative = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::slt, x, zero);
+      positive = b.create<arith::CmpIOp>(
+          loc, arith::CmpIPredicate::sgt, x, zero);
+    }
+    Value minusOne = isa<FloatType>(x.getType())
+                         ? b.create<arith::ConstantOp>(
+                               loc, b.getFloatAttr(x.getType(), -1.0))
+                         : b.create<arith::ConstantOp>(
+                               loc, b.getIntegerAttr(x.getType(), -1));
+    Value plusOne = isa<FloatType>(x.getType())
+                        ? b.create<arith::ConstantOp>(
+                              loc, b.getFloatAttr(x.getType(), 1.0))
+                        : b.create<arith::ConstantOp>(
+                              loc, b.getIntegerAttr(x.getType(), 1));
+    Value signedValue = b.create<arith::SelectOp>(loc, negative, minusOne, x);
+    return b.create<arith::SelectOp>(loc, positive, plusOne, signedValue);
+  }
+  if (fn == "log10")
+    return b.create<math::Log10Op>(loc, x);
+  if (fn == "log1p")
+    return b.create<math::Log1pOp>(loc, x);
+  if (fn == "expm1")
+    return b.create<math::ExpM1Op>(loc, x);
   if (fn == "sigmoid") {
     // 1 / (1 + exp(-x))
     Value one = b.create<arith::ConstantOp>(loc, b.getFloatAttr(x.getType(), 1.0));
@@ -259,7 +454,43 @@ static bool hasScalarUnary(StringRef fn) {
          fn == "sqrt" ||
          fn == "rsqrt" || fn == "neg" || fn == "recip" || fn == "tanh" ||
          fn == "cos" || fn == "sin" || fn == "tan" || fn == "exp2" ||
-         fn == "atan" || fn == "erf" || fn == "sigmoid" || isToI1UnaryFn(fn);
+         fn == "atan" || fn == "erf" || fn == "erfc" || fn == "sigmoid" ||
+         fn == "acos" || fn == "asin" || fn == "cbrt" || fn == "ceil" ||
+         fn == "floor" || fn == "round" || fn == "roundeven" || fn == "trunc" ||
+         fn == "sign" || fn == "log10" || fn == "log1p" || fn == "expm1" ||
+         isToI1UnaryFn(fn);
+}
+
+/// Create a destination tensor while preserving runtime extents from one of
+/// the operation's ranked tensor operands.  Dynamic Ragged member results use
+/// this helper before entering an ordinary linalg.generic consumer; an empty
+/// tensor with omitted dynamic-size operands is not a complete lowering.
+static Value createTensorEmptyLike(OpBuilder &builder, Location loc,
+                                   RankedTensorType resultType,
+                                   ValueRange shapeSources) {
+  if (resultType.hasStaticShape())
+    return builder.create<tensor::EmptyOp>(loc, resultType.getShape(),
+                                           resultType.getElementType());
+
+  SmallVector<Value> dynamicSizes;
+  for (auto [axis, dimension] : llvm::enumerate(resultType.getShape())) {
+    if (!ShapedType::isDynamic(dimension))
+      continue;
+    Value size;
+    for (Value source : shapeSources) {
+      auto sourceType = dyn_cast<RankedTensorType>(source.getType());
+      if (!sourceType || sourceType.getRank() != resultType.getRank())
+        continue;
+      size = builder.create<tensor::DimOp>(loc, source, axis);
+      break;
+    }
+    if (!size)
+      return Value();
+    dynamicSizes.push_back(size);
+  }
+  return builder.create<tensor::EmptyOp>(loc, resultType.getShape(),
+                                         resultType.getElementType(),
+                                         dynamicSizes);
 }
 
 struct MapUnaryLowering : OpRewritePattern<MapUnaryOp> {
@@ -273,15 +504,20 @@ struct MapUnaryLowering : OpRewritePattern<MapUnaryOp> {
     if (toI1) {
       if (!resTy.getElementType().isInteger(1))
         return rewriter.notifyMatchFailure(op, "i1 predicate needs i1 result");
-    } else if (!isa<FloatType>(resTy.getElementType())) {
+    } else if (!isa<FloatType>(resTy.getElementType()) &&
+               !(fn == "identity" || fn == "neg" || fn == "abs" ||
+                 fn == "sign")) {
       return rewriter.notifyMatchFailure(op, "non-float unary not implemented");
     }
     if (!hasScalarUnary(fn))
       return rewriter.notifyMatchFailure(op, "fn has no scalar lowering");
 
     Location loc = op.getLoc();
-    Value init = rewriter.create<tensor::EmptyOp>(loc, resTy.getShape(),
-                                                  resTy.getElementType());
+    Value init = createTensorEmptyLike(rewriter, loc, resTy,
+                                       ValueRange{op.getInput()});
+    if (!init)
+      return rewriter.notifyMatchFailure(
+          op, "dynamic unary result has no operand-provided extent");
     unsigned rank = resTy.getRank();
     SmallVector<AffineMap> maps(2, rewriter.getMultiDimIdentityMap(rank));
     SmallVector<utils::IteratorType> iters(rank, utils::IteratorType::parallel);
@@ -320,13 +556,195 @@ struct IotaLowering : OpRewritePattern<IotaOp> {
         loc, TypeRange{resTy}, ValueRange{}, ValueRange{init}, maps, iters,
         [&](OpBuilder &b, Location l, ValueRange) {
           Value index = b.create<linalg::IndexOp>(l, 0);
-          Value value = elemTy.isIndex()
-                            ? index
-                            : b.create<arith::IndexCastOp>(l, elemTy, index)
-                                  .getResult();
+          Value value;
+          if (elemTy.isIndex()) {
+            value = index;
+          } else if (auto integer = dyn_cast<IntegerType>(elemTy);
+                     integer && integer.isUnsigned()) {
+            Type signless = IntegerType::get(l.getContext(), integer.getWidth());
+            Value cast = b.create<arith::IndexCastOp>(l, signless, index);
+            value = fromSignlessInteger(b, l, cast, elemTy);
+          } else {
+            value = b.create<arith::IndexCastOp>(l, elemTy, index).getResult();
+          }
           b.create<linalg::YieldOp>(l, value);
         });
     rewriter.replaceOp(op, generic.getResults());
+    return success();
+  }
+};
+
+/// Convert one scalar integer tensor value to an MLIR index.  Ragged offsets
+/// and the outer selector are allowed to use different integer widths and
+/// signedness, while tensor.extract_slice requires index-typed dynamic bounds.
+static Value raggedToIndex(OpBuilder &builder, Location loc, Value value) {
+  if (value.getType().isIndex())
+    return value;
+  auto integer = dyn_cast<IntegerType>(value.getType());
+  if (!integer)
+    return Value();
+  return builder.create<arith::IndexCastOp>(
+      loc, builder.getIndexType(), toSignlessInteger(builder, loc, value));
+}
+
+/// Convert an MLIR index back to the declared scalar tensor element type.
+static Value raggedFromIndex(OpBuilder &builder, Location loc, Value value,
+                             Type target) {
+  if (target.isIndex())
+    return value;
+  auto integer = dyn_cast<IntegerType>(target);
+  if (!integer)
+    return Value();
+  Type signless = IntegerType::get(builder.getContext(), integer.getWidth());
+  Value cast = builder.create<arith::IndexCastOp>(loc, signless, value);
+  return fromSignlessInteger(builder, loc, cast, target);
+}
+
+/// Lower the tuple-shaped descriptor producer after all of its semantic users
+/// have been rewritten.  A live tuple cannot cross the target ABI: the only
+/// supported representation is the two carrier tensors consumed directly by
+/// RaggedOuterLowering/RaggedMemberLowering below.
+struct RaggedCleanupLowering : OpRewritePattern<RaggedOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(RaggedOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!op.getResult().use_empty())
+      return rewriter.notifyMatchFailure(
+          op, "ragged descriptor still has an unlowered consumer");
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// Lower ragged_outer to offsets.size - 1 as a rank-0 tensor of the authored
+/// offsets element type.  The descriptor is intentionally required to come
+/// from RaggedOp: this keeps tuple values from becoming an implicit ABI and
+/// makes a future external descriptor ABI an explicit extension point.
+struct RaggedOuterLowering : OpRewritePattern<RaggedOuterOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(RaggedOuterOp op,
+                                PatternRewriter &rewriter) const override {
+    auto producer = op.getRagged().getDefiningOp<RaggedOp>();
+    if (!producer)
+      return rewriter.notifyMatchFailure(
+          op, "ragged_outer requires a local ragged descriptor producer");
+    auto offsetsTy = dyn_cast<RankedTensorType>(producer.getOffsets().getType());
+    auto resultTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+    if (!offsetsTy || !resultTy || !isRaggedCarrierTensorType(offsetsTy) ||
+        resultTy.getRank() != 0 ||
+        !isRaggedCarrierElementType(resultTy.getElementType()))
+      return rewriter.notifyMatchFailure(op, "invalid ragged outer tensor types");
+
+    Location loc = op.getLoc();
+    Value count;
+    if (offsetsTy.isDynamicDim(0))
+      count = rewriter.create<tensor::DimOp>(loc, producer.getOffsets(), 0);
+    else
+      count = rewriter.create<arith::ConstantIndexOp>(loc,
+                                                      offsetsTy.getDimSize(0));
+    Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value outer = rewriter.create<arith::SubIOp>(loc, count, one);
+    Value scalar = raggedFromIndex(rewriter, loc, outer,
+                                   resultTy.getElementType());
+    if (!scalar)
+      return rewriter.notifyMatchFailure(
+          op, "ragged outer result is not an integer/index type");
+    Value result = rewriter.create<tensor::FromElementsOp>(
+        loc, resultTy, ValueRange{scalar});
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Lower ragged_member to a dynamic one-dimensional tensor.extract_slice:
+/// indices[offsets[i] : offsets[i + 1]].  Both offsets and the selector retain
+/// their authored integer ABI types; only the slice bounds are converted to
+/// MLIR index values.
+struct RaggedMemberLowering : OpRewritePattern<RaggedMemberOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(RaggedMemberOp op,
+                                PatternRewriter &rewriter) const override {
+    auto producer = op.getRagged().getDefiningOp<RaggedOp>();
+    if (!producer)
+      return rewriter.notifyMatchFailure(
+          op, "ragged_member requires a local ragged descriptor producer");
+    auto offsetsTy = dyn_cast<RankedTensorType>(producer.getOffsets().getType());
+    auto indicesTy = dyn_cast<RankedTensorType>(producer.getIndices().getType());
+    auto indexTy = dyn_cast<RankedTensorType>(op.getIndex().getType());
+    auto resultTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+    if (!offsetsTy || !indicesTy || !indexTy || !resultTy ||
+        !isRaggedCarrierTensorType(offsetsTy) ||
+        !isRaggedCarrierTensorType(indicesTy) ||
+        indexTy.getRank() != 0 ||
+        !isRaggedCarrierElementType(indexTy.getElementType()) ||
+        resultTy.getRank() != 1 ||
+        !isRaggedCarrierElementType(resultTy.getElementType()) ||
+        !resultTy.isDynamicDim(0))
+      return rewriter.notifyMatchFailure(op, "invalid ragged member tensor types");
+
+    Location loc = op.getLoc();
+    Value selector = rewriter.create<tensor::ExtractOp>(
+        loc, op.getIndex(), ValueRange{});
+    selector = raggedToIndex(rewriter, loc, selector);
+    if (!selector)
+      return rewriter.notifyMatchFailure(
+          op, "ragged member selector is not an integer/index type");
+
+    Value nextSelector = rewriter.create<arith::AddIOp>(
+        loc, selector, rewriter.create<arith::ConstantIndexOp>(loc, 1));
+    Value startRaw = rewriter.create<tensor::ExtractOp>(
+        loc, producer.getOffsets(), ValueRange{selector});
+    Value endRaw = rewriter.create<tensor::ExtractOp>(
+        loc, producer.getOffsets(), ValueRange{nextSelector});
+    Value start = raggedToIndex(rewriter, loc, startRaw);
+    Value end = raggedToIndex(rewriter, loc, endRaw);
+    if (!start || !end)
+      return rewriter.notifyMatchFailure(
+          op, "ragged offsets are not integer/index values");
+    Value length = rewriter.create<arith::SubIOp>(loc, end, start);
+
+    SmallVector<OpFoldResult> offsets{start};
+    SmallVector<OpFoldResult> sizes{length};
+    SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1)};
+    Value result = rewriter.create<tensor::ExtractSliceOp>(
+        loc, resultTy, producer.getIndices(), offsets, sizes, strides);
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+/// Materialize the static shape operand required by tensor.reshape.  The
+/// Layer-A JSON form may use symbolic extents, but this MLIR front end is
+/// instantiated at concrete dimensions, so the target-neutral lowering keeps
+/// the result type and shape attribute in lockstep.
+struct ReshapeLowering : OpRewritePattern<ReshapeOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ReshapeOp op,
+                                PatternRewriter &rewriter) const override {
+    auto inputTy = dyn_cast<RankedTensorType>(op.getInput().getType());
+    auto resultTy = dyn_cast<RankedTensorType>(op.getResult().getType());
+    if (!inputTy || !resultTy || !inputTy.hasStaticShape() ||
+        !resultTy.hasStaticShape())
+      return rewriter.notifyMatchFailure(
+          op, "reshape lowering currently requires static ranked tensors");
+    if (static_cast<int64_t>(op.getShape().size()) != resultTy.getRank())
+      return rewriter.notifyMatchFailure(op, "shape rank differs from result rank");
+
+    SmallVector<int64_t> extents;
+    extents.reserve(op.getShape().size());
+    for (Attribute attr : op.getShape())
+      extents.push_back(cast<IntegerAttr>(attr).getInt());
+
+    auto shapeTy = RankedTensorType::get(
+        {static_cast<int64_t>(extents.size())}, rewriter.getIndexType());
+    auto shapeAttr = DenseIntElementsAttr::get(shapeTy, extents);
+    Value shape = rewriter.create<arith::ConstantOp>(op.getLoc(), shapeAttr);
+    rewriter.replaceOpWithNewOp<tensor::ReshapeOp>(op, resultTy, op.getInput(),
+                                                  shape);
     return success();
   }
 };
@@ -346,6 +764,10 @@ struct IdentityScatterLowering : OpRewritePattern<ScatterOp> {
 
   LogicalResult matchAndRewrite(ScatterOp op,
                                 PatternRewriter &rewriter) const override {
+    if (op->hasAttr("atomic") || op->hasAttr("ordering") ||
+        op->hasAttr("memory_scope") || op->hasAttr("cas_retry"))
+      return rewriter.notifyMatchFailure(
+          op, "identity scatter lowering does not consume atomic metadata");
     if (op.getMode() != "along_axis" || op.getReduce() != "none")
       return failure();
     auto dataTy = dyn_cast<RankedTensorType>(op.getData().getType());
@@ -437,8 +859,11 @@ struct MapBinaryLowering : OpRewritePattern<MapBinaryOp> {
         rewriter.getMultiDimIdentityMap(rank)};
     SmallVector<utils::IteratorType> iters(rank, utils::IteratorType::parallel);
 
-    Value init = rewriter.create<tensor::EmptyOp>(loc, resTy.getShape(),
-                                                  resTy.getElementType());
+    Value init = createTensorEmptyLike(
+        rewriter, loc, resTy, ValueRange{op.getLhs(), op.getRhs()});
+    if (!init)
+      return rewriter.notifyMatchFailure(
+          op, "dynamic binary result has no operand-provided extent");
     StringRef fn = op.getFn();
     auto generic = rewriter.create<linalg::GenericOp>(
         loc, TypeRange{resTy}, ValueRange{op.getLhs(), op.getRhs()},
@@ -454,7 +879,8 @@ struct MapBinaryLowering : OpRewritePattern<MapBinaryOp> {
 /// Lower `intent.select` (numpy where) to a linalg.generic over `arith.select`.
 /// cond is i1; cond/x/y broadcast numpy-style into the result shape (so a rank-0
 /// scalar branch or an [M,N] i1 condition over rank-0 x/y both work). C2c: select
-/// now lowers on the general linalg path (was GPU-pass-only), so map+cmp+select
+/// now lowers on the general linalg path (was GPU-pass-only), so
+/// map+comparison+select
 /// composites (masked_fill / threshold / nan_to_num / logical_*) reach zero
 /// residual.
 struct SelectLowering : OpRewritePattern<SelectOp> {
@@ -475,8 +901,12 @@ struct SelectLowering : OpRewritePattern<SelectOp> {
         broadcastMap(ctx, yTy.getShape(), resTy.getShape()),
         rewriter.getMultiDimIdentityMap(rank)};
     SmallVector<utils::IteratorType> iters(rank, utils::IteratorType::parallel);
-    Value init = rewriter.create<tensor::EmptyOp>(loc, resTy.getShape(),
-                                                  resTy.getElementType());
+    Value init = createTensorEmptyLike(
+        rewriter, loc, resTy,
+        ValueRange{op.getCond(), op.getX(), op.getY()});
+    if (!init)
+      return rewriter.notifyMatchFailure(
+          op, "dynamic select result has no operand-provided extent");
     auto generic = rewriter.create<linalg::GenericOp>(
         loc, TypeRange{resTy}, ValueRange{op.getCond(), op.getX(), op.getY()},
         ValueRange{init}, maps, iters,
@@ -558,9 +988,11 @@ struct GatherLowering : OpRewritePattern<GatherOp> {
           Value rawIndex =
               b.create<tensor::ExtractOp>(l, op.getIndex(), indexCoords);
           Value gathered = rawIndex;
-          if (!isa<IndexType>(rawIndex.getType()))
+          if (!isa<IndexType>(rawIndex.getType())) {
+            Value integer = toSignlessInteger(b, l, rawIndex);
             gathered = b.create<arith::IndexCastOp>(
-                l, b.getIndexType(), rawIndex);
+                l, b.getIndexType(), integer);
+          }
 
           SmallVector<Value> dataCoords;
           if (alongAxis) {
@@ -592,28 +1024,44 @@ struct GatherLowering : OpRewritePattern<GatherOp> {
 static Value emitReduceCombine(OpBuilder &b, Location loc, StringRef fn, Value a,
                                Value c,
                                bool allowFloatReassociation = false) {
-  bool isInteger = isa<IntegerType>(a.getType());
+  auto integer = dyn_cast<IntegerType>(a.getType());
+  bool isInteger = integer != nullptr;
+  bool unsignedInteger = integer && integer.isUnsigned();
+  Value lhs = isInteger ? toSignlessInteger(b, loc, a) : a;
+  Value rhs = isInteger ? toSignlessInteger(b, loc, c) : c;
   arith::FastMathFlags floatFlags =
       allowFloatReassociation ? arith::FastMathFlags::reassoc
                               : arith::FastMathFlags::none;
   if (fn == "sum" || fn == "mean") {
     if (isInteger)
-      return b.create<arith::AddIOp>(loc, a, c);
+      return fromSignlessInteger(b, loc,
+                                 b.create<arith::AddIOp>(loc, lhs, rhs),
+                                 a.getType());
     return b.create<arith::AddFOp>(loc, a, c, floatFlags);
   }
   if (fn == "max") {
     if (isInteger)
-      return b.create<arith::MaxSIOp>(loc, a, c);
+      return fromSignlessInteger(
+          b, loc,
+          unsignedInteger ? Value(b.create<arith::MaxUIOp>(loc, lhs, rhs))
+                          : Value(b.create<arith::MaxSIOp>(loc, lhs, rhs)),
+          a.getType());
     return b.create<arith::MaxNumFOp>(loc, a, c);
   }
   if (fn == "min") {
     if (isInteger)
-      return b.create<arith::MinSIOp>(loc, a, c);
+      return fromSignlessInteger(
+          b, loc,
+          unsignedInteger ? Value(b.create<arith::MinUIOp>(loc, lhs, rhs))
+                          : Value(b.create<arith::MinSIOp>(loc, lhs, rhs)),
+          a.getType());
     return b.create<arith::MinNumFOp>(loc, a, c);
   }
   if (fn == "prod") {
     if (isInteger)
-      return b.create<arith::MulIOp>(loc, a, c);
+      return fromSignlessInteger(b, loc,
+                                 b.create<arith::MulIOp>(loc, lhs, rhs),
+                                 a.getType());
     return b.create<arith::MulFOp>(loc, a, c, floatFlags);
   }
   if (fn == "all")
@@ -645,9 +1093,13 @@ static Value reduceIdentityConst(OpBuilder &b, Location loc, StringRef fn,
     if (fn == "prod")
       ident = llvm::APInt(width, 1);
     else if (fn == "max")
-      ident = llvm::APInt::getSignedMinValue(width);
+      ident = isUnsignedInteger(elemTy)
+                  ? llvm::APInt::getMinValue(width)
+                  : llvm::APInt::getSignedMinValue(width);
     else if (fn == "min")
-      ident = llvm::APInt::getSignedMaxValue(width);
+      ident = isUnsignedInteger(elemTy)
+                  ? llvm::APInt::getMaxValue(width)
+                  : llvm::APInt::getSignedMaxValue(width);
     return b.create<arith::ConstantOp>(loc, b.getIntegerAttr(elemTy, ident));
   }
 
@@ -690,6 +1142,57 @@ struct ReduceLowering : OpRewritePattern<ReduceOp> {
         (elemTy.isInteger(1) && isBoolReduce(fn));
     if (!supported)
       return rewriter.notifyMatchFailure(op, "unsupported reduce element type");
+
+    // Ragged member produces a runtime-length rank-one tensor.  Keep this
+    // target-neutral path in the common lowering instead of leaving a high-
+    // level reduce for one backend to rediscover.  The dynamic form is the
+    // exact one-dimensional reduction used by the J contract: it reduces the
+    // complete member vector to a scalar result.  Static multi-dimensional
+    // reductions continue through the linalg.generic path below.
+    if (!inTy.hasStaticShape()) {
+      int64_t dynamicAxis =
+          op.getAxes().size() == 1
+              ? cast<IntegerAttr>(op.getAxes()[0]).getInt()
+              : std::numeric_limits<int64_t>::min();
+      if (inTy.getRank() != 1 || resTy.getRank() != 0 ||
+          (dynamicAxis != 0 && dynamicAxis != -1) ||
+          resTy.getElementType() != elemTy)
+        return rewriter.notifyMatchFailure(
+            op, "dynamic reduce currently requires a rank-one full reduction");
+
+      Location loc = op.getLoc();
+      Value lower = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value upper = rewriter.create<tensor::DimOp>(loc, op.getInput(), 0);
+      Value step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      StringRef combineFn = fn == "mean" ? "sum" : fn;
+      Value identity = reduceIdentityConst(rewriter, loc, combineFn, elemTy);
+      auto reduction = rewriter.create<scf::ForOp>(
+          loc, lower, upper, step, ValueRange{identity},
+          [&](OpBuilder &b, Location l, Value iv, ValueRange iterArgs) {
+            Value element = b.create<tensor::ExtractOp>(
+                l, op.getInput(), ValueRange{iv});
+            Value combined = emitReduceCombine(
+                b, l, combineFn, iterArgs.front(), element,
+                allowFloatReassociation);
+            b.create<scf::YieldOp>(l, combined);
+          });
+      Value scalar = reduction.getResult(0);
+      if (fn == "mean") {
+        auto floatTy = dyn_cast<FloatType>(elemTy);
+        if (!floatTy)
+          return rewriter.notifyMatchFailure(
+              op, "dynamic mean requires a floating-point member tensor");
+        Value count = rewriter.create<arith::IndexCastOp>(
+            loc, rewriter.getI64Type(), upper);
+        Value countFloat = rewriter.create<arith::SIToFPOp>(
+            loc, floatTy, count);
+        scalar = rewriter.create<arith::DivFOp>(loc, scalar, countFloat);
+      }
+      Value result = rewriter.create<tensor::FromElementsOp>(
+          loc, resTy, ValueRange{scalar});
+      rewriter.replaceOp(op, result);
+      return success();
+    }
 
     unsigned R = inTy.getRank();
     SmallVector<bool> isReduced(R, false);
@@ -1087,15 +1590,16 @@ struct ContractionLowering : OpRewritePattern<ContractionOp> {
         [&](OpBuilder &b, Location l, ValueRange args) {
           auto castToAccumulator = [&](Value value) -> Value {
             if (!isFloat)
-              return value;
+              return toSignlessInteger(b, l, value);
             auto dstTy = cast<FloatType>(elemTy);
             if (auto integer = dyn_cast<IntegerType>(value.getType())) {
               // Mixed numeric no-reduction contractions are the canonical
               // outer-mask spelling emitted for one-hot coefficient grids.
-              // i1 is an unsigned boolean (0/1); wider canonical integers are
-              // signed.  The result type owns the explicit numeric promotion.
-              if (integer.getWidth() == 1)
-                return b.create<arith::UIToFPOp>(l, dstTy, value);
+              // i1 and explicit unsigned integers use the UI conversion; the
+              // result type owns the explicit numeric promotion.
+              if (integer.getWidth() == 1 || integer.isUnsigned())
+                return b.create<arith::UIToFPOp>(
+                    l, dstTy, toSignlessInteger(b, l, value));
               return b.create<arith::SIToFPOp>(l, dstTy, value);
             }
             auto srcTy = cast<FloatType>(value.getType());
@@ -1111,13 +1615,17 @@ struct ContractionLowering : OpRewritePattern<ContractionOp> {
                            ? Value(b.create<arith::MulFOp>(l, lhs, rhs))
                            : Value(b.create<arith::MulIOp>(l, lhs, rhs));
           if (!hasReduction) {
-            b.create<linalg::YieldOp>(l, prod);
+            b.create<linalg::YieldOp>(
+                l, isFloat ? prod
+                           : fromSignlessInteger(b, l, prod, elemTy));
             return;
           }
           Value acc = isFloat
                           ? Value(b.create<arith::AddFOp>(l, args[2], prod))
-                          : Value(b.create<arith::AddIOp>(l, args[2], prod));
-          b.create<linalg::YieldOp>(l, acc);
+                          : Value(b.create<arith::AddIOp>(
+                                l, toSignlessInteger(b, l, args[2]), prod));
+          b.create<linalg::YieldOp>(
+              l, isFloat ? acc : fromSignlessInteger(b, l, acc, elemTy));
         });
     rewriter.replaceOp(op, generic.getResults());
     return success();
@@ -1137,24 +1645,43 @@ struct LoopLowering : OpRewritePattern<LoopOp> {
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     unsigned nScan = op.getScanInputs().size();
-    if (nScan == 0)
-      return rewriter.notifyMatchFailure(op, "loop with no scan inputs");
-
-    int64_t tile =
-        op.getTileHint() ? static_cast<int64_t>(*op.getTileHint()) : 1;
-    auto scan0Ty = cast<RankedTensorType>(op.getScanInputs()[0].getType());
-    int64_t axis0 = cast<IntegerAttr>(op.getScanAxes()[0]).getInt();
-    int64_t extent = scan0Ty.getDimSize(axis0);
-    if (ShapedType::isDynamic(extent))
-      return rewriter.notifyMatchFailure(op, "dynamic scan extent");
-    if (tile <= 0 || extent % tile != 0)
+    bool dynamicTrip = static_cast<bool>(op.getUpperBound());
+    int64_t tile = 1;
+    int64_t trip = 0;
+    if (!dynamicTrip) {
+      if (nScan == 0)
+        return rewriter.notifyMatchFailure(op, "loop with no scan inputs");
+      tile =
+          op.getTileHint() ? static_cast<int64_t>(*op.getTileHint()) : 1;
+      auto scan0Ty = cast<RankedTensorType>(op.getScanInputs()[0].getType());
+      int64_t axis0 = cast<IntegerAttr>(op.getScanAxes()[0]).getInt();
+      int64_t extent = scan0Ty.getDimSize(axis0);
+      if (ShapedType::isDynamic(extent))
+        return rewriter.notifyMatchFailure(op, "dynamic scan extent");
+      if (tile <= 0 || extent % tile != 0)
+        return rewriter.notifyMatchFailure(
+            op, "scan extent not a multiple of tile_hint (tail tiles unsupported)");
+      trip = extent / tile;
+    } else if (nScan != 0) {
       return rewriter.notifyMatchFailure(
-          op, "scan extent not a multiple of tile_hint (tail tiles unsupported)");
-    int64_t trip = extent / tile;
+          op, "dynamic upper_bound form cannot lower scanned inputs");
+    }
 
     Block &body = op.getBody().front();
     Value lb = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    Value ub = rewriter.create<arith::ConstantIndexOp>(loc, trip);
+    Value ub;
+    if (dynamicTrip) {
+      auto upperTy = cast<RankedTensorType>(op.getUpperBound().getType());
+      Value upperScalar = rewriter.create<tensor::ExtractOp>(
+          loc, op.getUpperBound(), ValueRange{});
+      ub = raggedToIndex(rewriter, loc, upperScalar);
+      if (!ub)
+        return rewriter.notifyMatchFailure(
+            op, "dynamic upper_bound is not an integer/index tensor");
+      (void)upperTy;
+    } else {
+      ub = rewriter.create<arith::ConstantIndexOp>(loc, trip);
+    }
     Value step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     Value tileV = rewriter.create<arith::ConstantIndexOp>(loc, tile);
     SmallVector<Value> inits(op.getInits().begin(), op.getInits().end());
@@ -1163,26 +1690,45 @@ struct LoopLowering : OpRewritePattern<LoopOp> {
         loc, lb, ub, step, inits,
         [&](OpBuilder &b, Location l, Value iv, ValueRange iterArgs) {
           IRMapping map;
-          Value off = b.create<arith::MulIOp>(l, iv, tileV);
-          for (unsigned i = 0; i < nScan; ++i) {
-            Value src = op.getScanInputs()[i];
-            auto srcTy = cast<RankedTensorType>(src.getType());
-            int64_t ax = cast<IntegerAttr>(op.getScanAxes()[i]).getInt();
-            unsigned rank = srcTy.getRank();
-            SmallVector<OpFoldResult> offs(rank, b.getIndexAttr(0));
-            SmallVector<OpFoldResult> sizes;
-            for (unsigned d = 0; d < rank; ++d)
-              sizes.push_back(b.getIndexAttr(srcTy.getDimSize(d)));
-            SmallVector<OpFoldResult> strides(rank, b.getIndexAttr(1));
-            offs[ax] = off;
-            sizes[ax] = b.getIndexAttr(tile);
-            auto sliceTy = cast<RankedTensorType>(body.getArgument(i).getType());
-            Value slice = b.create<tensor::ExtractSliceOp>(
-                l, sliceTy, src, offs, sizes, strides);
-            map.map(body.getArgument(i), slice);
+          if (!dynamicTrip) {
+            Value off = b.create<arith::MulIOp>(l, iv, tileV);
+            for (unsigned i = 0; i < nScan; ++i) {
+              Value src = op.getScanInputs()[i];
+              auto srcTy = cast<RankedTensorType>(src.getType());
+              int64_t ax = cast<IntegerAttr>(op.getScanAxes()[i]).getInt();
+              unsigned rank = srcTy.getRank();
+              SmallVector<OpFoldResult> offs(rank, b.getIndexAttr(0));
+              SmallVector<OpFoldResult> sizes;
+              for (unsigned d = 0; d < rank; ++d)
+                sizes.push_back(b.getIndexAttr(srcTy.getDimSize(d)));
+              SmallVector<OpFoldResult> strides(rank, b.getIndexAttr(1));
+              offs[ax] = off;
+              sizes[ax] = b.getIndexAttr(tile);
+              auto sliceTy =
+                  cast<RankedTensorType>(body.getArgument(i).getType());
+              Value slice = b.create<tensor::ExtractSliceOp>(
+                  l, sliceTy, src, offs, sizes, strides);
+              map.map(body.getArgument(i), slice);
+            }
+          } else {
+            // The dynamic J ABI exposes the SCF induction value as a rank-0
+            // tensor using the authored upper-bound element type.  Keeping
+            // this conversion explicit prevents an MLIR index from leaking
+            // into the Layer-A value graph and keeps CPU/CUDA/RISC-V emitters
+            // on the same contract.
+            auto inductionTy = cast<RankedTensorType>(
+                body.getArgument(nScan).getType());
+            Value induction = raggedFromIndex(
+                b, l, iv, inductionTy.getElementType());
+            if (!induction)
+              return;
+            Value inductionTensor = b.create<tensor::FromElementsOp>(
+                l, inductionTy, ValueRange{induction});
+            map.map(body.getArgument(nScan), inductionTensor);
           }
+          unsigned carryArgBase = nScan + (dynamicTrip ? 1 : 0);
           for (unsigned j = 0; j < iterArgs.size(); ++j)
-            map.map(body.getArgument(nScan + j), iterArgs[j]);
+            map.map(body.getArgument(carryArgBase + j), iterArgs[j]);
           for (Operation &o : body.without_terminator())
             b.clone(o, map);
           auto yield = cast<YieldOp>(body.getTerminator());
@@ -1214,17 +1760,38 @@ static Value emitScalarCast(OpBuilder &b, Location loc, Type dst, Value v) {
     return sf.getWidth() < df.getWidth()
                ? b.create<arith::ExtFOp>(loc, dst, v).getResult()
                : b.create<arith::TruncFOp>(loc, dst, v).getResult();
-  if (sf && di)
+  if (sf && di) {
+    if (di.isUnsigned()) {
+      Type signlessTarget = IntegerType::get(dst.getContext(), di.getWidth());
+      Value converted = b.create<arith::FPToUIOp>(loc, signlessTarget, v);
+      return fromSignlessInteger(b, loc, converted, dst);
+    }
     return b.create<arith::FPToSIOp>(loc, dst, v);
+  }
   if (si && df)
-    return si.isInteger(1) ? b.create<arith::UIToFPOp>(loc, dst, v).getResult()
-                           : b.create<arith::SIToFPOp>(loc, dst, v).getResult();
-  if (si && di)
-    return si.getWidth() < di.getWidth()
-               ? (si.isInteger(1)
-                      ? b.create<arith::ExtUIOp>(loc, dst, v).getResult()
-                      : b.create<arith::ExtSIOp>(loc, dst, v).getResult())
-               : b.create<arith::TruncIOp>(loc, dst, v).getResult();
+    return (si.isInteger(1) || si.isUnsigned())
+               ? b.create<arith::UIToFPOp>(loc, dst,
+                                           toSignlessInteger(b, loc, v))
+                     .getResult()
+               : b.create<arith::SIToFPOp>(loc, dst, v).getResult();
+  if (si && di) {
+    Value source = toSignlessInteger(b, loc, v);
+    if (si.getWidth() < di.getWidth()) {
+      Type signlessTarget = IntegerType::get(
+          dst.getContext(), di.getWidth());
+      Value widened =
+          (si.isInteger(1) || si.isUnsigned())
+              ? b.create<arith::ExtUIOp>(loc, signlessTarget, source).getResult()
+              : b.create<arith::ExtSIOp>(loc, signlessTarget, source).getResult();
+      return fromSignlessInteger(b, loc, widened, dst);
+    }
+    if (si.getWidth() == di.getWidth() &&
+        (si.isUnsigned() != di.isUnsigned()))
+      return fromSignlessInteger(b, loc, source, dst);
+    Type signlessTarget = IntegerType::get(dst.getContext(), di.getWidth());
+    Value narrowed = b.create<arith::TruncIOp>(loc, signlessTarget, source);
+    return fromSignlessInteger(b, loc, narrowed, dst);
+  }
   return nullptr;
 }
 
@@ -1398,15 +1965,55 @@ struct ConvertIntentToLinalgPass
   using ConvertIntentToLinalgBase::ConvertIntentToLinalgBase;
 
   void runOnOperation() override {
+    bool rejectedAtomic = false;
+    getOperation().walk([&](Operation *operation) {
+      bool explicitAtomic = false;
+      if (auto scatter = dyn_cast<ScatterOp>(operation))
+        explicitAtomic = scatter->hasAttr("atomic") ||
+                         scatter->hasAttr("ordering") ||
+                         scatter->hasAttr("memory_scope") ||
+                         scatter->hasAttr("cas_retry");
+      else if (isa<AtomicScatterOp>(operation))
+        explicitAtomic = true;
+      if (!explicitAtomic)
+        return;
+      operation->emitError()
+          << "generic Intent-to-Linalg lowering rejects explicit atomic "
+             "scatter because it has no target-neutral atomic operation; "
+             "atomic metadata would otherwise be lost";
+      rejectedAtomic = true;
+    });
+    if (rejectedAtomic) {
+      signalPassFailure();
+      return;
+    }
+
     RewritePatternSet patterns(&getContext());
-    patterns.add<IotaLowering, IdentityScatterLowering, MapUnaryLowering,
+    patterns.add<IotaLowering, RaggedCleanupLowering,
+                 RaggedOuterLowering,
+                 RaggedMemberLowering, ReshapeLowering,
+                 IdentityScatterLowering,
+                 MapUnaryLowering,
                  MapBinaryLowering, SelectLowering, GatherLowering,
                  ScanLowering, ContractionLowering,
                  LoopLowering, CastLowering, TransposeLowering, ConcatLowering,
                  PadLowering>(
         &getContext());
     patterns.add<ReduceLowering>(&getContext(), reassociateFloatReductions);
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+      signalPassFailure();
+      return;
+    }
+
+    bool liveUnsupported = false;
+    getOperation().walk([&](Operation *operation) {
+      if (isa<RaggedOp, RaggedOuterOp, RaggedMemberOp>(operation)) {
+        operation->emitError()
+            << "ragged operation was not fully lowered to carrier tensors";
+        liveUnsupported = true;
+      }
+    });
+    if (liveUnsupported)
       signalPassFailure();
   }
 };

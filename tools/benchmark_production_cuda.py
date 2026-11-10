@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Lower, execute, search, and benchmark accepted production J+C inputs.
+"""Lower, execute, search, and benchmark accepted J+Source-prior snapshots.
 
 The measured implementation is always a cubin emitted from the snapshot's
 materialized Intent MLIR through a registered C++ MLIR pass.  Python owns only
 snapshot transport, candidate orchestration, CUDA Driver launch binding, and
 event timing.  The comparison baseline is the exact declarative Triton workload
 adapter already used by SCRC, not a newly authored substitute kernel.
+
+The snapshot's compatibility ``ImplementationConfig`` is used only as an
+erasable search-order prior in this legacy benchmark tool.  It is not a
+``TargetLayerCPlugin`` and does not cross the public production Lower boundary.
 """
 
 from __future__ import annotations
@@ -28,9 +32,9 @@ from intentir.backend.cuda.benchmark import (
     do_bench_cudagraph_us,
     do_bench_us,
 )
-from intentir.backend.cuda.pipeline import lower_to_cuda
 from intentir.backend.cuda.search import (
     canonical_cuda_candidate,
+    compile_cuda_target_plugin,
     search_cuda,
 )
 from intentir.backend.cuda.qd import (
@@ -53,6 +57,7 @@ from intentir.ir.production_snapshot import (
     ProductionSnapshot,
     load_production_snapshot,
 )
+from intentir.ir.canonical_j import j_elaboration
 from intentir.verify.gate2.compare import compare_outputs
 from intentir.verify.gate2.policy import DEFAULT_GATE2_POLICY
 from intentir.verify.gate2.scalar import ScalarLoweringRunner
@@ -127,13 +132,16 @@ def _tensor_outputs(
     snapshot: ProductionSnapshot,
     dims: Mapping[str, int],
 ) -> list[Any]:
+    output_bindings = j_elaboration(snapshot.j).output_bindings
+    if not output_bindings:
+        raise ValueError("accepted J has no canonical output bindings")
     return [
         torch.empty(
-            _shape(tensor.shape, dims),
-            dtype=_torch_dtype(torch, tensor.dtype),
+            _shape(binding.output_type.shape, dims),
+            dtype=_torch_dtype(torch, binding.output_type.dtype),
             device="cuda",
         )
-        for tensor in snapshot.j.intent.outputs
+        for binding in output_bindings
     ]
 
 
@@ -184,6 +192,7 @@ def _one_kernel(
         dims,
         constexpr_bindings=constexpr_bindings,
     )
+    target = BackendTarget("cuda", backend_compile.CHIP)
     state = attach_c(
         materialized,
         snapshot.c
@@ -193,8 +202,9 @@ def _one_kernel(
             else search_prior == "with-c"
         )
         else None,
-        BackendTarget("cuda", backend_compile.CHIP),
+        target,
     )
+    neutral_state = attach_c(materialized, None, target)
     qd_controller = None
     if qd_search_seeds or qd_cert_seeds:
         if not qd_search_seeds or not qd_cert_seeds:
@@ -424,19 +434,8 @@ def _one_kernel(
         }
 
     if axes is not None and axes.baseline_kind == "canonical":
-        candidate = canonical_cuda_candidate(state)
-        program = lower_to_cuda(
-            state.base_ir,
-            allow_specialized=not candidate.generic,
-            only_fast_path=candidate.fast_path_id,
-            pass_overrides=(
-                {candidate.fast_path_id: candidate.pass_argument}
-                if candidate.fast_path_id is not None
-                and candidate.pass_argument is not None
-                else None
-            ),
-            require_specialized=not candidate.generic,
-        )
+        candidate = canonical_cuda_candidate(neutral_state)
+        program = compile_cuda_target_plugin(neutral_state, candidate)
         concrete_state = candidate.concrete_state(program)
         qd_search = (
             qd_controller.filter_candidate(program, concrete_state)

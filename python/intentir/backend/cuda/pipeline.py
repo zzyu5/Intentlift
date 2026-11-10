@@ -1,10 +1,10 @@
-"""Verification-neutral IntentIR -> CUDA lowering entry points.
+"""Verification-neutral canonical-J -> CUDA lowering entry points.
 
 Gate, paper, command-line, and future target frontends may share this module,
-but none of their verdicts participate in lowering authorization.  Callers must
-first construct an ``IntentFunction`` (or Intent dialect MLIR) whose A/B/C
-contract they accept.  This module emits/probes/compiles that exact program and
-returns executable cubins plus a neutral lowering record.
+but none of their verdicts participate in lowering authorization.  The formal
+J-facing entry accepts only a ``SemanticArchive``; raw Intent dialect MLIR is
+handled by the lower consumer below.  This module emits/probes/compiles that
+exact program and returns executable cubins plus a neutral lowering record.
 """
 
 from __future__ import annotations
@@ -24,14 +24,16 @@ from intentir.backend.cuda.launch_config import (
 )
 from intentir.backend.cuda.selection import (
     LoweringTarget,
+    RAGGED_FAST_PATH_ID,
     VariantSelection,
     read_intent_module,
     residual_intent_ops,
     select_variant,
 )
 from intentir.backend.cuda.schedules import ScheduleDecision
-from intentir.frontend import emit_module
-from intentir.ir.model import IntentFunction
+from intentir.frontend.canonical_j import emit_j_module
+from intentir.ir.canonical_j import elaborate_j
+from intentir.verify.gate1.model import SemanticArchive
 
 
 @dataclass(frozen=True)
@@ -307,6 +309,10 @@ class LoweredProgram:
     kernels: tuple[backend_compile.CompiledKernel, ...]
     transformation_record: MLIRTransformationRecord | None = None
     pipeline_id: str = "cuda.pipeline.direct.v1"
+    # The exact MLIR handed to the selected CUDA pipeline.  It is retained as
+    # a stage artifact so a target split/materialization record cannot be
+    # certified merely by repeating the final cubin digest.
+    realization_mlir: str = ""
 
     def __post_init__(self) -> None:
         if not self.kernels:
@@ -329,6 +335,8 @@ class LoweredProgram:
             raise ValueError("generic lowering cannot carry a transformation record")
         if not self.pipeline_id:
             raise ValueError("lowering pipeline_id must be non-empty")
+        if not isinstance(self.realization_mlir, str) or not self.realization_mlir.strip():
+            raise ValueError("lowering must retain its non-empty realization MLIR")
     def to_record(self) -> dict[str, object]:
         """Return the structural compilation result without embedding binary bytes."""
 
@@ -341,6 +349,7 @@ class LoweredProgram:
                 else None
             ),
             "kernel_count": len(self.kernels),
+            "realization_mlir_size_bytes": len(self.realization_mlir.encode("utf-8")),
             "kernels": [
                 {
                     "binary_name": kernel.binary_name,
@@ -419,6 +428,21 @@ def lower_to_cuda(
         only_fast_path=only_fast_path,
         allow_specialized=allow_specialized,
     )
+    if backend_compile._has_ragged_ops(source):
+        ragged_attempts = tuple(
+            attempt
+            for attempt in selection.attempts
+            if attempt.fast_path_id == RAGGED_FAST_PATH_ID
+        )
+        if len(ragged_attempts) != 1 or not ragged_attempts[0].direct_hit:
+            reason = (
+                ragged_attempts[0].reason
+                if ragged_attempts
+                else "descriptor-aware Ragged probe was not executed"
+            )
+            raise ValueError(
+                "CUDA Ragged capability boundary rejected the module: " + reason
+            )
     if require_specialized and selection.pipeline_kind != "specialized":
         raise ValueError(
             "required specialized candidate failed whole-graph admission"
@@ -444,10 +468,9 @@ def lower_to_cuda(
         kernels=kernels,
         transformation_record=transformation_record,
         pipeline_id=(
-            "cuda.pipeline.direct-specialized.v1"
-            if selection.pipeline_kind == "specialized"
-            else "cuda.pipeline.linalg-materialized.v1"
+            selection.pipeline_id
         ),
+        realization_mlir=(specialized if selection.pipeline_kind == "specialized" else source),
     )
 
 
@@ -466,6 +489,11 @@ def lower_to_cuda_fused(
     """
 
     source = read_intent_module(intent_module)
+    if backend_compile._has_ragged_ops(source):
+        raise ValueError(
+            "CUDA Ragged graphs require the descriptor-aware lowering; "
+            "the fused elementwise pipeline is not ABI-compatible"
+        )
     selected_target = target or LoweringTarget()
     if selected_target.chip != backend_compile.CHIP:
         raise ValueError(
@@ -498,11 +526,12 @@ def lower_to_cuda_fused(
         selection=selection,
         kernels=kernels,
         pipeline_id="cuda.pipeline.linalg-elementwise-fused.v1",
+        realization_mlir=source,
     )
 
 
 def lower_function_to_cuda(
-    function: IntentFunction,
+    function: SemanticArchive,
     concrete_extents: Mapping[str, int],
     *,
     target: LoweringTarget | None = None,
@@ -513,15 +542,21 @@ def lower_function_to_cuda(
     require_specialized: bool = False,
     fold: int = 0,
 ) -> LoweredProgram:
-    """Emit an accepted flat ``IntentFunction`` and compile it to CUDA.
+    """Emit the accepted canonical J and compile it to the generic CUDA path.
 
-    Validation policy intentionally remains outside this function.  Gate1/2,
-    another verifier, or a trusted handwritten source can all use the same
-    backend once they have accepted the function and supplied concrete extents.
+    This named compatibility entry is still a formal J boundary: callers may
+    not pass a bare ``IntentFunction`` and thereby skip Layer-B elaboration.
+    Raw MLIR remains available through :func:`lower_to_cuda`, which is the
+    explicit lower-consumer boundary.
     """
 
-    mlir = emit_module(
-        function,
+    if not isinstance(function, SemanticArchive):
+        raise TypeError(
+            "CUDA production lowering requires canonical SemanticArchive J"
+        )
+    j = elaborate_j(function)
+    mlir = emit_j_module(
+        j,
         dict(concrete_extents),
         fold=fold,
     )

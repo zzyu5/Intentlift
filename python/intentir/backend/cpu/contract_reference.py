@@ -33,15 +33,19 @@ from intentir.backend.cpu.structured_reference import (
     _Evaluator,
     _resolved_shape,
 )
-from intentir.frontend.emit_mlir import _broadcast_projection
 from intentir.ir.canonical_j import (
     CanonicalValueType,
     ContractExpr,
     ContractSort,
+    canonical_top_level_operations,
     canonical_broadcast_axes,
     direct_unit_dimension_refs,
     elaborate_j,
     j_elaboration,
+)
+from intentir.ir.intent_op_contract import (
+    _broadcast_projection,
+    operation_attr_contract,
 )
 from intentir.ir.contract_ir import (
     CanonicalContractIR,
@@ -63,10 +67,29 @@ if TYPE_CHECKING:
 
 
 CONTRACT_REFERENCE_PROTOCOL = "intentir.j-contract-indexed-cpu-reference.v3"
+_CONCAT_ATTR_CONTRACT = operation_attr_contract("concat")
 
 
 class ContractReferenceUnsupportedError(CPUBackendUnsupportedError):
     """The accepted J is outside the closed relation-indexed profile."""
+
+
+def _canonical_body(j: "SemanticArchive") -> tuple[IntentOp, ...]:
+    """Return the top-level execution sequence from construction records.
+
+    The typed rows preserve the original nested operation objects, so this is
+    an execution view of the same canonical tree rather than a second body
+    deserialization.  Keeping this accessor local to the reference backend
+    prevents ``SemanticArchive.intent.body`` from becoming an accidental
+    operation-order authority.
+    """
+
+    try:
+        return canonical_top_level_operations(j)
+    except (TypeError, ValueError) as exc:
+        raise ContractReferenceUnsupportedError(
+            "contract reference requires canonical typed operation records"
+        ) from exc
 
 
 def _canonical_json(value: Any) -> str:
@@ -303,7 +326,12 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
             "contract reference v1 does not implement alias, reduction, update, "
             "consumer-extension, or access-guard relations"
         )
-    operations = tuple(canonical.intent.body)
+    operations = canonical_top_level_operations(canonical)
+    top_level_rows = tuple(
+        (path, operation)
+        for path, operation in j_elaboration(canonical).typed_operation_rows
+        if path.startswith("body[") and "." not in path
+    )
     if any(
         operation.body or operation.op not in _RELATION_INDEXED_OPS
         for operation in operations
@@ -317,8 +345,7 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
         )
 
     operations_by_path = {
-        f"body[{index}]": operation
-        for index, operation in enumerate(operations)
+        path: operation for path, operation in top_level_rows
     }
     node_refs_by_path: dict[str, str] = {}
     for node_ref, path in canonical.node_ids.items():
@@ -475,7 +502,8 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
             "contract reference requires one closed typed ContractIR"
         ) from exc
     input_names = {item.name for item in canonical.intent.inputs}
-    output_names = {item.name for item in canonical.intent.outputs}
+    output_names = j_elaboration(canonical).output_names
+    output_name_set = set(output_names)
     graph_operands = {
         operand for operation in operations for operand in operation.operands
     }
@@ -535,7 +563,7 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
         result_ref = _result_names(operation)[0]
         if access.kind == "load" and operation.op == "gather":
             axis = operation.attrs.get("axis")
-            mode = operation.attrs.get("mode", "along_axis")
+            mode = operation.attrs["mode"]
             if (
                 mode != "take"
                 or not isinstance(axis, int)
@@ -641,7 +669,7 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
                 )
             )
         elif access.kind == "store":
-            if access.tensor not in output_names:
+            if access.tensor not in output_name_set:
                 raise ContractReferenceUnsupportedError(
                     "contract reference v1 stores only logical J outputs"
                 )
@@ -692,7 +720,7 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
     if consumed_index_bounds != authored_index_bounds:
         raise ValueError("contract reference left an authored index bound unconsumed")
     stores_by_output = {item.access.tensor for item in stores}
-    if stores_by_output != output_names:
+    if stores_by_output != output_name_set:
         raise ContractReferenceUnsupportedError(
             "contract reference v1 requires authored stores for every output"
         )
@@ -704,7 +732,7 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
     }
     output_assemblies: list[IndexedOutputAssembly] = []
     assembly_results: set[str] = set()
-    for output in sorted(output_names):
+    for output in output_names:
         binding = output_bindings.get(output)
         if binding == output:
             continue
@@ -713,7 +741,12 @@ def project_contract_reference(j: "SemanticArchive") -> ContractReferencePlan:
         if (
             operation is None
             or operation.op != "concat"
-            or set(operation.attrs) != {"axis"}
+            or not frozenset(operation.attrs).issubset(
+                _CONCAT_ATTR_CONTRACT["allowed"]
+            )
+            or not frozenset(_CONCAT_ATTR_CONTRACT["required"]).issubset(
+                operation.attrs
+            )
             or not operation.operands
             or not isinstance(operation.attrs.get("axis"), int)
             or isinstance(operation.attrs.get("axis"), bool)
@@ -887,6 +920,10 @@ def _evaluate_array_program(
                 if expression.op == "floordiv"
                 else np.mod(values[0], values[1])
             )
+        if expression.op == "left_shift":
+            return np.left_shift(values[0], values[1])
+        if expression.op == "right_shift":
+            return np.right_shift(values[0], values[1])
         if expression.op in {"lt", "le", "gt", "ge", "eq", "ne"}:
             return {
                 "lt": np.less,
@@ -1313,7 +1350,11 @@ def execute_contract_reference(
         selected,
         scalar_bindings,
     )
-    env = evaluator.sequence(canonical.intent.body, checked_inputs, allow_loop=False)
+    env = evaluator.sequence(
+        _canonical_body(canonical),
+        checked_inputs,
+        allow_loop=False,
+    )
 
     value_types = j_elaboration(canonical).value_type_by_name
     outputs: dict[str, np.ndarray] = {}
@@ -1321,12 +1362,15 @@ def execute_contract_reference(
     output_assemblies = selected.output_assembly_map
     executed_stores = 0
     assembled_slices = 0
-    for tensor in canonical.intent.outputs:
-        shape = _resolved_shape(tensor.shape, checked_dims)
-        output = np.empty(shape, dtype=numpy_dtype(tensor.dtype))
+    output_bindings = j_elaboration(canonical).output_bindings
+    for binding in output_bindings:
+        # The output record has already closed output/return/type/ABI order.
+        # Do not reopen a second output type authority from intent.outputs.
+        shape = _resolved_shape(binding.output_type.shape, checked_dims)
+        output = np.empty(shape, dtype=numpy_dtype(binding.output_type.dtype))
         covered = np.zeros(shape, dtype=np.bool_)
-        assembly = output_assemblies.get(tensor.name)
-        output_stores = stores_by_output[tensor.name]
+        assembly = output_assemblies.get(binding.output)
+        output_stores = stores_by_output[binding.output]
         if assembly is not None:
             by_value = {item.value_ref: item for item in output_stores}
             output_stores = tuple(by_value[item] for item in assembly.operand_refs)
@@ -1385,11 +1429,11 @@ def execute_contract_reference(
             raise ContractReferenceUnsupportedError(
                 "contract output concat slices do not exhaust the concat axis"
             )
-        outputs[tensor.name] = validate_array(
+        outputs[binding.output] = validate_array(
             output,
             shape=shape,
-            dtype=tensor.dtype,
-            context=f"contract output {tensor.name!r}",
+            dtype=binding.output_type.dtype,
+            context=f"contract output {binding.output!r}",
         )
 
     plan_record = selected.to_json()

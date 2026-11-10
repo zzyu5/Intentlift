@@ -7,16 +7,18 @@ include "mlir/Interfaces/SideEffectInterfaces.td"
 //===----------------------------------------------------------------------===//
 // Tensor-level atomic ops (Layer A semantics, Layer B constraints as attrs).
 // Starter set: map_binary / reduce / contraction. More ops (scan, gather,
-// scatter, loop, ...) follow the same pattern (see spec/ir/atomic-ops.md).
+// scatter, loop, ...) follow the same declaration and verifier pattern below.
 //===----------------------------------------------------------------------===//
 
 def Intent_MapBinaryOp : Intent_Op<"map_binary"> {
   let summary = "Elementwise binary map (Layer A).";
   let description = [{
     Elementwise binary op over two ranked tensors. `fn` selects the
-    pointwise operation (add/sub/mul/div/max/min/pow/cmp). The comparison fns
-    (gt/ge/lt/le/eq/ne) produce an `i1`-typed result tensor (feeding `intent.select`);
-    every other fn is element-type-preserving.
+    pointwise operation (add/sub/mul/div/floordiv/remainder/max/min/pow/atan2/
+    left_shift/right_shift/copysign). The comparison fns
+    (gt/ge/lt/le/eq/ne), logical fns (logical_and/logical_or/logical_xor and
+    their and/or/xor aliases), and isclose produce an `i1`-typed result tensor
+    (feeding `intent.select`); every other fn is element-type-preserving.
   }];
   let arguments = (ins AnyRankedTensor:$lhs, AnyRankedTensor:$rhs, StrAttr:$fn);
   let results = (outs AnyRankedTensor:$result);
@@ -65,7 +67,9 @@ def Intent_MapUnaryOp : Intent_Op<"map_unary"> {
   let description = [{
     Elementwise unary op over one ranked tensor. `fn` selects the pointwise
     operation. Most fns are shape- AND element-type-preserving
-    (identity/exp/log/log2/neg/abs/sqrt/rsqrt/recip/tanh/sigmoid/cos/sin/tan/exp2/erf), the same
+    (identity/exp/log/log2/neg/abs/sqrt/rsqrt/recip/tanh/sigmoid/cos/sin/tan/
+    exp2/atan/erf/acos/asin/cbrt/ceil/floor/round/roundeven/trunc/sign/log10/
+    log1p/expm1/erfc), the same
     class the transcendental peephole turns into NVVM approx intrinsics.
     Predicate fns (`isnan`) instead produce an `i1`-typed result tensor (the
     boolean condition for `intent.select`, mirroring the `map_binary` comparison
@@ -173,8 +177,12 @@ def Intent_GatherOp : Intent_Op<"gather"> {
     Gather elements of `data` at runtime positions read from an integer `index`
     tensor along `axis`. Two `mode`s cover the data-dependent-addressing family:
 
-    * `"along_axis"` (torch.gather / numpy `take_along_axis`): `index` has the
-      same rank as `data`, the result is shaped like `index`, and
+    * `"along_axis"` (torch.gather / numpy `take_along_axis`): the canonical J
+      source contract accepts either an index with the same rank as `data`, or
+      a compressed index with the selected axis omitted (rank `data.rank - 1`).
+      In both cases the result is shaped like the source index.  The latter
+      form is expanded with a unit selected axis before this Intent MLIR op is
+      emitted, so the dialect verifier receives an equal-rank index and result.
       `result[i..] = data[i.. with i[axis] replaced by index[i..]]`.
     * `"take"` (index_select / embedding row-gather / numpy `take`): `index` is a
       rank-r selector inserted at `axis`; the result rank is
@@ -214,18 +222,105 @@ def Intent_ScatterOp : Intent_Op<"scatter"> {
     is not declared bitwise order-independent, and overwrite races are not
     assigned an arbitrary deterministic winner here.
 
-    The result has `data`'s shape and element type. The GPU lowering treats it as
-    an in-place update of the (caller-cloned) `data` buffer: a data-dependent
-    `memref.store` (reduce `"none"`) or `memref.atomic_rmw addf` (reduce
-    `"add"`, reusing the M4/M9 atomic -> `red.global.add.f32` on sm_120a) at the
-    index-computed coordinate. `index` must be integer-typed.
+    When `atomic` is present it is either `"add"` or `"cas"`; the operation
+    must also carry one of `relaxed`, `acquire`, `release`, `acq_rel`, or
+    `seq_cst` in `ordering`, and one of `work_item`, `subgroup`, `workgroup`,
+    `device`, or `system` in `memory_scope`. Layer-B
+    `realization_authorizations` must contain the matching `native_atomic`
+    authorization for this scatter's stable J node handle.
+
+    The result has `data`'s shape and element type. The legacy GPU lowering
+    treats an unannotated scatter as an in-place update of the (caller-cloned)
+    `data` buffer: a data-dependent `memref.store` (reduce `"none"`) or
+    `memref.atomic_rmw addf` (reduce `"add"`) at the index-computed coordinate.
+    An explicit atomic scatter is lowered through the target's scoped atomic
+    operation and ordering fences instead. `index` must be integer-typed.
   }];
   let arguments = (ins AnyRankedTensor:$data, AnyRankedTensor:$index,
                        AnyRankedTensor:$src, I64Attr:$axis, StrAttr:$mode,
-                       StrAttr:$reduce);
+                       StrAttr:$reduce, OptionalAttr<StrAttr>:$atomic,
+                       OptionalAttr<StrAttr>:$ordering,
+                       OptionalAttr<StrAttr>:$memory_scope);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat =
       "$data `,` $index `,` $src attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def Intent_AtomicScatterOp : Intent_Op<"atomic_scatter"> {
+  let summary = "Explicit compare-exchange scatter with observable old value.";
+  let description = [{
+    Internal Layer-A form for a J scatter with `atomic = "cas"`. `compare`
+    supplies the expected value and `src` supplies the replacement value for
+    each indexed update. The first result is the updated data state (the CUDA
+    implementation uses the data buffer in place); the second result is the
+    value observed by the compare-exchange. `cas_retry` is explicit so a
+    consumer cannot silently replace a retrying compare-exchange with a single
+    attempt.
+  }];
+  let arguments = (ins AnyRankedTensor:$data, AnyRankedTensor:$index,
+                       AnyRankedTensor:$compare, AnyRankedTensor:$src,
+                       I64Attr:$axis, StrAttr:$mode, StrAttr:$atomic,
+                       StrAttr:$ordering, StrAttr:$memory_scope,
+                       OptionalAttr<StrAttr>:$cas_retry);
+  let results = (outs AnyRankedTensor:$updated, AnyRankedTensor:$observed);
+  let assemblyFormat =
+      "$data `,` $index `,` $compare `,` $src attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Ragged descriptor ops (Layer A). A ragged value is represented in MLIR as a
+// builtin tuple<offsets, indices>; both fields are rank-1 Ragged carrier
+// tensors: i8/i16/i32/i64, ui8/ui16/ui32, or logical index (materialized as
+// i64). bool/i1, ui64, explicit signed integer types, and other widths are not
+// valid Ragged carriers.
+// Keeping the descriptor as one typed result/operand preserves the J-level
+// value graph while giving C++ lowerings a concrete type they can inspect and
+// destructure. The verifiers below enforce the field and result contracts.
+//===----------------------------------------------------------------------===//
+
+def Intent_RaggedOp : Intent_Op<"ragged", [Pure]> {
+  let summary = "Package offsets and member indices into a ragged descriptor.";
+  let description = [{
+    Package a rank-1 Ragged carrier `offsets` tensor and a rank-1 Ragged carrier
+    `indices` tensor into one typed ragged descriptor. The descriptor is represented by
+    the builtin MLIR type `tuple<offsets_type, indices_type>`; the tuple fields
+    must exactly match the two operands. This operation has no attributes.
+  }];
+  let arguments = (ins AnyRankedTensor:$offsets, AnyRankedTensor:$indices);
+  let results = (outs AnyTuple:$result);
+  let assemblyFormat =
+      "$offsets `,` $indices attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def Intent_RaggedOuterOp : Intent_Op<"ragged_outer", [Pure]> {
+  let summary = "Return the number of outer groups in a ragged descriptor.";
+  let description = [{
+    Return a rank-0 Ragged carrier tensor containing the number of outer groups in a
+    ragged descriptor. The result element type matches the descriptor's
+    offsets element type. This operation has no attributes.
+  }];
+  let arguments = (ins AnyTuple:$ragged);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat =
+      "$ragged attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+def Intent_RaggedMemberOp : Intent_Op<"ragged_member", [Pure]> {
+  let summary = "Return the member-index vector for one ragged outer group.";
+  let description = [{
+    Select the member-index vector for one outer group from `ragged`, using a
+    rank-0 Ragged carrier `index`. The result is a dynamic-length rank-1 Ragged carrier
+    tensor (`tensor<?x...>`), with element type equal to the descriptor's
+    indices field type. This operation has no attributes.
+  }];
+  let arguments = (ins AnyTuple:$ragged, AnyRankedTensor:$index);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat =
+      "$ragged `,` $index attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 
@@ -239,7 +334,7 @@ def Intent_ScatterOp : Intent_Op<"scatter"> {
 // the inclusive sum. Lowered by `convert-intent-compact-to-gpu`; the runtime
 // extent is resolved host-side (a reduce over the mask) before the compaction
 // launch, so the destination buffer's leading dim is concrete at launch time.
-// See spec/ir/atomic-ops.md (C8).
+// See the operation declaration and verifier below (C8).
 //===----------------------------------------------------------------------===//
 
 def Intent_NonzeroOp : Intent_Op<"nonzero"> {
@@ -312,8 +407,22 @@ def Intent_MaskedScatterOp : Intent_Op<"masked_scatter"> {
 // first-class. Lowered by
 // `convert-intent-layout-to-gpu`: one block per output row, cols over threads,
 // each output element's SOURCE coord computed by the rule then `memref.load`ed
-// (or set to the pad constant). See spec/ir/atomic-ops.md (C4).
+// (or set to the pad constant). See the operation declaration below (C4).
 //===----------------------------------------------------------------------===//
+
+def Intent_ReshapeOp : Intent_Op<"reshape", [Pure]> {
+  let summary = "Reshape a tensor without changing its element order (Layer A).";
+  let description = [{
+    Reinterpret the row-major element sequence of `input` with the static result
+    shape carried by `shape`. The operation preserves element type and total
+    element count; symbolic or runtime shape expressions are resolved by the
+    Layer-A frontend before this static MLIR leg is emitted.
+  }];
+  let arguments = (ins AnyRankedTensor:$input, I64ArrayAttr:$shape);
+  let results = (outs AnyRankedTensor:$result);
+  let assemblyFormat = "$input attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
 
 def Intent_TransposeOp : Intent_Op<"transpose"> {
   let summary = "Permute tensor dimensions by a static permutation (Layer A).";
@@ -442,8 +551,9 @@ def Intent_RandOp : Intent_Op<"rand"> {
 //   pool     — windowed reduction (max/avg) over a kHxkW window at stride s with
 //              padding; max_pool2d_with_indices ALSO returns the argmax FLAT index
 //              (ih*W + iw within the (H,W) plane) as an i64.
-//   upsample — nearest-neighbor gather: out[.,oh,ow] = in[.,floor(oh*IH/OH),
-//              floor(ow*IW/OW)] (an affine/floor index-remap, C4-layout-like).
+//   upsample — nearest-neighbor or bicubic resize over NCHW; the mode selects
+//              either the floor index-remap or the four-tap cubic interpolation
+//              described by Intent_UpsampleOp below.
 //   polar    — elementwise abs*(cos angle, sin angle): a complex tensor
 //              represented as a trailing real/imag PAIR (two real results),
 //              reusing the C0 cos/sin scalar emitters.
@@ -486,7 +596,9 @@ def Intent_PoolOp : Intent_Op<"pool"> {
 def Intent_UpsampleOp : Intent_Op<"upsample"> {
   let summary = "2-D upsample (nearest / bicubic) over NCHW (Layer A).";
   let description = [{
-    Resize a rank-4 `[N,C,H,W]` `input` to `[N,C,OH,OW]` under `mode`:
+    Resize a rank-4 `[N,C,H,W]` `input` to `[N,C,OH,OW]` under `mode` and the
+    positive integer spatial scale `[sh,sw]`, with `OH = H*sh` and
+    `OW = W*sw`:
 
     * `"nearest"` (torch.upsample_nearest2d / F.interpolate mode="nearest") —
       pure index-remap: `out[n,c,oh,ow] = input[n,c, min(floor(oh*IH/OH), IH-1),
@@ -505,7 +617,8 @@ def Intent_UpsampleOp : Intent_Op<"upsample"> {
       `upsample_bicubic2d_aa`; the variable-support aa DOWNSAMPLE kernel is a
       follow-up. Bilinear is a documented follow-up.
   }];
-  let arguments = (ins AnyRankedTensor:$input, StrAttr:$mode);
+  let arguments = (ins AnyRankedTensor:$input, StrAttr:$mode,
+                       I64ArrayAttr:$scale);
   let results = (outs AnyRankedTensor:$result);
   let assemblyFormat =
       "$input attr-dict `:` functional-type($input, $result)";
@@ -600,8 +713,7 @@ def Intent_ContractionOp : Intent_Op<"contraction"> {
 // accumulator) while scanning K/V tiles. See spec/ir/structured-loop.md.
 //===----------------------------------------------------------------------===//
 
-def Intent_YieldOp : Intent_Op<"yield",
-    [Pure, Terminator, HasParent<"LoopOp">]> {
+def Intent_YieldOp : Intent_Op<"yield", [Pure, Terminator]> {
   let summary = "Terminator of an intent.loop body; yields the next carries.";
   let description = [{
     Yields the loop-carried values for the next trip iteration (and, after the
@@ -613,6 +725,7 @@ def Intent_YieldOp : Intent_Op<"yield",
   // No-operand builder so SingleBlockImplicitTerminator can materialize the
   // implicit terminator (mirrors scf.yield).
   let builders = [OpBuilder<(ins), [{ /* nothing to do */ }]>];
+  let hasVerifier = 1;
 }
 
 def Intent_LoopOp : Intent_Op<"loop",
@@ -621,14 +734,20 @@ def Intent_LoopOp : Intent_Op<"loop",
   let summary = "Structured loop with loop-carried state and scanned inputs.";
   let description = [{
     A structured loop (an explicit induction variable, loop-carried `inits`, and
-    a single-block body region) that scans `scan_inputs` tile-by-tile along their
-    `scan_axes` while threading carried state. This is the IntentIR primitive for
-    FlashAttention's K-loop: `inits` = (running max m, running sum l, accumulator
-    Oacc); each trip slices a tile (`tile_hint` rows, Layer C) of K and V; the
-    body recomputes the online-softmax update and `intent.yield`s the new carries.
+    a single-block body region) that either scans `scan_inputs` tile-by-tile along
+    their `scan_axes`, or uses the dynamic `upper_bound` form for a runtime-sized
+    value loop. The static form is the IntentIR primitive for FlashAttention's
+    K-loop: `inits` = (running max m, running sum l, accumulator Oacc); each trip
+    slices a tile (`tile_hint` rows, Layer C) of K and V; the body recomputes the
+    online-softmax update and `intent.yield`s the new carries. The dynamic form
+    has no scan inputs, carries one rank-0 integer `upper_bound` operand, and
+    exposes a rank-0 integer induction tensor as the first body argument after
+    the scan slice arguments (there are no scan slice arguments in this form).
+    Its induction value is the J `trip.index` binding and is not a carry.
 
     Body block arguments are the per-trip scan slices (one per `scan_inputs`, in
-    order) followed by the current carries (one per `inits`). Results are the
+    order), followed by the dynamic induction tensor when `upper_bound` is
+    present, and then the current carries (one per `inits`). Results are the
     final carries; result types equal `inits` types (carry types are invariant).
 
     Layer attribution: the recurrence is Layer A (algorithmic intent); `tile_hint`
@@ -636,6 +755,7 @@ def Intent_LoopOp : Intent_Op<"loop",
   }];
   let arguments = (ins Variadic<AnyRankedTensor>:$scan_inputs,
                        Variadic<AnyType>:$inits,
+                       Optional<AnyRankedTensor>:$upper_bound,
                        I64ArrayAttr:$scan_axes,
                        OptionalAttr<I64Attr>:$tile_hint);
   let results = (outs Variadic<AnyType>:$results);
@@ -644,6 +764,7 @@ def Intent_LoopOp : Intent_Op<"loop",
   let assemblyFormat = [{
     `scan` `(` ($scan_inputs^ `:` type($scan_inputs))? `)`
     `init` `(` ($inits^ `:` type($inits))? `)`
+    (`upper_bound` `(` $upper_bound^ `:` type($upper_bound) `)`)?
     attr-dict (`->` type($results)^)? `do` $body
   }];
 }

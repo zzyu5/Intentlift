@@ -23,7 +23,12 @@ from intentir.ir.contract_materialization import (
     ContractMaterializationProjection,
     project_contract_materialization,
 )
-from intentir.ir.model import IntentFunction, IntentOp, IntentReturn, Tensor
+from intentir.ir.model import (
+    IntentFunction,
+    IntentOp,
+    IntentReturn,
+    walk_intent_op_paths,
+)
 from intentir.verify.gate1.model import SemanticArchive
 
 
@@ -146,18 +151,20 @@ class TypedBoundaryFunctionMaterialization:
 def _walk(
     body: Sequence[IntentOp], prefix: str = "body"
 ) -> tuple[tuple[str, IntentOp], ...]:
-    result: list[tuple[str, IntentOp]] = []
-    for index, operation in enumerate(body):
-        path = f"{prefix}[{index}]"
-        result.append((path, operation))
-        result.extend(_walk(operation.body, f"{path}.body"))
-        for polarity, arm in (
-            ("positive", operation.positive),
-            ("negative", operation.negative),
-        ):
-            if arm is not None:
-                result.extend(_walk(arm.body, f"{path}.{polarity}.body"))
-    return tuple(result)
+    return tuple(walk_intent_op_paths(body, prefix))
+
+
+def _canonical_walk(
+    j: SemanticArchive,
+) -> tuple[tuple[str, IntentOp], ...]:
+    """Return typed operations materialized from canonical J records only."""
+
+    rows = j_elaboration(j).typed_operation_by_path
+    if rows is None:
+        raise TypedBoundaryMaterializationError(
+            "canonical operation records have no typed operation view"
+        )
+    return tuple(rows.items())
 
 
 def _results(operation: IntentOp) -> tuple[str, ...]:
@@ -371,7 +378,9 @@ class _ExpressionBuilder:
             for value in values[1:]:
                 result = self.binary(fn, result, value, "i1")
             return result
-        if expression.op in {"add", "sub", "mul", "floordiv", "mod"}:
+        if expression.op in {
+            "add", "sub", "mul", "floordiv", "mod", "left_shift", "right_shift"
+        }:
             lhs, rhs = (self.emit(item) for item in expression.args)
             if expression.op == "floordiv":
                 # Contract indices are mathematical integers; admitted access
@@ -499,7 +508,7 @@ def _axis_candidates(j: SemanticArchive) -> frozenset[str]:
         extent
         for tensor in [*j.intent.inputs, *j.intent.outputs]
         for extent in tensor.shape
-        if isinstance(extent, str)
+        if isinstance(extent, str) and extent != "?"
     }
     logical_values = {
         name for name, _value_type in j_elaboration(j).value_types
@@ -547,12 +556,12 @@ def _requires_typed_lowering(j: SemanticArchive) -> bool:
             if arm is not None
             for _nested_path, nested in _walk(arm.body)
         )
-        for _path, operation in _walk(j.intent.body)
+        for _path, operation in _canonical_walk(j)
     ):
         return True
     axes = _axis_candidates(j)
     authored = {item.access_id: item for item in j.boundary.accesses}
-    by_path = dict(_walk(j.intent.body))
+    by_path = dict(_canonical_walk(j))
     nodes = {
         node_ref: by_path[path]
         for node_ref, path in j.node_ids.items()
@@ -597,8 +606,8 @@ def materialize_typed_boundary(
         sorted(
             node_ref
             for node_ref, path in j.node_ids.items()
-            if path in dict(_walk(j.intent.body))
-            and dict(_walk(j.intent.body))[path].op == "loop"
+            if path in dict(_canonical_walk(j))
+            and dict(_canonical_walk(j))[path].op == "loop"
         )
     )
     logical_projection = project_contract_materialization(
@@ -625,13 +634,35 @@ def materialize_typed_boundary(
         relation.value_ref: relation.dimension_ref
         for relation in j.value_dimension_relations
     }
-    path_to_node = {path: node for node, path in j.node_ids.items()}
-    canonical_node_results = {
-        (operation.node_id or path_to_node.get(path)): _results(operation)[0]
-        for path, operation in _walk(j.intent.body)
-        if (operation.node_id or path_to_node.get(path)) is not None
-        and _results(operation)
+    path_to_node = j_elaboration(j).authored_node_by_path(j.node_ids)
+    operation_records = j_elaboration(j).operation_records
+    record_by_path = {
+        record["path"]: record for record in operation_records
     }
+    typed_by_path = dict(_canonical_walk(j))
+    if set(record_by_path) != set(typed_by_path):
+        raise TypedBoundaryMaterializationError(
+            "typed boundary operation paths disagree with canonical J records"
+        )
+    canonical_node_results: dict[str, str] = {}
+    for path, record in record_by_path.items():
+        results = tuple(record.get("results", ()))
+        if not results:
+            continue
+        operation = typed_by_path[path]
+        typed_results = _results(operation)
+        if tuple(typed_results) != results:
+            raise TypedBoundaryMaterializationError(
+                f"typed boundary result record disagrees at {path!r}"
+            )
+        node_ref = record["id"]
+        authored_ref = path_to_node.get(path)
+        if authored_ref is not None and authored_ref != node_ref:
+            raise TypedBoundaryMaterializationError(
+                f"typed boundary node record disagrees at {path!r}"
+            )
+        if len(results) == 1:
+            canonical_node_results[node_ref] = results[0]
     accesses_by_node: dict[str, list[ContractAccessIR]] = {}
     for access in contract.accesses:
         if access.node_ref is not None:
@@ -703,11 +734,6 @@ def materialize_typed_boundary(
         target: list[IntentOp],
     ) -> _Value:
         authored = authored_access[access.access_id]
-        tensor = next(
-            item
-            for item in [*j.intent.inputs, *j.intent.outputs]
-            if item.name == access.tensor
-        )
         current = value(access.tensor)
         components = [program.expression for program in access.index]
         constant_positions: list[int] = []
@@ -920,6 +946,32 @@ def materialize_typed_boundary(
                     raise TypedBoundaryMaterializationError(
                         "semantic loop requires a closed trip axis"
                     )
+                if original.trip.is_dynamic:
+                    # A runtime-bounded loop cannot be inlined into the
+                    # target-neutral boundary projection: doing so would turn
+                    # a data-dependent recurrence into one arbitrary host
+                    # iteration.  Preserve the loop ABI and recursively lower
+                    # only its J-owned body.  The MLIR emitter and CPU/native
+                    # consumers then execute the same upper_bound/index form.
+                    operation = copy.deepcopy(original)
+                    operation.node_id = node_ref
+                    operation.trip.upper_bound = resolve(
+                        operation.trip.upper_bound
+                    )
+                    for scan in operation.scan:
+                        scan.source = resolve(scan.source)
+                    for state in operation.carry:
+                        state.init_value = resolve(state.init_value)
+                    operation.body = rewrite_body(
+                        original.body,
+                        f"{path}.body",
+                        execution_guard,
+                    )
+                    rewritten.append(operation)
+                    if node_ref is not None and _results(operation):
+                        node_results[node_ref] = _results(operation)[0]
+                        node_guards[node_ref] = execution_guard
+                    continue
                 # M0 chooses one deterministic full-axis step.  Every scan slice
                 # is therefore the complete source tensor and the structured
                 # carry recurrence has exactly one iteration; inline that one
@@ -1104,8 +1156,14 @@ def materialize_typed_boundary(
     # concat-based MRoPE) already encode their writeback value in Layer A.
     input_names = {item.name for item in function.inputs}
     output_by_name = {item.name: item for item in function.outputs}
+    output_bindings = j_elaboration(j).output_bindings
+    if tuple(item.output for item in output_bindings) != tuple(output_by_name):
+        raise TypedBoundaryMaterializationError(
+            "canonical output bindings do not cover materialized function outputs "
+            "in ABI order"
+        )
     canonical_outputs = {
-        item.output: item.value for item in j_elaboration(j).output_bindings
+        item.output: item.value for item in output_bindings
     }
     store_accesses: dict[str, list[ContractAccessIR]] = {}
     for access in contract.accesses:
@@ -1113,8 +1171,15 @@ def materialize_typed_boundary(
             store_accesses.setdefault(access.tensor, []).append(access)
 
     final_outputs: dict[str, str] = {}
-    for output_name, output in output_by_name.items():
-        canonical_value = resolve(canonical_outputs.get(output_name, output_name))
+    for binding in output_bindings:
+        output_name = binding.output
+        output = output_by_name[output_name]
+        try:
+            canonical_value = resolve(canonical_outputs[output_name])
+        except KeyError as exc:
+            raise TypedBoundaryMaterializationError(
+                f"output {output_name!r} has no complete canonical return binding"
+            ) from exc
         stores = store_accesses.get(output_name, [])
         if not stores:
             final_outputs[output_name] = canonical_value
@@ -1293,6 +1358,8 @@ def materialize_typed_boundary(
             continue
         compact_body.append(operation)
         live.update(operation.operands)
+        if operation.trip is not None and operation.trip.is_dynamic:
+            live.add(operation.trip.upper_bound)
         if operation.predicate is not None:
             live.add(operation.predicate)
         for scan in operation.scan:
@@ -1307,8 +1374,8 @@ def materialize_typed_boundary(
         outputs=copy.deepcopy(function.outputs),
         body=compact_body,
         returns=[
-            IntentReturn(output=item.name, value=final_outputs[item.name])
-            for item in function.outputs
+            IntentReturn(output=binding.output, value=final_outputs[binding.output])
+            for binding in output_bindings
         ],
     )
     return TypedBoundaryFunctionMaterialization(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -17,7 +18,15 @@ import numpy as np
 from intentir.verify.gate1.compiler import KernelSource
 from intentir.verify.triton_compat import normalize_deprecated_triton_dot
 
-from .model import ExecutionResult
+from .model import (
+    ExecutionBinding,
+    ExecutionResult,
+    artifact_sha256,
+    execution_spec_contract,
+    output_binding_digest,
+    output_digest,
+    program_identity_digests,
+)
 
 
 class ArgumentRole(str, Enum):
@@ -133,6 +142,8 @@ class TritonExecutionSpec:
     grid: tuple[int, ...]
     schedule: Mapping[str, int | float | bool | str] = field(default_factory=dict)
     device: str = "cuda"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+    execution_binding: ExecutionBinding | None = None
 
     def __post_init__(self) -> None:
         if not self.arguments:
@@ -157,8 +168,16 @@ class TritonExecutionSpec:
                 "Triton arguments and schedule overlap: " + ", ".join(overlap)
             )
         object.__setattr__(self, "schedule", schedule)
+        metadata = dict(self.metadata)
+        if any(not isinstance(name, str) or not name for name in metadata):
+            raise ValueError("Triton execution metadata keys must be non-empty strings")
+        object.__setattr__(self, "metadata", metadata)
         if not 1 <= len(self.grid) <= 3 or any(int(dim) <= 0 for dim in self.grid):
             raise ValueError("grid must contain one to three positive dimensions")
+        if self.execution_binding is not None and not isinstance(
+            self.execution_binding, ExecutionBinding
+        ):
+            raise TypeError("Triton execution_binding must be an ExecutionBinding")
 
 
 def _torch_dtype(torch: Any, dtype: str) -> Any:
@@ -172,7 +191,14 @@ def _torch_dtype(torch: Any, dtype: str) -> Any:
         "i16": "int16",
         "i32": "int32",
         "i64": "int64",
+        "index": "int64",
         "i1": "bool",
+        "u8": "uint8",
+        "u16": "uint16",
+        "u32": "uint32",
+        "ui8": "uint8",
+        "ui16": "uint16",
+        "ui32": "uint32",
     }
     key = aliases.get(key, key)
     try:
@@ -184,27 +210,40 @@ def _torch_dtype(torch: Any, dtype: str) -> Any:
 def _load_module(
     source: KernelSource, temporary: Path
 ) -> tuple[ModuleType, str, dict[str, Any]]:
-    code, origin = source.read_code()
-    normalized, frontend_compat = normalize_deprecated_triton_dot(code)
-    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
-    module_name = f"_intentir_gate2_{source.function}_{digest}_{id(source):x}"
-    if source.kind == "module_file" and not frontend_compat["rewrite_count"]:
-        assert source.path is not None
-        path = Path(source.path).resolve()
-    else:
-        path = temporary / f"{module_name}.py"
-        path.write_text(normalized, encoding="utf-8")
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load Triton module from {origin}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    previous_sys_path = list(sys.path)
     try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
-    return module, module_name, frontend_compat
+        if source.trusted:
+            for raw_root in source.import_roots:
+                root = Path(raw_root).expanduser().resolve()
+                if not root.is_dir():
+                    raise ValueError(
+                        f"trusted Source import root is not a directory: {root}"
+                    )
+                if str(root) not in sys.path:
+                    sys.path.insert(0, str(root))
+        code, origin = source.read_code()
+        normalized, frontend_compat = normalize_deprecated_triton_dot(code)
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        module_name = f"_intentir_gate2_{source.function}_{digest}_{id(source):x}"
+        if source.kind == "module_file" and not frontend_compat["rewrite_count"]:
+            assert source.path is not None
+            path = Path(source.path).resolve()
+        else:
+            path = temporary / f"{module_name}.py"
+            path.write_text(normalized, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load Triton module from {origin}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+        return module, module_name, frontend_compat
+    finally:
+        sys.path[:] = previous_sys_path
 
 
 def _launch_by_name(
@@ -252,6 +291,73 @@ def _launch_by_name(
     kernel[grid](**launch_kwargs)
 
 
+def _triton_artifact_parts(value: Any) -> tuple[tuple[str, bytes], ...]:
+    """Extract actual backend image bytes from Triton's compiled result."""
+
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        parts: list[tuple[str, bytes]] = []
+        for item in value:
+            parts.extend(_triton_artifact_parts(item))
+        return tuple(parts)
+    kernel_image = getattr(value, "kernel", None)
+    if isinstance(kernel_image, (bytes, bytearray, memoryview)):
+        asm = getattr(value, "asm", None)
+        kind = "binary"
+        if isinstance(asm, Mapping):
+            for candidate in ("cubin", "hsaco", "amdgcn", "ptx"):
+                if candidate in asm:
+                    kind = candidate
+                    break
+        return ((kind, bytes(kernel_image)),)
+    asm = getattr(value, "asm", None)
+    if isinstance(asm, Mapping):
+        for candidate in ("cubin", "hsaco", "amdgcn", "ptx"):
+            payload = asm.get(candidate)
+            if isinstance(payload, (bytes, bytearray, memoryview)):
+                return ((candidate, bytes(payload)),)
+            if isinstance(payload, str) and payload:
+                return ((candidate, payload.encode("utf-8")),)
+    return ()
+
+
+def _triton_artifact_metadata(value: Any) -> dict[str, Any]:
+    parts = _triton_artifact_parts(value)
+    if not parts:
+        raise RuntimeError(
+            "Triton warmup did not expose a real compiled backend artifact"
+        )
+    entries = [
+        {
+            "ordinal": index,
+            "kind": kind,
+            "digest": artifact_sha256(payload),
+            "size": len(payload),
+        }
+        for index, (kind, payload) in enumerate(parts)
+    ]
+    if len(entries) == 1:
+        artifact_digest = entries[0]["digest"]
+        artifact_kind = f"triton.{entries[0]['kind']}"
+    else:
+        # Autotuner warmup can produce more than one real candidate.  Keep every
+        # per-candidate byte digest and bind the deterministic ordered set as the
+        # lifecycle artifact identity.
+        encoded = json.dumps(
+            [(item["kind"], item["digest"], item["size"]) for item in entries],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        artifact_digest = artifact_sha256(encoded)
+        artifact_kind = "triton.autotuned_artifacts"
+    return {
+        "artifact_digest": artifact_digest,
+        "artifact_kind": artifact_kind,
+        "compiled_artifacts": entries,
+    }
+
+
 class TritonRunner:
     """Load and launch the final-J replay executable independently."""
 
@@ -268,6 +374,19 @@ class TritonRunner:
 
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA is unavailable")
+            binding = spec.execution_binding
+            if binding is not None:
+                raw_program_digest, executed_program_digest = program_identity_digests(
+                    program,
+                    frontend="triton",
+                )
+                binding.validate_runtime(
+                    leg=leg,
+                    program_source_sha256=raw_program_digest,
+                    program_execution_sha256=executed_program_digest,
+                    program_entry=program.function,
+                    contract=execution_spec_contract(spec, leg=leg),
+                )
             with tempfile.TemporaryDirectory(prefix=f"intentir-gate2-{leg}-") as tmp:
                 module, module_name, frontend_compat = _load_module(
                     program, Path(tmp)
@@ -312,6 +431,15 @@ class TritonRunner:
                             if argument.role is ArgumentRole.INOUT:
                                 outputs[argument.output_key or argument.name] = tensor
                         launch_args[argument.name] = tensor
+                    # Warmup is the compile boundary.  It must complete before
+                    # launch so the evidence is taken from Triton's actual
+                    # CompiledKernel rather than from source text or a cache
+                    # label.
+                    compiled = kernel.warmup(
+                        grid=tuple(int(dim) for dim in spec.grid),
+                        **{**launch_args, **dict(spec.schedule)},
+                    )
+                    artifact_metadata = _triton_artifact_metadata(compiled)
                     _launch_by_name(
                         kernel,
                         tuple(int(dim) for dim in spec.grid),
@@ -323,17 +451,39 @@ class TritonRunner:
                         key: tensor.detach().cpu().numpy().copy()
                         for key, tensor in outputs.items()
                     }
+                    source_code, _source_origin = program.read_code()
+                    normalized_source, _ = normalize_deprecated_triton_dot(
+                        source_code
+                    )
                     return ExecutionResult(
                         leg,
                         True,
                         copied,
                         metadata={
+                            **dict(spec.metadata),
                             "function": program.function,
                             "grid": list(spec.grid),
                             "binding_protocol": (
                                 "triton_name_keyed_complete_abi_v1"
                             ),
                             "frontend_compat": frontend_compat,
+                            "program_source_sha256": hashlib.sha256(
+                                source_code.encode("utf-8")
+                            ).hexdigest(),
+                            "program_execution_sha256": hashlib.sha256(
+                                normalized_source.encode("utf-8")
+                            ).hexdigest(),
+                            **artifact_metadata,
+                            **(
+                                {
+                                    "execution_binding": binding.to_json(),
+                                    "execution_binding_digest": binding.digest,
+                                }
+                                if binding is not None
+                                else {}
+                            ),
+                            "output_digest": output_digest(copied),
+                            "output_binding_digest": output_binding_digest(copied),
                         },
                     )
                 finally:

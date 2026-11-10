@@ -1,10 +1,10 @@
 """Pure-code Gate1 judge for normalized TTIR fingerprints.
 
-The comparator has no LLM escape hatch and no fuzzy acceptance threshold.
-Every hard component must match exactly after :mod:`.ttir` normalization.
-The continuous score and rank tuple exist only to retain the best failed replay
-candidate and to quantify ablations; they never turn a hard mismatch into a
-pass.
+Gate1 compares the accepted algorithm structure, not every physical compiler
+artifact.  Semantic operations, semantic dataflow, interface, reductions and
+memory effects remain hard evidence.  Compiler-only nodes and structural SSA
+edges are retained as non-blocking diagnostics.  Numerical equivalence stays
+in Gate2.
 """
 
 from __future__ import annotations
@@ -32,11 +32,31 @@ TTIR_SCORE_SEMANTICS = "active_evidence_weighted_v2"
 
 _CATEGORY_WEIGHTS = {
     "interface": 0.15,
-    "op_multiset": 0.20,
-    "dataflow": 0.25,
-    "reduction": 0.20,
-    "predicate_effect": 0.20,
+    "op_multiset": 0.18,
+    "dataflow": 0.22,
+    "reduction": 0.18,
+    "predicate_effect": 0.17,
+    "output_topology": 0.10,
 }
+
+# These operations materialize a compiler representation of an already
+# observed address/lane expression.  They are not allowed to introduce a new
+# J operation, but their count and placement must not make an otherwise equal
+# semantic graph fail Gate1.  Typed conversions remain semantic and therefore
+# stay in the hard operation view.
+_REALIZATION_ONLY_OPS = frozenset(
+    {
+        "tt.addptr",
+        "tt.make_range",
+        "tt.splat",
+        "arith.index_cast",
+        "arith.index_castui",
+    }
+)
+
+
+def _op_name(label: str) -> str:
+    return label.split("[", 1)[0]
 
 
 def _stable_json(value: Any) -> str:
@@ -162,6 +182,7 @@ class TTIRComparison:
         # rewired graph with unchanged ops -> dataflow.
         for category in (
             "interface",
+            "output_topology",
             "reduction",
             "predicate_effect",
             "op_multiset",
@@ -265,8 +286,22 @@ def _interface_counter(fingerprint: TTIRFingerprint) -> Counter[Any]:
 
 
 def _dataflow_counter(fingerprint: TTIRFingerprint) -> Counter[Any]:
+    """Return semantic dataflow, excluding compiler scaffolding edges."""
+
     items: Counter[Any] = Counter()
     for edge in fingerprint.dataflow_edges:
+        if len(edge) != 3:
+            continue
+        source, target, relation = edge
+        # Region membership, representation anchors and effect ordering are
+        # observer scaffolding.  Memory effects and semantic producer edges
+        # are represented by the hard effect/reduction/output views below.
+        if relation in {"region.member", "effect.order", "representation"}:
+            continue
+        if _op_name(source) in _REALIZATION_ONLY_OPS:
+            continue
+        if _op_name(target) in _REALIZATION_ONLY_OPS:
+            continue
         items[("edge", *edge)] += 1
     for dot in fingerprint.dots:
         items[("dot", _stable_json(dot.to_dict()))] += 1
@@ -277,6 +312,18 @@ def _dataflow_counter(fingerprint: TTIRFingerprint) -> Counter[Any]:
     for terminal_fork in fingerprint.terminal_forks:
         items[("terminal_fork", _stable_json(terminal_fork.to_dict()))] += 1
     return items
+
+
+def _semantic_op_counter(fingerprint: TTIRFingerprint) -> Counter[Any]:
+    """Keep logical operations hard while ignoring representation-only nodes."""
+
+    return Counter(
+        {
+            name: count
+            for name, count in fingerprint.op_multiset
+            if name not in _REALIZATION_ONLY_OPS
+        }
+    )
 
 
 def _reduction_counter(fingerprint: TTIRFingerprint) -> Counter[Any]:
@@ -294,6 +341,19 @@ def _predicate_effect_counter(fingerprint: TTIRFingerprint) -> Counter[Any]:
         items[("mask", predicate)] += 1
     for effect, count in fingerprint.effect_multiset:
         items[("effect", effect)] += count
+    return items
+
+
+def _output_topology_counter(fingerprint: TTIRFingerprint) -> Counter[Any]:
+    """Compare observed output ABI/store topology without partition proof."""
+
+    items: Counter[Any] = Counter()
+    for argument in fingerprint.interface.arguments:
+        if argument.access in {"output", "inout"}:
+            items[("output-argument", argument.position, _stable_json(argument.to_dict()))] += 1
+    for effect in fingerprint.memory_effects:
+        if effect.kind == "store":
+            items[("store", _stable_json(effect.to_dict()))] += 1
     return items
 
 
@@ -315,8 +375,8 @@ def compare_fingerprints(
         ),
         _compare_counter(
             "op_multiset",
-            Counter(dict(source.op_multiset)),
-            Counter(dict(replay.op_multiset)),
+            _semantic_op_counter(source),
+            _semantic_op_counter(replay),
             hard=True,
         ),
         _compare_counter(
@@ -333,6 +393,24 @@ def compare_fingerprints(
             _predicate_effect_counter(source),
             _predicate_effect_counter(replay),
             hard=True,
+        ),
+        _compare_counter(
+            "output_topology",
+            _output_topology_counter(source),
+            _output_topology_counter(replay),
+            hard=True,
+        ),
+        _compare_counter(
+            "op_multiset-realization",
+            Counter(dict(source.op_multiset)),
+            Counter(dict(replay.op_multiset)),
+            hard=False,
+        ),
+        _compare_counter(
+            "dataflow-realization",
+            Counter(("edge", *edge) for edge in source.dataflow_edges),
+            Counter(("edge", *edge) for edge in replay.dataflow_edges),
+            hard=False,
         ),
         _compare_counter(
             "schedule-only",
@@ -384,6 +462,8 @@ def compare_ttir(
     replay_python_interface: Mapping[str, Any] | None = None,
     source_schedule: Mapping[str, Any] | None = None,
     replay_schedule: Mapping[str, Any] | None = None,
+    source_external_math: Mapping[str, Any] | None = None,
+    replay_external_math: Mapping[str, Any] | None = None,
 ) -> TTIRComparison:
     """Parse and compare two Triton TTIR texts in one call."""
 
@@ -391,11 +471,13 @@ def compare_ttir(
         source_ttir,
         python_interface=source_python_interface,
         schedule=source_schedule,
+        external_math=source_external_math,
     )
     replay = fingerprint_ttir(
         replay_ttir,
         python_interface=replay_python_interface,
         schedule=replay_schedule,
+        external_math=replay_external_math,
     )
     return compare_fingerprints(source, replay)
 

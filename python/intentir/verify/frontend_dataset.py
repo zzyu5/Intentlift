@@ -5,11 +5,12 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 from typing import Any, Mapping
 
 MULTIFRONTEND_DATASET_PROTOCOL = "intentir.multifrontend-dataset.v1"
@@ -249,8 +250,106 @@ def load_frontend_dataset(
     return FrontendDatasetCatalog(root, kernels)
 
 
+def _dataset_manifest_root(dataset_root: str | os.PathLike[str] | Path) -> Path:
+    base = Path(dataset_root).expanduser().resolve()
+    return base if (base / "manifest.json").is_file() else base / "TianchenIR-MultiFrontend"
+
+
+def _manifest_for_root(root: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _probe_tilelang_runtime(executable: Path) -> tuple[str, Path] | None:
+    probe = subprocess.run(
+        [
+            str(executable),
+            "-c",
+            "import tilelang; from pathlib import Path; "
+            "print(getattr(tilelang, '__version__', 'unknown')); "
+            "print(Path(tilelang.__file__).resolve().parent)",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if probe.returncode != 0:
+        return None
+    lines = [line.strip() for line in probe.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    package = Path(lines[-1]).resolve()
+    if not package.is_dir():
+        return None
+    return lines[0], package
+
+
+def resolve_tilelang_python_executable(
+    dataset_root: str | os.PathLike[str] | Path | None = None,
+) -> str:
+    """Resolve the interpreter pinned by the external Dataset manifest.
+
+    The generated CUDA snapshots are tied to the TileLang header layout that
+    produced them.  Following whichever ``tilelang`` happens to be imported by
+    the caller silently pairs a 0.1.8 snapshot with another header tree, so the
+    manifest's pinned interpreter is authoritative here.
+    """
+
+    root = _dataset_manifest_root(
+        dataset_root if dataset_root is not None else default_frontend_dataset_root()
+    )
+    manifest = _manifest_for_root(root)
+    tilelang = manifest.get("tilelang")
+    expected = str(tilelang.get("version") or "") if isinstance(tilelang, dict) else ""
+    if not expected:
+        raise RuntimeError(f"Dataset manifest lacks a pinned TileLang version: {root}")
+    configured = (
+        str(tilelang.get("python_executable") or "")
+        if isinstance(tilelang, dict)
+        else ""
+    )
+    candidates = [
+        configured,
+        os.environ.get("INTENTIR_TILELANG_PYTHON", ""),
+        sys.executable,
+    ]
+    seen: set[str] = set()
+    failures: list[str] = []
+    for raw in candidates:
+        if not raw:
+            continue
+        # Do not resolve the venv's ``bin/python`` symlink: executing the
+        # resolved system binary would discard the venv and silently import a
+        # different TileLang installation.
+        executable = str(Path(raw).expanduser().absolute())
+        if executable in seen:
+            continue
+        seen.add(executable)
+        if not Path(executable).is_file():
+            failures.append(f"{executable}: missing")
+            continue
+        try:
+            runtime = _probe_tilelang_runtime(Path(executable))
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures.append(f"{executable}: {type(exc).__name__}: {exc}")
+            continue
+        if runtime is None:
+            failures.append(f"{executable}: TileLang import failed")
+            continue
+        actual, _package = runtime
+        if actual == expected:
+            return executable
+        failures.append(f"{executable}: TileLang {actual}, expected {expected}")
+    details = "; ".join(failures) if failures else "no candidate interpreter"
+    raise RuntimeError(f"no interpreter satisfies Dataset TileLang {expected}: {details}")
+
+
 def resolve_cuda_include_dirs(kernel: FrontendDatasetKernel) -> tuple[str, ...]:
-    """Resolve portable Dataset include roots against the active installation."""
+    """Resolve Dataset include roots against its pinned TileLang installation."""
     if kernel.frontend != "cuda":
         raise ValueError("include roots are only defined for CUDA Dataset cases")
     roots = tuple(str(item) for item in kernel.metadata.get("include_roots") or ())
@@ -259,10 +358,21 @@ def resolve_cuda_include_dirs(kernel: FrontendDatasetKernel) -> tuple[str, ...]:
             str(Path(item).expanduser().resolve())
             for item in kernel.metadata.get("include_dirs") or ()
         )
-    spec = importlib.util.find_spec("tilelang")
-    if spec is None or spec.origin is None:
-        raise RuntimeError("TileLang is required to resolve generated CUDA headers")
-    package = Path(spec.origin).resolve().parent
+    root = next(
+        (
+            parent
+            for parent in [kernel.path.parent, *kernel.path.parents]
+            if (parent / "manifest.json").is_file()
+        ),
+        None,
+    )
+    if root is None:
+        raise RuntimeError("Dataset manifest is required to resolve TileLang headers")
+    executable = resolve_tilelang_python_executable(root)
+    runtime = _probe_tilelang_runtime(Path(executable))
+    if runtime is None:
+        raise RuntimeError(f"TileLang is required to resolve generated CUDA headers: {executable}")
+    _version, package = runtime
     resolved: list[str] = []
     for root in roots:
         prefix = "tilelang/"
@@ -290,5 +400,6 @@ __all__ = [
     "MULTIFRONTEND_DATASET_PROTOCOL",
     "default_frontend_dataset_root",
     "load_frontend_dataset",
+    "resolve_tilelang_python_executable",
     "resolve_cuda_include_dirs",
 ]

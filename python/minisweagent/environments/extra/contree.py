@@ -4,7 +4,12 @@ import platform
 import shlex
 from dataclasses import asdict, is_dataclass
 from numbers import Number
-from typing import Any, NotRequired, TypedDict
+from typing import Any, TypedDict
+
+try:
+    from typing import NotRequired
+except ImportError:  # Python 3.10 compatibility
+    from typing_extensions import NotRequired
 
 from contree_sdk import ContreeSync
 from contree_sdk.config import ContreeConfig

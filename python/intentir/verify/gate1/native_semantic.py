@@ -16,11 +16,15 @@ inside the declared execution domain.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 import re
 from typing import Any
 
+from intentir.ir.intent_op_contract import RAGGED_OPS
+from intentir.ir.canonical_j import j_elaboration
+
 from .model import Gate1Artifact, ParameterKind
+from .pi import canonical_program_coordinate_projection
 from .ptx import PTXComparison, PTXDifference, PTXFingerprint, compare_ptx_fingerprints
 from .tilelang import TileLangComparison, TileLangDifference, TileLangFingerprint, compare_tilelang_fingerprints
 
@@ -54,45 +58,49 @@ _UNARY_FAMILY = {
 }
 
 
-def _walk_operations(value: Any) -> Iterable[Mapping[str, Any]]:
-    if isinstance(value, Mapping):
-        if isinstance(value.get("op"), str):
-            yield value
-        for child in value.values():
-            yield from _walk_operations(child)
-    elif isinstance(value, list):
-        for child in value:
-            yield from _walk_operations(child)
-
-
 def _j_contract(artifact: Gate1Artifact) -> tuple[set[str], set[str], bool]:
     """Return required families, J-authorized representation families, control flag."""
 
-    intent = artifact.j.intent.to_json()["intent_function"]
-    body = intent.get("body", [])
+    try:
+        elaboration = j_elaboration(artifact.j)
+        operation_records = elaboration.operation_records
+        operations = tuple(
+            record["wire"]
+            for record in operation_records
+            if isinstance(record.get("wire"), Mapping)
+        )
+        value_dtypes = {
+            name: value_type.dtype
+            for name, value_type in elaboration.value_type_by_name.items()
+        }
+    except Exception:
+        # Native Gate1 must not invent a second operation interpretation when
+        # canonical construction is unavailable.  The exact comparator remains
+        # the fail-closed fallback for unsupported/incomplete J contracts.
+        operations = ()
+        value_dtypes = {}
+        canonical_operations_unavailable = True
+    else:
+        canonical_operations_unavailable = len(operations) != len(operation_records)
     required: set[str] = set()
     allowed: set[str] = set()
-    unsupported = False
-    value_dtypes: dict[str, str] = {
-        str(item.get("name")): str(item.get("dtype"))
-        for item in (*intent.get("inputs", []), *intent.get("outputs", []))
-        if isinstance(item, Mapping)
-    }
-    for operation in _walk_operations(body):
+    unsupported = canonical_operations_unavailable
+    def result_dtype(operation: Mapping[str, Any]) -> str | None:
+        """Read result dtype from the elaborated construction type table."""
+
         result = operation.get("result")
-        operation_type = operation.get("type")
-        if isinstance(result, str) and isinstance(operation_type, Mapping):
-            dtype = operation_type.get("dtype")
-            if isinstance(dtype, str):
-                value_dtypes[result] = dtype
-    for operation in _walk_operations(body):
+        if not isinstance(result, str):
+            return None
+        dtype = value_dtypes.get(result)
+        return dtype if isinstance(dtype, str) else None
+
+    for operation in operations:
         name = operation.get("op")
         if name in {"effect_if", "value_if", "loop", "scan", "sort", "scatter", "masked_scatter"}:
             unsupported = True
             continue
         if name == "map_binary":
-            operation_type = operation.get("type")
-            dtype = operation_type.get("dtype") if isinstance(operation_type, Mapping) else None
+            dtype = result_dtype(operation)
             # Integer selector arithmetic and i1 predicates are representation
             # scaffolding; their PTX spellings are not a floating J operator.
             if dtype not in _FLOAT_DTYPES:
@@ -105,8 +113,7 @@ def _j_contract(artifact: Gate1Artifact) -> tuple[set[str], set[str], bool]:
                 if family in {"max", "min"}:
                     allowed.add("select")
         elif name == "map_unary":
-            operation_type = operation.get("type")
-            dtype = operation_type.get("dtype") if isinstance(operation_type, Mapping) else None
+            dtype = result_dtype(operation)
             if dtype not in _FLOAT_DTYPES:
                 continue
             family = _UNARY_FAMILY.get(str(operation.get("attrs", {}).get("fn")))
@@ -142,10 +149,12 @@ def _j_contract(artifact: Gate1Artifact) -> tuple[set[str], set[str], bool]:
                 # A boolean-to-numeric blend may remain arithmetic or become a
                 # target select; both are representations of the same J cast.
                 allowed.add("select")
-        elif name in {"const", "gather", "iota", "transpose"}:
+        elif name in {"const", "gather", "iota", "transpose"} | RAGGED_OPS:
             # Pure data-movement nodes carry no floating opcode family of their
-            # own.  Their exact tensor types/ABI/program axes remain J-owned,
-            # while Gate2 evaluates the authored indexing/permutation semantics.
+            # own.  Ragged descriptor construction and its outer/member queries
+            # are the same bounded data-movement family: exact carrier types and
+            # ABI remain J-owned, while Gate2 evaluates offsets/indices/selector
+            # semantics at the runtime boundary.
             continue
         elif name is not None:
             unsupported = True
@@ -205,12 +214,11 @@ def _expected_program_coordinates(
     *,
     prefix: str,
 ) -> frozenset[str]:
-    result: set[str] = set()
-    for row in artifact.pi.to_json().get("program_axes", []):
-        axis = row.get("axis") if isinstance(row, Mapping) else None
-        if type(axis) is int and 0 <= axis < 3:
-            result.add(f"{prefix}.{('x', 'y', 'z')[axis]}")
-    return frozenset(result)
+    projection = canonical_program_coordinate_projection(artifact.pi)
+    return frozenset(
+        f"{prefix}.{('x', 'y', 'z')[axis]}"
+        for axis in projection.physical_axes
+    )
 
 
 def _memory_kinds(fingerprint: PTXFingerprint) -> frozenset[str]:

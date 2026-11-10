@@ -1,17 +1,262 @@
 """Parse actions & format observations for OpenAI Responses API toolcalls"""
 
+import copy
 import json
 import time
+from collections.abc import Sequence
 
 from jinja2 import StrictUndefined, Template
 
 from minisweagent.exceptions import FormatError
+from minisweagent.mcp_lift import (
+    MCP_RESOURCE_READ_SCHEMA,
+    MCP_TOOL_ARGUMENT_SCHEMAS,
+    MCP_TOOL_DESCRIPTIONS,
+    MCPRequestError,
+    mcp_resource_count_upper_for_uri,
+    validate_mcp_gateway_call,
+)
 
 
 MAX_BASH_TOOL_CHARS = 8192
-MAX_EXACT_PATCH_TOOL_CHARS = 8192
-MAX_CANDIDATE_TOOL_CHARS = 256 * 1024
-MAX_WRITE_TEXT_TOOL_CHARS = 64 * 1024
+
+
+_MCP_RESOURCE_READ_PARAMS = MCP_RESOURCE_READ_SCHEMA
+
+
+def _mcp_tool_call_branch(name: str, arguments: dict) -> dict:
+    """Bind one MCP tool name to its only valid argument object.
+
+    A single unconstrained ``arguments.oneOf`` lets a provider combine the
+    right tool name with the wrong argument shape.  The local MCP dispatcher
+    rejects that combination, but discovering it only after a tool call wastes
+    a model turn and makes the provider-facing contract differ from the
+    server contract.  Keep the correlation in the function schema itself.
+    """
+
+    description = MCP_TOOL_DESCRIPTIONS.get(name)
+    name_schema = {"type": "string", "enum": [name]}
+    argument_schema = copy.deepcopy(arguments)
+    if isinstance(description, str) and description:
+        name_schema["description"] = description
+        argument_schema["description"] = description
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "name": name_schema,
+            "arguments": argument_schema,
+        },
+        "required": ["name", "arguments"],
+    }
+
+
+_MCP_GATEWAY_TOOL_PARAMS = {
+    "type": "object",
+    "oneOf": [
+        _mcp_tool_call_branch(name, arguments)
+        for name, arguments in MCP_TOOL_ARGUMENT_SCHEMAS.items()
+    ],
+}
+
+
+_MCP_GATEWAY_PARAMS = {
+    "type": "object",
+    "oneOf": [
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "enum": ["resources/read"],
+                },
+                "params": _MCP_RESOURCE_READ_PARAMS,
+            },
+            "required": ["method", "params"],
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "method": {
+                    "type": "string",
+                    "enum": ["tools/call"],
+                },
+                "params": _MCP_GATEWAY_TOOL_PARAMS,
+            },
+            "required": ["method", "params"],
+        },
+    ],
+}
+
+
+def mcp_call_tool_response_api_for_surface(
+    *,
+    resource_uris: Sequence[str] = (),
+    tool_names: Sequence[str] = (),
+    schema_lookup_items: Sequence[str] | None = None,
+) -> dict:
+    """Build the exact MCP gateway schema for one Lift transaction phase.
+
+    The server has always validated the transaction after a call.  A static
+    Responses schema nevertheless advertised every MCP resource and every
+    construction write on every turn, so a model could select an action that
+    was already impossible.  This projection is intentionally a restriction
+    of the canonical gateway grammar: it changes neither argument shape nor
+    acceptance rules, and exposes only actions the current phase can execute.
+    """
+
+    resources = tuple(resource_uris)
+    names = tuple(tool_names)
+    lookup_items = (
+        tuple(schema_lookup_items) if schema_lookup_items is not None else None
+    )
+    if (
+        not resources
+        and not names
+        or len(resources) != len(set(resources))
+        or len(names) != len(set(names))
+        or any(not isinstance(uri, str) or not uri for uri in resources)
+        or any(name not in MCP_TOOL_ARGUMENT_SCHEMAS for name in names)
+        or lookup_items is not None
+        and (
+            names != ("schema_lookup",)
+            or not lookup_items
+            or len(lookup_items) != len(set(lookup_items))
+            or any(
+                not isinstance(item, str)
+                or not item.startswith("op:")
+                or len(item) <= len("op:")
+                for item in lookup_items
+            )
+        )
+    ):
+        raise ValueError("MCP phase surface must contain unique known actions")
+
+    branches: list[dict] = []
+    if resources:
+        resource_params = copy.deepcopy(_MCP_RESOURCE_READ_PARAMS)
+        properties = resource_params.get("properties")
+        if not isinstance(properties, dict) or not isinstance(
+            properties.get("uri"), dict
+        ):
+            raise RuntimeError("canonical MCP resource schema is malformed")
+        uri_schema = dict(properties["uri"])
+        uri_schema["enum"] = list(resources)
+        properties["uri"] = uri_schema
+        count_schema = properties.get("count")
+        if isinstance(count_schema, dict):
+            count_schema = dict(count_schema)
+            count_schema["maximum"] = min(
+                mcp_resource_count_upper_for_uri(uri) for uri in resources
+            )
+            properties["count"] = count_schema
+        branches.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "method": {"type": "string", "enum": ["resources/read"]},
+                    "params": resource_params,
+                },
+                "required": ["method", "params"],
+            }
+        )
+    if names:
+        tool_branches = []
+        for name in names:
+            arguments = copy.deepcopy(MCP_TOOL_ARGUMENT_SCHEMAS[name])
+            if name == "schema_lookup" and lookup_items is not None:
+                properties = arguments.get("properties")
+                if not isinstance(properties, dict) or not isinstance(
+                    properties.get("items"), dict
+                ):
+                    raise RuntimeError("canonical schema lookup arguments are malformed")
+                item_array = dict(properties["items"])
+                item_schema = item_array.get("items")
+                if not isinstance(item_schema, dict):
+                    raise RuntimeError("canonical schema lookup item schema is malformed")
+                exact_item_schema = dict(item_schema)
+                exact_item_schema["enum"] = list(lookup_items)
+                item_array["minItems"] = len(lookup_items)
+                item_array["maxItems"] = len(lookup_items)
+                item_array["items"] = exact_item_schema
+                item_array["prefixItems"] = [
+                    {**dict(item_schema), "const": item}
+                    for item in lookup_items
+                ]
+                properties["items"] = item_array
+            tool_branches.append(_mcp_tool_call_branch(name, arguments))
+        branches.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "method": {"type": "string", "enum": ["tools/call"]},
+                    "params": {
+                        "type": "object",
+                        "oneOf": [
+                            *tool_branches,
+                        ],
+                    },
+                },
+                "required": ["method", "params"],
+            }
+        )
+    description = (
+        "Use the single IntentIR Lift MCP gateway. This turn exposes only "
+        "the current transaction phase actions; use exactly one listed "
+        "resource or construction call."
+    )
+    if names:
+        description += " Current construction contract: " + " ".join(
+            MCP_TOOL_DESCRIPTIONS[name] for name in names
+        )
+    return {
+        "type": "function",
+        "name": "mcp_call_tool",
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "oneOf": branches,
+        },
+    }
+
+MCP_CALL_TOOL_RESPONSE_API = {
+    "type": "function",
+    "name": "mcp_call_tool",
+    "description": (
+        "Use the single IntentIR Lift MCP gateway. Set method to resources/read "
+        "for one bounded resource or tools/call for one server tool, and pass "
+        "the exact MCP params object. For schema_lookup, arguments is exactly "
+        "{items:[...]}; semantic J construction is only begin_candidate, the "
+        "schema-derived declare_* calls, then finalize_candidate. The gateway "
+        "reads bounded facts and constructs the one candidate buffer; it never "
+        "invents unresolved semantics or accepts a candidate."
+    ),
+    "parameters": {
+        **_MCP_GATEWAY_PARAMS,
+    },
+}
+
+MCP_FIRST_READ_TOOL_RESPONSE_API = {
+    "type": "function",
+    "name": "mcp_call_tool",
+    "description": (
+        "Required first Lift action: read exactly one bounded IntentIR Lift "
+        "MCP resource. Use method=resources/read; this first action is read-only."
+    ),
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "method": {"type": "string", "enum": ["resources/read"]},
+            "params": _MCP_RESOURCE_READ_PARAMS,
+        },
+        "required": ["method", "params"],
+    },
+}
 
 # OpenRouter/OpenAI Responses API uses a flat structure (no nested "function" key)
 BASH_TOOL_RESPONSE_API = {
@@ -28,257 +273,6 @@ BASH_TOOL_RESPONSE_API = {
             }
         },
         "required": ["command"],
-    },
-}
-
-APPLY_PATCH_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "apply_patch",
-    "description": (
-        "Atomically replace one exact text span in the existing candidate file. "
-        "The caller supplies both old and new text; the tool never infers content."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "path": {
-                "type": "string",
-                "enum": ["/output/candidate.json"],
-                "description": "The existing Lift candidate to patch",
-            },
-            "old_text": {
-                "type": "string",
-                "maxLength": MAX_EXACT_PATCH_TOOL_CHARS,
-                "description": "A non-empty exact span that must occur once",
-            },
-            "new_text": {
-                "type": "string",
-                "maxLength": MAX_EXACT_PATCH_TOOL_CHARS,
-                "description": "The exact replacement text authored by the model",
-            },
-            "submit": {
-                "type": "boolean",
-                "description": (
-                    "If true, run the existing submission preflight immediately "
-                    "after applying the exact replacement"
-                ),
-            },
-        },
-        "required": ["path", "old_text", "new_text"],
-    },
-}
-
-SUBMIT_CANDIDATE_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "submit_candidate",
-    "description": (
-        "Atomically write the complete candidate text authored in this call and "
-        "run the existing submission preflight. The tool never edits fields."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "candidate_text": {
-                "type": "string",
-                "maxLength": MAX_CANDIDATE_TOOL_CHARS,
-                "description": "The complete exact candidate.json text",
-            },
-        },
-        "required": ["candidate_text"],
-    },
-}
-
-WRITE_TEXT_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "write_text",
-    "description": (
-        "Atomically overwrite or append exact model-authored text to one fixed "
-        "Lift workspace file. The tool never interprets the text."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "path": {
-                "type": "string",
-                "enum": [
-                    "/output/candidate.json",
-                    "/work/semantic_ledger.md",
-                    "/work/construction_plan.md",
-                    "/work/build.py",
-                ],
-            },
-            "content": {
-                "type": "string",
-                "maxLength": MAX_WRITE_TEXT_TOOL_CHARS,
-                "description": "The exact text bytes authored by the model",
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["overwrite", "append"],
-            },
-            "submit": {
-                "type": "boolean",
-                "description": (
-                    "Only for /output/candidate.json: run existing submission "
-                    "preflight after the write"
-                ),
-            },
-        },
-        "required": ["path", "content", "mode"],
-    },
-}
-
-SAVE_SEMANTIC_LEDGER_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "save_semantic_ledger",
-    "description": (
-        "Save one compact, proof-irrelevant semantic working ledger authored by "
-        "the Lift owner. This is not J/C/pi and has no acceptance authority."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "content": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 8192,
-                "description": "Compact source-grounded working notes",
-            }
-        },
-        "required": ["content"],
-    },
-}
-
-SAVE_CONSTRUCTION_PLAN_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "save_construction_plan",
-    "description": (
-        "Save one compact, proof-irrelevant construction checklist authored by "
-        "the same Lift owner. It records the owner's intended J/C/pi topology "
-        "and obligations but is not an artifact and has no acceptance authority."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "content": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 8192,
-                "description": "Compact model-authored construction checklist",
-            }
-        },
-        "required": ["content"],
-    },
-}
-
-CHECK_SUBMIT_CANDIDATE_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "check_and_submit_candidate",
-    "description": (
-        "Explicitly run the existing CandidateCheck preflight on the current "
-        "exact candidate bytes and submit only on PASS. It never edits the file."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {},
-    },
-}
-
-INSPECT_LIFT_CONTEXT_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "inspect_lift_context",
-    "description": (
-        "Read one bounded exact Source/anonymous-TTIR/observer/Harness/feedback-category/"
-        "current-candidate or source-neutral knowledge view without guessing filesystem "
-        "paths. The tool is read-only and never classifies or repairs J/C/pi."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "view": {
-                "type": "string",
-                "enum": [
-                    "source",
-                    "source_outline",
-                    "source_find",
-                    "source_brief",
-                    "source_ttir",
-                    "source_ttir_outline",
-                    "source_ttir_find",
-                    "source_ttir_def_use",
-                    "source_observer",
-                    "harness",
-                    "harness_abi",
-                    "feedback",
-                    "feedback_category",
-                    "candidate",
-                    "candidate_find",
-                    "candidate_nodes",
-                    "candidate_node",
-                    "candidate_abi",
-                    "candidate_control",
-                    "candidate_diff",
-                    "knowledge",
-                ],
-            },
-            "query": {"type": "string", "maxLength": 512},
-            "path": {"type": "string", "maxLength": 512},
-            "start": {"type": "integer", "minimum": 1, "maximum": 1000000},
-            "count": {"type": "integer", "minimum": 1, "maximum": 160},
-            "context": {"type": "integer", "minimum": 0, "maximum": 16},
-            "op": {"type": "string", "maxLength": 64},
-            "section": {
-                "type": "string",
-                "enum": ["overview", "outputs", "boundary", "pi"],
-            },
-        },
-        "required": ["view"],
-    },
-}
-
-INSPECT_LIFT_SCHEMA_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "inspect_lift_schema",
-    "description": (
-        "Read a compact exact bundle from the closed artifact schema and public "
-        "operation catalog. Items are top, catalog, op:NAME, or section:NAME."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "items": {
-                "type": "array",
-                "minItems": 1,
-                "maxItems": 12,
-                "items": {
-                    "type": "string",
-                    "pattern": "^(?:top|catalog|op:[A-Za-z0-9_]+|section:[A-Za-z0-9_.]+)$",
-                },
-            }
-        },
-        "required": ["items"],
-    },
-}
-
-CHECK_CANDIDATE_TOOL_RESPONSE_API = {
-    "type": "function",
-    "name": "check_candidate",
-    "description": (
-        "Run the shared diagnostic-only CandidateCheck on the current exact "
-        "candidate. It never edits or submits bytes and has no certification authority."
-    ),
-    "parameters": {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {},
     },
 }
 
@@ -375,15 +369,9 @@ def parse_toolcall_actions_response(
     format_error_template: str,
     template_kwargs: dict | None = None,
     max_tool_calls: int = 1,
-    enable_apply_patch_tool: bool = False,
-    enable_submit_candidate_tool: bool = False,
-    enable_write_text_tool: bool = False,
-    enable_semantic_ledger_tool: bool = False,
-    enable_construction_plan_tool: bool = False,
-    enable_check_submit_candidate_tool: bool = False,
-    enable_lift_context_tool: bool = False,
-    enable_lift_schema_tool: bool = False,
-    enable_check_candidate_tool: bool = False,
+    enable_bash_tool: bool = True,
+    enable_lift_mcp_tool: bool = False,
+    mcp_first_read_only: bool = False,
     enable_replay_patch_tool: bool = False,
     enable_submit_replay_tool: bool = False,
 ) -> list[dict]:
@@ -422,7 +410,7 @@ def parse_toolcall_actions_response(
         error_text = Template(format_error_template, undefined=StrictUndefined).render(
             error=(
                 "IntentIR permits at most "
-                f"{max_tool_calls} bash tool call(s) per model turn; "
+                f"{max_tool_calls} tool call(s) per model turn; "
                 f"received {len(tool_calls)}."
             ),
             actions=[],
@@ -439,7 +427,7 @@ def parse_toolcall_actions_response(
         except Exception as e:
             error_msg = f"Error parsing tool call arguments: {e}."
         tool_name = tool_call.get("name")
-        if tool_name == "bash":
+        if tool_name == "bash" and enable_bash_tool:
             if (
                 not isinstance(args, dict)
                 or "command" not in args
@@ -447,125 +435,14 @@ def parse_toolcall_actions_response(
                 or len(args.get("command", "")) > MAX_BASH_TOOL_CHARS
             ):
                 error_msg += "Missing or non-string 'command' argument in bash tool call."
-        elif tool_name == "apply_patch" and enable_apply_patch_tool:
-            if (
-                not isinstance(args, dict)
-                or not {"path", "old_text", "new_text"}.issubset(args)
-                or not set(args).issubset(
-                    {"path", "old_text", "new_text", "submit"}
+        elif tool_name == "mcp_call_tool" and enable_lift_mcp_tool:
+            try:
+                validate_mcp_gateway_call(
+                    args,
+                    first_read_only=mcp_first_read_only,
                 )
-                or not all(
-                    isinstance(args.get(key), str)
-                    for key in ("path", "old_text", "new_text")
-                )
-                or len(args.get("old_text", "")) > MAX_EXACT_PATCH_TOOL_CHARS
-                or len(args.get("new_text", "")) > MAX_EXACT_PATCH_TOOL_CHARS
-                or (
-                    "submit" in args and not isinstance(args.get("submit"), bool)
-                )
-            ):
-                error_msg += (
-                    "apply_patch requires string path, old_text, new_text, and "
-                    "an optional boolean submit."
-                )
-        elif tool_name == "submit_candidate" and enable_submit_candidate_tool:
-            if (
-                not isinstance(args, dict)
-                or set(args) != {"candidate_text"}
-                or not isinstance(args.get("candidate_text"), str)
-                or len(args.get("candidate_text", "")) > MAX_CANDIDATE_TOOL_CHARS
-            ):
-                error_msg += "submit_candidate requires exactly candidate_text."
-        elif tool_name == "write_text" and enable_write_text_tool:
-            if (
-                not isinstance(args, dict)
-                or not {"path", "content", "mode"}.issubset(args)
-                or not set(args).issubset({"path", "content", "mode", "submit"})
-                or not isinstance(args.get("path"), str)
-                or not isinstance(args.get("content"), str)
-                or len(args.get("content", "")) > MAX_WRITE_TEXT_TOOL_CHARS
-                or args.get("mode") not in {"overwrite", "append"}
-                or (
-                    "submit" in args and not isinstance(args.get("submit"), bool)
-                )
-            ):
-                error_msg += (
-                    "write_text requires string path/content, mode overwrite|append, "
-                    "and an optional boolean submit."
-                )
-        elif tool_name == "save_semantic_ledger" and enable_semantic_ledger_tool:
-            if (
-                not isinstance(args, dict)
-                or set(args) != {"content"}
-                or not isinstance(args.get("content"), str)
-                or not 1 <= len(args.get("content", "")) <= 8192
-            ):
-                error_msg += (
-                    "save_semantic_ledger requires exactly 1..8192 characters "
-                    "of content."
-                )
-        elif (
-            tool_name == "save_construction_plan"
-            and enable_construction_plan_tool
-        ):
-            if (
-                not isinstance(args, dict)
-                or set(args) != {"content"}
-                or not isinstance(args.get("content"), str)
-                or not 1 <= len(args.get("content", "")) <= 8192
-            ):
-                error_msg += (
-                    "save_construction_plan requires exactly 1..8192 characters "
-                    "of content."
-                )
-        elif (
-            tool_name == "check_and_submit_candidate"
-            and enable_check_submit_candidate_tool
-        ):
-            if not isinstance(args, dict) or args:
-                error_msg += "check_and_submit_candidate takes no arguments."
-        elif tool_name == "inspect_lift_context" and enable_lift_context_tool:
-            allowed = {
-                "view", "query", "path", "start", "count", "context", "op", "section"
-            }
-            if (
-                not isinstance(args, dict)
-                or not set(args).issubset(allowed)
-                or args.get("view") not in {
-                    "source", "source_outline", "source_find", "source_brief",
-                    "source_ttir", "source_ttir_outline", "source_ttir_find",
-                    "source_ttir_def_use", "source_observer", "harness", "harness_abi",
-                    "feedback", "feedback_category", "candidate", "candidate_find",
-                    "candidate_nodes", "candidate_node", "candidate_abi", "candidate_control",
-                    "candidate_diff", "knowledge",
-                }
-                or any(
-                    key in args and not isinstance(args[key], str)
-                    for key in ("query", "path", "op", "section")
-                )
-                or any(
-                    key in args
-                    and (
-                        not isinstance(args[key], int)
-                        or isinstance(args[key], bool)
-                    )
-                    for key in ("start", "count", "context")
-                )
-            ):
-                error_msg += "inspect_lift_context has invalid closed arguments."
-        elif tool_name == "inspect_lift_schema" and enable_lift_schema_tool:
-            items = args.get("items") if isinstance(args, dict) else None
-            if (
-                not isinstance(args, dict)
-                or set(args) != {"items"}
-                or not isinstance(items, list)
-                or not 1 <= len(items) <= 12
-                or any(not isinstance(item, str) for item in items)
-            ):
-                error_msg += "inspect_lift_schema requires 1..12 string items."
-        elif tool_name == "check_candidate" and enable_check_candidate_tool:
-            if not isinstance(args, dict) or args:
-                error_msg += "check_candidate takes no arguments."
+            except (MCPRequestError, TypeError, ValueError) as exc:
+                error_msg += str(exc)
         elif tool_name == "apply_replay_patch" and enable_replay_patch_tool:
             if (
                 not isinstance(args, dict)
@@ -602,79 +479,12 @@ def parse_toolcall_actions_response(
         tool_call_id = tool_call.get("call_id") or tool_call.get("id")
         if tool_name == "bash":
             actions.append({"command": args["command"], "tool_call_id": tool_call_id})
-        elif tool_name == "apply_patch":
+        elif tool_name == "mcp_call_tool":
             actions.append(
                 {
-                    "tool_name": "apply_patch",
-                    "path": args["path"],
-                    "old_text": args["old_text"],
-                    "new_text": args["new_text"],
-                    "submit": args.get("submit", False),
-                    "tool_call_id": tool_call_id,
-                }
-            )
-        elif tool_name == "submit_candidate":
-            actions.append(
-                {
-                    "tool_name": "submit_candidate",
-                    "candidate_text": args["candidate_text"],
-                    "tool_call_id": tool_call_id,
-                }
-            )
-        elif tool_name == "write_text":
-            actions.append(
-                {
-                    "tool_name": "write_text",
-                    "path": args["path"],
-                    "content": args["content"],
-                    "mode": args["mode"],
-                    "submit": args.get("submit", False),
-                    "tool_call_id": tool_call_id,
-                }
-            )
-        elif tool_name == "save_semantic_ledger":
-            actions.append(
-                {
-                    "tool_name": "save_semantic_ledger",
-                    "content": args["content"],
-                    "tool_call_id": tool_call_id,
-                }
-            )
-        elif tool_name == "save_construction_plan":
-            actions.append(
-                {
-                    "tool_name": "save_construction_plan",
-                    "content": args["content"],
-                    "tool_call_id": tool_call_id,
-                }
-            )
-        elif tool_name == "check_and_submit_candidate":
-            actions.append(
-                {
-                    "tool_name": "check_and_submit_candidate",
-                    "tool_call_id": tool_call_id,
-                }
-            )
-        elif tool_name == "inspect_lift_context":
-            actions.append(
-                {
-                    "tool_name": "inspect_lift_context",
-                    **args,
-                    "tool_call_id": tool_call_id,
-                }
-            )
-        elif tool_name == "inspect_lift_schema":
-            actions.append(
-                {
-                    "tool_name": "inspect_lift_schema",
-                    "items": list(args["items"]),
-                    "tool_call_id": tool_call_id,
-                }
-            )
-        elif tool_name == "check_candidate":
-            actions.append(
-                {
-                    "tool_name": "check_candidate",
+                    "tool_name": "mcp_call_tool",
+                    "method": args["method"],
+                    "params": dict(args["params"]),
                     "tool_call_id": tool_call_id,
                 }
             )

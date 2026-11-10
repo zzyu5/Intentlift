@@ -38,8 +38,6 @@ PRODUCTION_CASE_IDS: dict[str, str] = {
     "llama4_rope": "high_performance:liger_llama4_rope",
     "liger_rope": "high_performance:liger_rope",
     "liger_rms_norm": "high_performance:liger_rms_norm",
-    "masked_copy": "scrc_canary:masked_copy",
-    "masked_row_square_sum": "scrc_canary:masked_row_square_sum",
     "poly_norm": "high_performance:liger_poly_norm",
     "qwen2vl_mrope": "high_performance:liger_qwen2vl_mrope",
     "softmax": "high_performance:liger_softmax",
@@ -60,14 +58,8 @@ PRODUCTION_CASE_IDS: dict[str, str] = {
     ),
 }
 
-# Formal performance inputs are the accepted high-performance J entries.  The
-# two SCRC canaries stay available to explicit compiler/correctness regression,
-# but no default paper experiment may silently include them.
-FORMAL_PRODUCTION_CASE_IDS: dict[str, str] = {
-    name: case_id
-    for name, case_id in PRODUCTION_CASE_IDS.items()
-    if case_id.startswith("high_performance:")
-}
+# Every production entry is a registered high-performance Source workload.
+FORMAL_PRODUCTION_CASE_IDS: dict[str, str] = dict(PRODUCTION_CASE_IDS)
 
 PRODUCTION_WORKLOAD_PROFILE_CLOSED = "closed-v1"
 PRODUCTION_WORKLOAD_PROFILE_NATURAL_HEADLINE = "natural-headline-v1"
@@ -148,10 +140,11 @@ _NATURAL_HEADLINE_EXTENTS: dict[str, dict[str, int]] = {
     "kl_div": {_ROW: 4096, _FEATURE: 4096},
     "poly_norm": {_ROW: 2048, _FEATURE: 4096},
     "flash_attention_forward": {
-        # B*H*S=262144 makes the certified J-only 128 MiB scan bound select
-        # exactly the 128-key semantic slice used by the Source valuation.  This
-        # is also a model-scale 32-head attention workload rather than the old
-        # tiny B2/H8 smoke shape.
+        # This is a model-scale 32-head attention workload rather than the old
+        # tiny B2/H8 smoke shape.  Production J materialization has no implicit
+        # scan-memory budget: a physical scan tile must come from a validated
+        # target Layer-C binding, while the C-free path consumes the complete
+        # semantic axis.
         _BATCH: 8,
         _HEADS: 32,
         _SEQUENCE: 1024,
@@ -364,13 +357,15 @@ _HARNESS_BINDINGS: dict[str, HarnessBindingSpec] = {
     ),
     "flash_bwd_preprocess": HarnessBindingSpec(
         buffer_axes=(
-            ("Out", _axes(None, _HEADS, None, None)),
-            ("DO", _axes(None, _HEADS, None, None)),
+            ("Out", _axes(None, None, _HEADS, None)),
+            ("DO", _axes(None, None, _HEADS, None)),
             ("Delta", _axes(None, _HEADS, None)),
         ),
         scalars=(
             ValueBinding("stride_ob", _HEADS, 33 * 16),
             ValueBinding("stride_dob", _HEADS, 33 * 16),
+            ValueBinding("stride_om", _HEADS, 16),
+            ValueBinding("stride_dom", _HEADS, 16),
             ValueBinding("nheads", _HEADS),
         ),
         grid=(GridBinding("preserve"), GridBinding("extent", _HEADS)),
@@ -1160,21 +1155,21 @@ _NATURAL_HARNESS_BINDINGS: dict[str, HarnessBindingSpec] = {
     ),
     "flash_bwd_preprocess": HarnessBindingSpec(
         buffer_axes=(
-            ("Out", _axes(_BATCH, _HEADS, _SEQUENCE, _HEAD_DIM)),
-            ("DO", _axes(_BATCH, _HEADS, _SEQUENCE, _HEAD_DIM)),
+            ("Out", _axes(_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)),
+            ("DO", _axes(_BATCH, _SEQUENCE, _HEADS, _HEAD_DIM)),
             ("Delta", _axes(_BATCH, _HEADS, _PADDED_SEQUENCE)),
         ),
         scalars=(
             ValueBinding(
                 "stride_ob", _HEADS, factors=(_SEQUENCE, _HEAD_DIM)
             ),
-            ValueBinding("stride_oh", _SEQUENCE, factors=(_HEAD_DIM,)),
-            ValueBinding("stride_om", _HEAD_DIM),
+            ValueBinding("stride_oh", _HEAD_DIM),
+            ValueBinding("stride_om", _HEADS, factors=(_HEAD_DIM,)),
             ValueBinding(
                 "stride_dob", _HEADS, factors=(_SEQUENCE, _HEAD_DIM)
             ),
-            ValueBinding("stride_doh", _SEQUENCE, factors=(_HEAD_DIM,)),
-            ValueBinding("stride_dom", _HEAD_DIM),
+            ValueBinding("stride_doh", _HEAD_DIM),
+            ValueBinding("stride_dom", _HEADS, factors=(_HEAD_DIM,)),
             ValueBinding("nheads", _HEADS),
             ValueBinding("seqlen_q", _SEQUENCE),
             ValueBinding("seqlen_q_rounded", _PADDED_SEQUENCE),

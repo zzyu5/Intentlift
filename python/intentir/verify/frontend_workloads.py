@@ -10,16 +10,20 @@ Harness and Replay remains source-blind.
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import hashlib
 import importlib.util
 import json
 import operator
+import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
-from typing import Any, Mapping
+import tempfile
+from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 
@@ -49,19 +53,34 @@ from intentir.verify.gate1.tilelang_compiler import (
     TileLangCompileCase,
     TileLangKernelSource,
 )
+from intentir.ir.value_dimension import resolve_runtime_output_shapes
+from intentir.ir.canonical_j import j_elaboration
+from intentir.ir.canonical_construction import (
+    CanonicalConstruction,
+    CanonicalHandleAllocator,
+    SourceFacts,
+)
 from intentir.verify.gate2.native import (
     NativeArgument,
     NativeArgumentRole,
     NativeExecutionSpec,
     NativeTensorMapSpec,
 )
+from intentir.verify.gate2.model import program_identity_digests
 from intentir.verify.gate2.orchestrate import Gate2Case, Gate2Suite
 from intentir.verify.gate2.policy import DEFAULT_GATE2_POLICY, gate2_policy_for
+from intentir.verify.gate2.inputs import materialize_ragged_input_values
 from intentir.verify.gate2.scalar import ScalarLoweringSpec
 from intentir.verify.scrc_runner import (
     HarnessBindingInstance,
     SCRCRunRequest,
     SourceProgram,
+)
+from intentir.verify.workload_adapters import (
+    GeneratedTargetSourceArgument,
+    GeneratedTargetSourceManifest,
+    build_generated_source_manifest,
+    reingress_prepared_workload,
 )
 
 
@@ -77,6 +96,232 @@ _DEFAULT_DATASET_BLOCK_2D = (16, 16, 1)
 
 class FrontendDatasetCaseUnavailableError(ValueError):
     """The catalog entry is valid but needs an unsupported explicit sidecar."""
+
+
+@dataclass(frozen=True)
+class CuTileConsumerResult:
+    """Bounded result from the optional external cuTile lowering consumer."""
+
+    ok: bool
+    failure_class: str
+    returncode: int | None
+    stdout: str = ""
+    stderr: str = ""
+    diagnostic: str = ""
+    source: str | None = None
+    realized_ir: str | None = None
+    capability_failure: bool = False
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "failure_class": self.failure_class,
+            "returncode": self.returncode,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "diagnostic": self.diagnostic,
+            "source": self.source,
+            "realized_ir": self.realized_ir,
+            "capability_failure": self.capability_failure,
+        }
+
+
+def _bounded_diagnostic(value: str, *, limit: int = 8192) -> str:
+    value = str(value or "")
+    return value if len(value) <= limit else value[: limit - 3] + "..."
+
+
+def _resolve_cutile_consumer(executable: str | Path | None) -> Path | None:
+    if executable is not None:
+        path = Path(executable).expanduser().resolve()
+        return path if path.is_file() else None
+    repo_root = Path(__file__).resolve().parents[3]
+    configured = os.environ.get("INTENTIR_CUTILE_COMPILER", "").strip()
+    candidates = [Path(configured)] if configured else []
+    candidates.extend(
+        Path(item)
+        for item in (
+            shutil.which("intent-compile"),
+            repo_root / "build" / "tools" / "intent-compile" / "intent-compile",
+            repo_root / "build" / "bin" / "intent-compile",
+            repo_root / "tools" / "intent-compile" / "intent-compile",
+            repo_root.parent
+            / "intent-dsl"
+            / "build"
+            / "tools"
+            / "intent-compile"
+            / "intent-compile",
+            repo_root.parent / "intent-dsl" / "build" / "bin" / "intent-compile",
+            repo_root.parent
+            / "intent-dsl"
+            / "tools"
+            / "intent-compile"
+            / "intent-compile",
+        )
+        if item
+    )
+    return next((path.resolve() for path in candidates if path.is_file()), None)
+
+
+def run_cutile_consumer(
+    kernel_mlir: str | Path,
+    *,
+    executable: str | Path | None = None,
+    device: int = 0,
+    compute_units: int,
+    shared_memory_per_unit: int,
+    registers_per_unit: int,
+    matrix_units: bool,
+    dynamic_vector_width: bool,
+    timeout: float = 120.0,
+) -> CuTileConsumerResult:
+    """Run the external cuTile consumer with fail-closed diagnostics.
+
+    All generated files live in a temporary directory and are returned only as
+    in-memory text.  A zero exit status is insufficient: any ``error:`` line,
+    missing output, or empty output is a failure.  Missing consumer binaries are
+    reported separately as capability failures.
+    """
+
+    consumer = _resolve_cutile_consumer(executable)
+    if consumer is None:
+        return CuTileConsumerResult(
+            False,
+            "capability_unavailable",
+            None,
+            diagnostic="cuTile intent-compile consumer is not available",
+            capability_failure=True,
+        )
+    if timeout <= 0 or not np.isfinite(timeout):
+        raise ValueError("cuTile consumer timeout must be positive and finite")
+    capability_values = {
+        "device": device,
+        "compute-units": compute_units,
+        "shared-memory-per-unit": shared_memory_per_unit,
+        "registers-per-unit": registers_per_unit,
+    }
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in capability_values.values()
+    ):
+        raise ValueError("cuTile consumer capability values must be non-negative integers")
+    if not isinstance(kernel_mlir, (str, Path)):
+        raise TypeError("cuTile kernel MLIR must be a path or text")
+    with tempfile.TemporaryDirectory(prefix="intentir-cutile-consumer-") as raw:
+        root = Path(raw)
+        input_path = (
+            Path(kernel_mlir).expanduser().resolve()
+            if isinstance(kernel_mlir, Path)
+            else Path(kernel_mlir)
+        )
+        if not input_path.is_file():
+            input_path = root / "kernel.mlir"
+            input_path.write_text(str(kernel_mlir), encoding="utf-8")
+        ir_path = root / "realized.mlir"
+        source_path = root / "generated.py"
+        command = [
+            str(consumer),
+            str(input_path),
+            "--target=cutile",
+            f"--device={device}",
+            f"--compute-units={compute_units}",
+            f"--shared-memory-per-unit={shared_memory_per_unit}",
+            f"--registers-per-unit={registers_per_unit}",
+            f"--matrix-units={'true' if matrix_units else 'false'}",
+            f"--dynamic-vector-width={'true' if dynamic_vector_width else 'false'}",
+            f"--ir-output={ir_path}",
+            f"--source-output={source_path}",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = _bounded_diagnostic(str(exc.stdout or ""))
+            stderr = _bounded_diagnostic(str(exc.stderr or ""))
+            return CuTileConsumerResult(
+                False,
+                "consumer_timeout",
+                None,
+                stdout=stdout,
+                stderr=stderr,
+                diagnostic=f"cuTile consumer timed out after {timeout:.1f}s",
+            )
+        except OSError as exc:
+            return CuTileConsumerResult(
+                False,
+                "capability_unavailable",
+                None,
+                diagnostic=f"cuTile consumer could not start: {exc}",
+                capability_failure=True,
+            )
+
+        stdout = _bounded_diagnostic(completed.stdout)
+        stderr = _bounded_diagnostic(completed.stderr)
+        diagnostic_stream = f"{completed.stdout}\n{completed.stderr}"
+        if "error:" in diagnostic_stream.casefold():
+            return CuTileConsumerResult(
+                False,
+                "consumer_diagnostic",
+                completed.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                diagnostic="cuTile consumer emitted an error diagnostic",
+            )
+        if completed.returncode != 0:
+            return CuTileConsumerResult(
+                False,
+                "consumer_exit",
+                completed.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                diagnostic=(
+                    f"cuTile consumer exited with status {completed.returncode}"
+                ),
+            )
+        if not ir_path.is_file() or ir_path.stat().st_size == 0:
+            return CuTileConsumerResult(
+                False,
+                "realized_ir_missing_or_empty",
+                completed.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                diagnostic="cuTile consumer produced no non-empty realized MLIR",
+            )
+        if not source_path.is_file() or source_path.stat().st_size == 0:
+            return CuTileConsumerResult(
+                False,
+                "source_missing_or_empty",
+                completed.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                diagnostic="cuTile consumer produced no non-empty source output",
+            )
+        try:
+            realized_ir = ir_path.read_text(encoding="utf-8")
+            source = source_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            return CuTileConsumerResult(
+                False,
+                "output_unreadable",
+                completed.returncode,
+                stdout=stdout,
+                stderr=stderr,
+                diagnostic=f"cuTile consumer output is unreadable: {exc}",
+            )
+        return CuTileConsumerResult(
+            True,
+            "ok",
+            completed.returncode,
+            stdout=stdout,
+            stderr=stderr,
+            source=source,
+            realized_ir=realized_ir,
+        )
 
 
 @dataclass(frozen=True)
@@ -345,6 +590,13 @@ class DatasetRuntimeParameter:
     value: bool | int | float | None = None
     shape_contract: tuple[int | str, ...] = ()
     semantic_mode: str | None = None
+    # Physical layout and observable output identity are source/Harness facts.
+    # They are intentionally not folded into J's logical tensor type.
+    strides: tuple[int, ...] | None = None
+    output_key: str | None = None
+    # For an opaque physical ABI slot, ``dtype`` is the physical token and this
+    # field is the logical tensor dtype projected to J/Replay.
+    logical_dtype: str | None = None
 
     def __post_init__(self) -> None:
         if not self.source_name.isidentifier() or not self.semantic_name.isidentifier():
@@ -355,9 +607,31 @@ class DatasetRuntimeParameter:
             raise ValueError("Dataset parameter dtype must be non-empty")
         shape = tuple(int(value) for value in self.shape)
         shape_contract: tuple[int | str, ...] = tuple(self.shape_contract)
+        strides = (
+            tuple(int(value) for value in self.strides)
+            if self.strides is not None
+            else None
+        )
+        if strides is not None:
+            if self.kind != "pointer":
+                raise ValueError("Dataset strides are valid only for pointer ABI")
+            if len(strides) != len(shape) or any(value < 0 for value in strides):
+                raise ValueError(
+                    "Dataset pointer strides must match rank and be non-negative"
+                )
+        output_key = self.output_key
+        if output_key is not None and (
+            not isinstance(output_key, str) or not output_key.isidentifier()
+        ):
+            raise ValueError("Dataset output_key must be an identifier")
+        logical_dtype = self.logical_dtype
         if self.kind == "pointer":
-            if self.rank != len(shape) or not shape or any(value <= 0 for value in shape):
-                raise ValueError("Dataset pointer shape must match its positive rank")
+            if self.rank != len(shape) or not shape or any(value < 0 for value in shape):
+                raise ValueError("Dataset pointer shape must match its non-negative rank")
+            if any(value == 0 for value in shape) and self.mode != "output":
+                raise ValueError(
+                    "zero-length Dataset pointers are allowed only for outputs"
+                )
             if len(shape_contract) != self.rank:
                 raise ValueError(
                     "Dataset pointer source shape contract must match its rank"
@@ -366,9 +640,13 @@ class DatasetRuntimeParameter:
                 if isinstance(extent, bool):
                     raise TypeError("Dataset source shape contract cannot be boolean")
                 if isinstance(extent, int):
-                    if extent <= 0:
+                    if extent < 0:
                         raise ValueError(
-                            "Dataset static source shape extents must be positive"
+                            "Dataset static source shape extents must be non-negative"
+                        )
+                    if extent == 0 and self.mode != "output":
+                        raise ValueError(
+                            "zero-length Dataset shape contracts are allowed only for outputs"
                         )
                 elif not isinstance(extent, str) or not extent.isidentifier():
                     raise ValueError(
@@ -378,6 +656,22 @@ class DatasetRuntimeParameter:
                 raise ValueError("Dataset pointer requires an effect mode")
             if self.value is not None:
                 raise ValueError("Dataset pointer cannot carry a scalar value")
+            if logical_dtype is not None:
+                if _normalize_dataset_dtype(logical_dtype) != _normalize_dataset_dtype(
+                    self.dtype
+                ):
+                    raise ValueError(
+                        "Dataset pointer logical_dtype differs from its dtype"
+                    )
+                logical_dtype = _normalize_dataset_dtype(logical_dtype)
+            if self.mode == "input":
+                if output_key is not None:
+                    raise ValueError("Dataset input pointer cannot declare output_key")
+            elif output_key is None:
+                # The source formal is stable within the captured ABI and is a
+                # deterministic fallback when an older descriptor omitted the
+                # explicit field.  It is not a J output name.
+                output_key = self.source_name.casefold()
         elif self.kind == "scalar":
             if (
                 self.rank != 0
@@ -387,7 +681,16 @@ class DatasetRuntimeParameter:
                 or self.value is None
             ):
                 raise ValueError("Dataset scalar requires one fixed runtime value")
+            if strides is not None or output_key is not None or logical_dtype is not None:
+                raise ValueError("Dataset scalar forbids layout/output fields")
         else:
+            try:
+                physical_dtype = _normalize_physical_opaque_dtype(self.dtype)
+                logical_dtype = _normalize_dataset_dtype(logical_dtype)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "Dataset opaque TensorMap requires a physical token and logical dtype"
+                ) from exc
             if (
                 self.rank != 2
                 or len(shape) != 2
@@ -396,12 +699,19 @@ class DatasetRuntimeParameter:
                 or self.mode != "value"
                 or self.value is not None
                 or self.semantic_mode != "input"
+                or output_key is not None
+                or strides is not None
+                or logical_dtype is None
             ):
                 raise ValueError(
                     "Dataset opaque TensorMap requires one rank-2 logical input sidecar"
                 )
+            object.__setattr__(self, "dtype", physical_dtype)
         object.__setattr__(self, "shape", shape)
         object.__setattr__(self, "shape_contract", shape_contract)
+        object.__setattr__(self, "strides", strides)
+        object.__setattr__(self, "output_key", output_key)
+        object.__setattr__(self, "logical_dtype", logical_dtype)
 
     def frontend_parameter(self) -> FrontendParameter:
         return FrontendParameter(self.kind, self.dtype, self.rank, self.mode)
@@ -423,6 +733,7 @@ class DatasetRuntimeParameter:
                     else extent
                     for extent in self.shape_contract
                 ),
+                strides=self.strides,
             )
         if self.kind == "scalar":
             return SCRCCompilerArgument(
@@ -449,6 +760,9 @@ class DatasetRuntimeParameter:
             "shape_contract": list(self.shape_contract),
             "value": self.value,
             "semantic_mode": self.semantic_mode,
+            "strides": list(self.strides) if self.strides is not None else None,
+            "output_key": self.output_key,
+            "logical_dtype": self.logical_dtype,
         }
 
 
@@ -490,10 +804,11 @@ def _logical_abi_parameters(
                 "input",
                 parameter.shape,
                 shape_contract=parameter.shape_contract,
+                strides=parameter.strides,
             )
         )
     if consumed != set(by_parameter):
-        raise ValueError("TensorMap logical ABI projection contains unused descriptors")
+        raise ValueError("TensorMap logical ABI mapping contains unused descriptors")
     return tuple(result)
 
 
@@ -515,6 +830,19 @@ class DatasetSourceProjection:
             not name.isidentifier() for name in self.parameters
         ):
             raise ValueError("Dataset source projection parameters must be unique")
+        constexpr_parameters = tuple(self.constexpr_parameters)
+        if len(constexpr_parameters) != len(set(constexpr_parameters)) or any(
+            not name.isidentifier() for name in constexpr_parameters
+        ):
+            raise ValueError(
+                "Dataset source projection constexpr parameters must be unique identifiers"
+            )
+        if not set(constexpr_parameters) <= set(self.parameters):
+            raise ValueError(
+                "Dataset source projection constexpr parameters must be in its ABI"
+            )
+        object.__setattr__(self, "parameters", tuple(self.parameters))
+        object.__setattr__(self, "constexpr_parameters", constexpr_parameters)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -550,6 +878,217 @@ class PreparedFrontendDatasetWorkload:
     runtime_parameters: tuple[DatasetRuntimeParameter, ...]
     grid: tuple[int, int, int]
     block: tuple[int, int, int]
+    manifest: GeneratedTargetSourceManifest
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.manifest, GeneratedTargetSourceManifest):
+            raise TypeError(
+                "PreparedFrontendDatasetWorkload requires a generated-source manifest"
+            )
+        self.manifest.validate_source_slice(
+            self.source_slice,
+            self.source_location,
+        )
+        mapping = dict(self.source_to_opaque)
+        expected_mapping_keys = set(self.manifest.source_parameter_order) | set(
+            self.manifest.compiler_slot_order
+        )
+        if set(mapping) != expected_mapping_keys:
+            missing = sorted(expected_mapping_keys - set(mapping))
+            extra = sorted(set(mapping) - expected_mapping_keys)
+            raise ValueError(
+                "Dataset source_to_opaque mapping must exactly cover the ABI"
+                + ("; missing " + ", ".join(missing) if missing else "")
+                + ("; extra " + ", ".join(extra) if extra else "")
+            )
+        if len(mapping) != len(set(mapping.values())):
+            raise ValueError("Dataset source_to_opaque mapping must be one-to-one")
+        if any(
+            not isinstance(source, str)
+            or not source.isidentifier()
+            or not isinstance(opaque, str)
+            or re.fullmatch(r"(?:p|c)[0-9]+", opaque) is None
+            for source, opaque in mapping.items()
+        ):
+            raise ValueError(
+                "Dataset source_to_opaque mapping must use p*/c* handles"
+            )
+        self.manifest.validate_compiler_view(
+            self.compiler_view,
+            source_to_opaque=mapping,
+            request=self.request,
+        )
+        if set(mapping[name] for name in self.manifest.c_slot_order) != set(
+            self.request.binding.values
+        ):
+            raise ValueError(
+                "Dataset source/C mapping differs from request c0"
+            )
+        object.__setattr__(self, "source_to_opaque", mapping)
+        object.__setattr__(self, "runtime_parameters", tuple(self.runtime_parameters))
+        object.__setattr__(self, "grid", tuple(self.grid))
+        object.__setattr__(self, "block", tuple(self.block))
+
+    def with_contract(
+        self,
+        j: Any,
+        c: Any,
+        *,
+        e_c: Any | None = None,
+    ) -> "PreparedFrontendDatasetWorkload":
+        """Bind the exact accepted J/C pair before native Gate2 or re-ingress."""
+
+        return replace(
+            self,
+            manifest=self.manifest.bind_contract(
+                j,
+                c,
+                e_c=e_c,
+                source_to_opaque=self.source_to_opaque,
+            ),
+        )
+
+    def with_lifecycle_records(
+        self,
+        records: tuple[Any, ...] | list[Any],
+    ) -> "PreparedFrontendDatasetWorkload":
+        return replace(
+            self,
+            manifest=self.manifest.with_lifecycle_records(records),
+        )
+
+    def reingress_source(
+        self,
+        *,
+        source: str,
+        source_symbol: str,
+        source_location: str,
+        j: Any | None = None,
+        c: Any | None = None,
+    ) -> "PreparedFrontendDatasetWorkload":
+        """Admit one explicit generated CUDA or TileLang source projection.
+
+        The complete source is sent to the frontend compiler, while the
+        selected device entry is independently projected for the Lift/source
+        ABI.  The frozen Dataset case supplies the compiler parameters,
+        launch geometry, C slots, and logical TensorMap bindings; none of those
+        facts are inferred from a filename or kernel name.
+        """
+
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("re-ingress source must be non-empty")
+        if not isinstance(source_symbol, str) or not source_symbol.isidentifier():
+            raise ValueError("re-ingress source_symbol must be an identifier")
+        if not isinstance(source_location, str) or not source_location.strip():
+            raise ValueError("re-ingress source_location must be non-empty")
+        if (j is None) != (c is None):
+            raise ValueError("re-ingress J and C must be supplied together")
+
+        prepared = self
+        if prepared.manifest.bound:
+            if j is None or c is None:
+                raise ValueError(
+                    "re-ingress of a bound Dataset workload requires the exact accepted J and C"
+                )
+            rebound = prepared.with_contract(j, c)
+            if (
+                rebound.manifest.j_digest != prepared.manifest.j_digest
+                or rebound.manifest.e_c_interface_digest
+                != prepared.manifest.e_c_interface_digest
+                or rebound.manifest.contract_ir_digest
+                != prepared.manifest.contract_ir_digest
+            ):
+                raise ValueError(
+                    "re-ingress source changed the bound J/E_C/contract identity"
+                )
+            prepared = rebound
+        elif j is not None:
+            assert c is not None
+            prepared = prepared.with_contract(j, c)
+
+        if prepared.adapter.frontend == "cuda":
+            projection = _cuda_lift_projection(
+                source,
+                source_symbol,
+                source_kind=prepared.source_slice.source_kind,
+                origin_location=source_location,
+            )
+            gate_source: Any = CudaKernelSource.from_code(
+                source,
+                source_symbol,
+            )
+            lift_source_kind = "cuda"
+            lift_mapping = tuple(prepared.source_to_opaque.items())
+        elif prepared.adapter.frontend == "tilelang":
+            gate_source = TileLangKernelSource.from_code(
+                source,
+                source_symbol,
+            )
+            projection = _tilelang_source_projection(
+                source,
+                source_symbol,
+                source_location=source_location,
+                source_kind=prepared.source_slice.source_kind,
+            )
+            # TileLang PrimFunc source is a Python/TIR source projection at the
+            # Lift boundary.  Keep the original kind so the same anonymizer
+            # and compiler-view contract are used for initial and re-ingressed
+            # observations.
+            lift_source_kind = prepared.request.source.lift_source_kind
+            if lift_source_kind != "python":
+                raise ValueError(
+                    "TileLang re-ingress requires the Python/TIR Lift source kind"
+                )
+            lift_mapping = ()
+        else:
+            raise ValueError(
+                f"unsupported Dataset re-ingress frontend {prepared.adapter.frontend!r}"
+            )
+
+        request_source = SourceProgram(
+            projection.code,
+            gate_source,
+            lift_source_kind=lift_source_kind,
+            lift_source_symbol=projection.function,
+            lift_parameter_order=projection.parameters,
+            lift_constexpr_parameters=projection.constexpr_parameters,
+            lift_source_to_opaque=lift_mapping,
+        )
+        source_facts = SourceFacts.from_compiler_view(
+            prepared.compiler_view,
+            frontend=prepared.request.frontend,
+            source_kind=request_source.lift_source_kind,
+            source_symbol=projection.function,
+            source_to_opaque=prepared.source_to_opaque,
+            source_digest=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            source_slice_digest=hashlib.sha256(
+                projection.code.encode("utf-8")
+            ).hexdigest(),
+        )
+        construction = CanonicalConstruction.from_source_facts(
+            source_facts,
+            source_text=projection.code,
+        )
+        request = SCRCRunRequest(
+            request_source,
+            prepared.request.binding,
+            prepared.request.frontend,
+            source_facts,
+            construction,
+            max_gate1_rounds=prepared.request.max_gate1_rounds,
+            max_lift_calls=prepared.request.max_lift_calls,
+            max_pre_replay_rejections=prepared.request.max_pre_replay_rejections,
+        )
+        return reingress_prepared_workload(
+            prepared,
+            source=source,
+            source_slice=projection,
+            source_location=source_location,
+            compiler_view=prepared.compiler_view,
+            source_to_opaque=prepared.source_to_opaque,
+            request=request,
+            consumer=f"{prepared.adapter.frontend}-source-reingress",
+        )
 
 
 def _safe_integer_expression(expression: Any, values: Mapping[str, int]) -> int:
@@ -570,6 +1109,8 @@ def _safe_integer_expression(expression: Any, values: Mapping[str, int]) -> int:
             ast.Mult: operator.mul,
             ast.FloorDiv: operator.floordiv,
             ast.Mod: operator.mod,
+            ast.LShift: operator.lshift,
+            ast.RShift: operator.rshift,
         }
 
         def evaluate(node: ast.AST) -> int:
@@ -720,13 +1261,7 @@ def _metadata_parameters(
     use_logical_interface: bool = False,
 ) -> tuple[DatasetRuntimeParameter, ...]:
     if use_logical_interface:
-        interface = metadata.get("interface")
-        raw_rows = interface.get("parameters") if isinstance(interface, Mapping) else None
-        if not isinstance(raw_rows, list) or not raw_rows or not all(
-            isinstance(item, Mapping) for item in raw_rows
-        ):
-            raise ValueError("TileLang Dataset metadata lacks a logical interface")
-        rows = list(raw_rows)
+        rows = list(_metadata_interface_rows(metadata))
     else:
         rows = list(_ordered_abi_rows(metadata))
     if not include_runtime_scalars:
@@ -734,49 +1269,54 @@ def _metadata_parameters(
     if source_names is not None:
         source_rows = _metadata_rows_in_source_order(source_names, rows)
         if len(source_rows) != len(rows):
-            raise ValueError("materialized TileLang ABI differs from generated metadata")
+            raise ValueError("materialized Dataset ABI differs from generated metadata")
     else:
         source_rows = tuple((str(row.get("name") or ""), row) for row in rows)
+
+    # A physical CUDA ABI may contain ``opaque`` CUtensorMap rows while its
+    # logical interface contains ordinary rank-2 pointers.  Resolve those rows
+    # by their explicit semantic name; never align them by position or infer a
+    # dtype from the physical token.
     logical_rows_by_source: dict[str, Mapping[str, Any]] = {}
-    if use_logical_interface_dtypes and not use_logical_interface:
-        interface = metadata.get("interface")
-        raw_logical_rows = (
-            interface.get("parameters") if isinstance(interface, Mapping) else None
-        )
-        if not isinstance(raw_logical_rows, list) or not raw_logical_rows:
-            raise ValueError("TileLang Dataset metadata lacks its logical interface")
-        if not all(isinstance(item, Mapping) for item in raw_logical_rows):
-            raise ValueError("TileLang logical interface parameters must be objects")
-        logical_source_rows = _metadata_rows_in_source_order(
-            tuple(source_name for source_name, _row in source_rows),
-            list(raw_logical_rows),
-        )
-        if len(logical_source_rows) != len(source_rows):
-            raise ValueError(
-                "TileLang logical interface differs from its materialized pointer ABI"
-            )
-        for (source_name, physical), (_logical_source, logical) in zip(
-            source_rows, logical_source_rows, strict=True
-        ):
+    need_logical_rows = use_logical_interface_dtypes or any(
+        str(row.get("kind") or "") == "opaque" for _name, row in source_rows
+    )
+    if not use_logical_interface and need_logical_rows:
+        logical_rows = _metadata_interface_rows(metadata)
+        for source_name, physical in source_rows:
+            logical = _logical_row_for_physical(physical, logical_rows)
+            physical_kind = str(physical.get("kind") or "")
+            logical_kind = str(logical.get("kind") or "")
             physical_shape = _source_shape_contract(physical.get("shape"))
             logical_shape = _source_shape_contract(logical.get("shape"))
-            if (
-                logical.get("kind") != physical.get("kind")
-                or logical.get("mode") != physical.get("mode")
-                or logical.get("rank") != physical.get("rank")
-                or logical_shape != physical_shape
+            physical_rank = int(physical.get("rank", len(physical_shape)))
+            logical_rank = int(logical.get("rank", len(logical_shape)))
+            if physical_shape != logical_shape or physical_rank != logical_rank:
+                raise ValueError(
+                    "Dataset logical interface differs from its physical ABI shape"
+                )
+            if physical_kind == "opaque":
+                if logical_kind != "pointer" or str(logical.get("mode") or "") != "input":
+                    raise ValueError(
+                        "Dataset opaque ABI must project to a logical input pointer"
+                    )
+            elif logical_kind != physical_kind or str(logical.get("mode") or "value") != str(
+                physical.get("mode") or "value"
             ):
                 raise ValueError(
-                    "TileLang logical interface differs from its physical CUDA ABI"
+                    "Dataset logical interface differs from its physical ABI kind/mode"
                 )
             logical_rows_by_source[source_name] = logical
+
     result: list[DatasetRuntimeParameter] = []
     for source_name, row in source_rows:
         semantic_name = str(row.get("semantic_name") or row.get("name") or "")
         kind = str(row.get("kind") or "")
+        logical_row = logical_rows_by_source.get(source_name)
         value = None
         shape: tuple[int, ...] = ()
         shape_contract: tuple[int | str, ...] = ()
+        rank = int(row.get("rank", 0))
         if kind in {"pointer", "opaque"}:
             shape_contract = _source_shape_contract(row.get("shape"))
             shape = _resolve_shape(shape_contract, dimensions)
@@ -787,23 +1327,26 @@ def _metadata_parameters(
                 value = dimensions[semantic_name]
             else:
                 raise ValueError(f"Dataset scalar {semantic_name!r} lacks a Harness value")
+
+        if kind == "opaque":
+            dtype = _normalize_physical_opaque_dtype(row.get("dtype"))
+            logical_dtype = _normalize_dataset_dtype(
+                (logical_row or {}).get("dtype")
+            )
+        elif logical_row is not None:
+            dtype = _normalize_dataset_dtype(logical_row.get("dtype"))
+            logical_dtype = None
+        else:
+            dtype = _normalize_dataset_dtype(row.get("dtype"))
+            logical_dtype = None
+        output_key = row.get("output_key")
         result.append(
             DatasetRuntimeParameter(
                 source_name=source_name,
                 semantic_name=semantic_name,
                 kind=kind,
-                dtype=(
-                    _normalize_dataset_dtype(
-                        (
-                            logical_rows_by_source[source_name].get("dtype")
-                            if source_name in logical_rows_by_source
-                            else row.get("dtype")
-                        )
-                    )
-                    if use_logical_interface or source_name in logical_rows_by_source
-                    else str(row.get("dtype") or "")
-                ),
-                rank=int(row.get("rank", 0)),
+                dtype=dtype,
+                rank=rank,
                 mode=str(row.get("mode") or "value"),
                 shape=shape,
                 value=value,
@@ -811,8 +1354,18 @@ def _metadata_parameters(
                 semantic_mode=(
                     str(row.get("semantic_mode"))
                     if row.get("semantic_mode") is not None
-                    else None
+                    else (
+                        str(logical_row.get("semantic_mode"))
+                        if logical_row is not None
+                        and logical_row.get("semantic_mode") is not None
+                        else None
+                    )
                 ),
+                strides=_metadata_row_strides(row, rank=rank)
+                if kind == "pointer"
+                else None,
+                output_key=str(output_key) if output_key is not None else None,
+                logical_dtype=logical_dtype,
             )
         )
     return tuple(result)
@@ -894,6 +1447,41 @@ def _materialize_tilelang_projection(
         "tilelang",
         "materialized_tir",
         kernel.location,
+    )
+
+
+def _tilelang_source_projection(
+    code: str,
+    symbol: str,
+    *,
+    source_location: str,
+    source_kind: str,
+) -> DatasetSourceProjection:
+    """Validate and project one explicitly selected generated PrimFunc.
+
+    Re-ingress must consume the supplied source bytes.  Calling the original
+    Dataset factory here would silently select a new source, so this helper
+    only parses the already generated module after ``TileLangKernelSource``
+    has applied its static policy.
+    """
+
+    tree = ast.parse(code)
+    functions = [
+        node for node in tree.body if isinstance(node, ast.FunctionDef)
+    ]
+    if len(functions) != 1 or functions[0].name != symbol:
+        raise ValueError(
+            "TileLang re-ingress source must contain exactly the selected PrimFunc"
+        )
+    function = functions[0]
+    parameters = tuple(argument.arg for argument in function.args.args)
+    return DatasetSourceProjection(
+        code if code.endswith("\n") else code + "\n",
+        function.name,
+        parameters,
+        "tilelang",
+        source_kind,
+        source_location,
     )
 
 
@@ -1154,6 +1742,7 @@ def _matching_brace(code: str, opening: int) -> int:
 def _cuda_definition(
     code: str, symbol: str
 ) -> tuple[tuple[str, ...], str]:
+    matches: list[tuple[tuple[str, ...], str]] = []
     for match in re.finditer(rf"\b{re.escape(symbol)}\s*\(", code):
         header = code[max(0, match.start() - 512) : match.start()]
         if "__global__" not in header:
@@ -1165,11 +1754,17 @@ def _cuda_definition(
             continue
         body_opening = code.find("{", closing + 1)
         body_closing = _matching_brace(code, body_opening)
-        return (
-            _split_cuda_parameters(code[opening + 1 : closing]),
-            code[body_opening + 1 : body_closing],
+        matches.append(
+            (
+                _split_cuda_parameters(code[opening + 1 : closing]),
+                code[body_opening + 1 : body_closing],
+            )
         )
-    raise ValueError("handwritten CUDA kernel definition is unavailable")
+    if len(matches) != 1:
+        raise ValueError(
+            "handwritten CUDA source must contain exactly one selected __global__ definition"
+        )
+    return matches[0]
 
 
 def _cuda_declaration_name(declaration: str) -> str:
@@ -1182,19 +1777,148 @@ def _cuda_declaration_name(declaration: str) -> str:
 def _normalize_dataset_dtype(dtype: Any) -> str:
     aliases = {
         "bool": "i1",
+        "boolean": "i1",
         "float16": "f16",
+        "half": "f16",
+        "__half": "f16",
         "float32": "f32",
         "float64": "f64",
+        "double": "f64",
+        "bfloat16": "bf16",
+        "__nv_bfloat16": "bf16",
         "int8": "i8",
         "int16": "i16",
         "int32": "i32",
         "int64": "i64",
+        "index": "i64",
+        "uint": "u32",
         "uint8": "u8",
+        "uint16": "u16",
+        "uint32": "u32",
     }
     value = aliases.get(str(dtype), str(dtype))
-    if not re.fullmatch(r"(?:bf16|f16|f32|f64|i1|i8|i16|i32|i64|u8)", value):
+    if not re.fullmatch(
+        r"(?:bf16|f16|f32|f64|i1|i8|i16|i32|i64|u8|u16|u32)",
+        value,
+    ):
         raise ValueError(f"unsupported Dataset ABI dtype {dtype!r}")
     return value
+
+
+def _normalize_physical_opaque_dtype(dtype: Any) -> str:
+    """Normalize the closed physical spelling for an opaque ABI value.
+
+    CUDA metadata has used both CUDA's ``CUtensorMap`` spelling and the
+    source-neutral ``tensor_map`` token.  These are physical ABI names, not
+    logical tensor dtypes, so they must never enter ``_normalize_dataset_dtype``.
+    """
+
+    spelling = str(dtype or "").strip().casefold().replace(" ", "")
+    aliases = {
+        "tensormap": "cuda_tensor_map",
+        "cutensormap": "cuda_tensor_map",
+        "cuda_tensormap": "cuda_tensor_map",
+        "cuda_tensor_map": "cuda_tensor_map",
+        "tensor_map": "tensor_map",
+        "opaque": "opaque",
+    }
+    result = aliases.get(spelling)
+    if result is None:
+        raise ValueError(f"unsupported physical opaque ABI dtype {dtype!r}")
+    return result
+
+
+def _metadata_row_strides(
+    row: Mapping[str, Any],
+    *,
+    rank: int,
+) -> tuple[int, ...] | None:
+    """Read physical element strides without guessing a layout."""
+
+    raw = row.get("strides")
+    if raw is None and isinstance(row.get("layout"), Mapping):
+        raw = row["layout"].get("strides")
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple)) or len(raw) != rank:
+        raise ValueError("Dataset ABI strides must match the declared rank")
+    result = tuple(int(value) for value in raw)
+    if any(isinstance(value, bool) or value < 0 for value in result):
+        raise ValueError("Dataset ABI strides must be non-negative integers")
+    return result
+
+
+def _cuda_declaration_kind_dtype(declaration: str) -> tuple[str, str]:
+    """Project one CUDA declaration to its physical kind and scalar dtype."""
+
+    normalized = re.sub(r"\b(const|volatile|restrict|__restrict__)\b", " ", declaration)
+    lowered = normalized.casefold()
+    if "cutensormap" in lowered:
+        return "opaque", "cuda_tensor_map"
+    kind = "pointer" if "*" in normalized else "scalar"
+    type_aliases = (
+        ("__nv_bfloat16", "bf16"),
+        ("bfloat16", "bf16"),
+        ("__half", "f16"),
+        ("half", "f16"),
+        ("float", "f32"),
+        ("double", "f64"),
+        ("int8_t", "i8"),
+        ("int16_t", "i16"),
+        ("int32_t", "i32"),
+        ("int64_t", "i64"),
+        ("uint8_t", "u8"),
+        ("uint16_t", "u16"),
+        ("uint32_t", "u32"),
+        ("int", "i32"),
+        ("unsigned", "u32"),
+        ("bool", "i1"),
+    )
+    for spelling, dtype in type_aliases:
+        if re.search(rf"\b{re.escape(spelling)}\b", normalized):
+            return kind, dtype
+    raise ValueError(f"CUDA declaration dtype is outside the closed profile: {declaration!r}")
+
+
+def _metadata_interface_rows(
+    metadata: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], ...]:
+    interface = metadata.get("interface")
+    raw_rows = interface.get("parameters") if isinstance(interface, Mapping) else None
+    if not isinstance(raw_rows, list) or not raw_rows or not all(
+        isinstance(item, Mapping) for item in raw_rows
+    ):
+        raise ValueError("Dataset metadata lacks a structured logical interface")
+    return tuple(raw_rows)
+
+
+def _logical_row_for_physical(
+    physical: Mapping[str, Any],
+    logical_rows: tuple[Mapping[str, Any], ...],
+) -> Mapping[str, Any]:
+    """Resolve one physical row through its explicit semantic name only."""
+
+    semantic_name = str(
+        physical.get("semantic_name") or physical.get("name") or ""
+    )
+    if not semantic_name:
+        raise ValueError("Dataset physical ABI row lacks a semantic_name")
+    candidates = [
+        row
+        for row in logical_rows
+        if str(row.get("name") or row.get("semantic_name") or "")
+        in {semantic_name, _parameter_alias(semantic_name)}
+        or _parameter_alias(
+            str(row.get("name") or row.get("semantic_name") or "")
+        )
+        == _parameter_alias(semantic_name)
+    ]
+    if len(candidates) != 1:
+        raise ValueError(
+            "Dataset physical ABI row cannot be uniquely aligned with its "
+            f"logical interface parameter {semantic_name!r}"
+        )
+    return candidates[0]
 
 
 def _cuda_pointer_mode(name: str, declaration: str, body: str) -> str:
@@ -1352,6 +2076,295 @@ def _runtime_metadata(kernel: FrontendDatasetKernel) -> Mapping[str, Any]:
     return kernel.metadata
 
 
+def _stable_dataset_source_mapping(
+    source_parameters: tuple[str, ...],
+    compiler_slots: tuple[str, ...],
+) -> dict[str, str]:
+    """Allocate one stable p*/c* namespace for every Dataset ABI name."""
+
+    source_parameters = tuple(source_parameters)
+    compiler_slots = tuple(compiler_slots)
+    if len(source_parameters) != len(set(source_parameters)):
+        raise ValueError("Dataset source ABI parameters must be unique")
+    if len(compiler_slots) != len(set(compiler_slots)):
+        raise ValueError("Dataset compiler slots must be unique")
+    overlap = set(source_parameters) & set(compiler_slots)
+    if overlap:
+        raise ValueError(
+            "Dataset source parameters and compiler slots overlap: "
+            + ", ".join(sorted(overlap))
+        )
+    return dict(
+        CanonicalHandleAllocator.abi_mapping(source_parameters, compiler_slots)
+    )
+
+
+def _dataset_manifest_arguments(
+    parameters: tuple[DatasetRuntimeParameter, ...],
+    compiler_view: SCRCCompilerView,
+) -> tuple[GeneratedTargetSourceArgument, ...]:
+    """Project physical Dataset parameters into the shared source manifest."""
+
+    by_compiler_name = {item.name: item for item in compiler_view.arguments}
+    result: list[GeneratedTargetSourceArgument] = []
+    for parameter in parameters:
+        compiler_argument = by_compiler_name.get(parameter.source_name)
+        if compiler_argument is None:
+            raise ValueError(
+                f"Dataset compiler view lacks parameter {parameter.source_name!r}"
+            )
+        if parameter.kind == "pointer":
+            if compiler_argument.kind != "tensor":
+                raise ValueError(
+                    f"Dataset pointer {parameter.source_name!r} lacks tensor ABI mapping"
+                )
+            result.append(
+                GeneratedTargetSourceArgument(
+                    name=parameter.source_name,
+                    category="buffer",
+                    role=parameter.mode,
+                    dtype=parameter.dtype,
+                    shape=parameter.shape,
+                    shape_contract=compiler_argument.shape_contract,
+                    strides=parameter.strides,
+                    output_key=parameter.output_key,
+                )
+            )
+        elif parameter.kind == "opaque":
+            if compiler_argument.kind != "tensor":
+                raise ValueError(
+                    f"Dataset opaque {parameter.source_name!r} lacks logical shape projection"
+                )
+            result.append(
+                GeneratedTargetSourceArgument(
+                    name=parameter.source_name,
+                    category="opaque",
+                    role="input",
+                    dtype=parameter.dtype,
+                    shape=parameter.shape,
+                    shape_contract=compiler_argument.shape_contract,
+                    logical_dtype=parameter.logical_dtype,
+                )
+            )
+        elif parameter.kind == "scalar":
+            if compiler_argument.kind != "scalar" or compiler_argument.value is None:
+                raise ValueError(
+                    f"Dataset scalar {parameter.source_name!r} lacks a compiler valuation"
+                )
+            result.append(
+                GeneratedTargetSourceArgument(
+                    name=parameter.source_name,
+                    category="runtime_scalar",
+                    role="value",
+                    dtype=parameter.dtype,
+                    value=parameter.value,
+                    shape_coordinate=compiler_argument.shape_coordinate,
+                )
+            )
+        else:  # pragma: no cover - DatasetRuntimeParameter closes the set
+            raise ValueError("unsupported Dataset parameter kind")
+    return tuple(result)
+
+
+def _dataset_tensor_map_relations(
+    parameters: tuple[DatasetRuntimeParameter, ...],
+    descriptors: tuple[DatasetTensorMapDescriptor, ...],
+    compiler_view: SCRCCompilerView,
+) -> tuple[Any, ...]:
+    """Build source-side TensorMap relations in the anonymous h* view."""
+
+    if not descriptors:
+        return ()
+    from intentir.verify.workload_adapters import GeneratedSourceTensorMapRelation
+
+    by_parameter = {item.source_name: item for item in parameters}
+    by_descriptor = {item.parameter: item for item in descriptors}
+    by_compiler_name = {item.name: item for item in compiler_view.arguments}
+    if set(by_descriptor) != {
+        item.source_name for item in parameters if item.kind == "opaque"
+    }:
+        raise ValueError(
+            "Dataset TensorMap descriptors must exactly cover physical opaque parameters"
+        )
+    relations: list[GeneratedSourceTensorMapRelation] = []
+    for physical_name, descriptor in (
+        (item.parameter, item) for item in descriptors
+    ):
+        parameter = by_parameter.get(physical_name)
+        compiler_argument = by_compiler_name.get(physical_name)
+        if (
+            parameter is None
+            or parameter.kind != "opaque"
+            or parameter.logical_dtype != descriptor.logical_dtype
+            or parameter.shape_contract != descriptor.shape_contract
+            or compiler_argument is None
+            or compiler_argument.kind != "tensor"
+            or compiler_argument.shape_contract is None
+            or compiler_argument.dtype != descriptor.logical_dtype
+        ):
+            raise ValueError(
+                f"Dataset TensorMap logical/physical ABI differs for {physical_name!r}"
+            )
+        relations.append(
+            GeneratedSourceTensorMapRelation(
+                physical_parameter=physical_name,
+                logical_parameter=parameter.semantic_name,
+                logical_dtype=descriptor.logical_dtype,
+                shape_contract=compiler_argument.shape_contract,
+                box_dim=descriptor.box_dim,
+                swizzle=descriptor.swizzle,
+            )
+        )
+    return tuple(relations)
+
+
+def _validate_cuda_metadata_admission(
+    kernel: FrontendDatasetKernel,
+    metadata: Mapping[str, Any],
+    physical_parameters: tuple[DatasetRuntimeParameter, ...],
+    *,
+    logical_parameters: tuple[DatasetRuntimeParameter, ...] = (),
+    tensor_map_descriptors: tuple[DatasetTensorMapDescriptor, ...] = (),
+) -> None:
+    """Close CUDA declaration, metadata, and logical sidecar ABI together."""
+
+    code = kernel.path.read_text(encoding="utf-8")
+    declarations, _body = _cuda_definition(code, kernel.symbol)
+    declaration_names = tuple(_cuda_declaration_name(item) for item in declarations)
+    expected_names = tuple(item.source_name for item in physical_parameters)
+    if declaration_names != expected_names:
+        raise ValueError(
+            f"CUDA declaration order differs from Dataset metadata for {kernel.case_id}"
+        )
+    rows = _ordered_abi_rows(metadata)
+    if len(rows) != len(physical_parameters):
+        raise ValueError("CUDA declaration and metadata ABI arities differ")
+    descriptors = {item.parameter: item for item in tensor_map_descriptors}
+    for declaration, row, parameter in zip(
+        declarations, rows, physical_parameters, strict=True
+    ):
+        if str(row.get("name") or row.get("semantic_name") or "") != parameter.source_name:
+            raise ValueError("CUDA metadata row order/name differs from declaration order")
+        recorded_declaration = row.get("declaration")
+        if recorded_declaration is not None and str(recorded_declaration).strip() != declaration.strip():
+            raise ValueError(
+                f"CUDA declaration text differs from metadata for {parameter.source_name!r}"
+            )
+        declaration_kind, declaration_dtype = _cuda_declaration_kind_dtype(declaration)
+        if declaration_kind != parameter.kind or declaration_dtype != parameter.dtype:
+            raise ValueError(
+                f"CUDA declaration kind/dtype differs for {parameter.source_name!r}"
+            )
+        if str(row.get("kind") or "") != parameter.kind:
+            raise ValueError(f"CUDA metadata kind differs for {parameter.source_name!r}")
+        row_dtype = (
+            _normalize_physical_opaque_dtype(row.get("dtype"))
+            if parameter.kind == "opaque"
+            else _normalize_dataset_dtype(row.get("dtype"))
+        )
+        if row_dtype != parameter.dtype:
+            raise ValueError(f"CUDA metadata dtype differs for {parameter.source_name!r}")
+        if str(row.get("mode") or "value") != parameter.mode:
+            raise ValueError(f"CUDA metadata mode differs for {parameter.source_name!r}")
+        if int(row.get("rank", -1)) != parameter.rank:
+            raise ValueError(f"CUDA metadata rank differs for {parameter.source_name!r}")
+        if parameter.kind in {"pointer", "opaque"}:
+            if _source_shape_contract(row.get("shape")) != parameter.shape_contract:
+                raise ValueError(
+                    f"CUDA metadata shape contract differs for {parameter.source_name!r}"
+                )
+            if parameter.kind == "pointer" and _metadata_row_strides(
+                row, rank=parameter.rank
+            ) != parameter.strides:
+                raise ValueError(
+                    f"CUDA metadata strides differ for {parameter.source_name!r}"
+                )
+        if parameter.output_key is not None and row.get("output_key") is not None:
+            if str(row["output_key"]) != parameter.output_key:
+                raise ValueError(
+                    f"CUDA metadata output identity differs for {parameter.source_name!r}"
+                )
+        if parameter.kind == "opaque":
+            descriptor = descriptors.get(parameter.source_name)
+            if (
+                descriptor is None
+                or descriptor.semantic_name != parameter.semantic_name
+                or descriptor.logical_dtype != parameter.logical_dtype
+                or descriptor.shape_contract != parameter.shape_contract
+            ):
+                raise ValueError(
+                    f"CUDA TensorMap descriptor differs for {parameter.source_name!r}"
+                )
+
+    if logical_parameters:
+        logical_by_semantic = {item.semantic_name: item for item in logical_parameters}
+        consumed: set[str] = set()
+        for parameter in physical_parameters:
+            logical = logical_by_semantic.get(parameter.semantic_name)
+            if logical is None:
+                raise ValueError(
+                    f"CUDA physical parameter {parameter.source_name!r} lacks logical projection"
+                )
+            if parameter.kind == "opaque":
+                expected_kind = "pointer"
+                expected_mode = "input"
+                expected_dtype = parameter.logical_dtype
+            else:
+                expected_kind = parameter.kind
+                expected_mode = parameter.mode
+                expected_dtype = parameter.dtype
+            if (
+                logical.kind != expected_kind
+                or logical.mode != expected_mode
+                or logical.dtype != expected_dtype
+                or logical.rank != parameter.rank
+                or logical.shape != parameter.shape
+                or logical.shape_contract != parameter.shape_contract
+            ):
+                raise ValueError(
+                    f"CUDA logical interface differs for {parameter.source_name!r}"
+                )
+            consumed.add(logical.semantic_name)
+        if consumed != {item.semantic_name for item in logical_parameters}:
+            raise ValueError("CUDA logical interface contains an unpaired parameter")
+
+
+def _cuda_lift_projection(
+    code: str,
+    symbol: str,
+    *,
+    source_kind: str,
+    origin_location: str,
+) -> DatasetSourceProjection:
+    """Return the one verified CUDA device entry used by the Lift owner.
+
+    The complete CUDA module remains the Gate compiler input.  Lift receives a
+    source projection containing only the selected ``__global__`` entry, and
+    the same projection object is carried into the manifest.  Keeping the
+    bytes, declaration order, and source-slice digest on one object prevents a
+    full-module digest from being paired with a different Lift input.
+    """
+
+    declarations, body = _cuda_definition(code, symbol)
+    projected = (
+        "__global__ void "
+        + symbol
+        + "("
+        + ", ".join(declarations)
+        + ") {\n"
+        + body
+        + "\n}\n"
+    )
+    return DatasetSourceProjection(
+        projected,
+        symbol,
+        tuple(_cuda_declaration_name(item) for item in declarations),
+        "cuda",
+        source_kind,
+        origin_location,
+    )
+
+
 def prepare_frontend_dataset_workload(
     adapter: FrontendDatasetHarness,
     *,
@@ -1369,6 +2382,7 @@ def prepare_frontend_dataset_workload(
         raise ValueError(f"Dataset case {adapter.case_id!r} is unavailable")
     if kernel.frontend != adapter.frontend:
         raise ValueError("Dataset catalog frontend differs from its Harness")
+    source_code = kernel.path.read_text(encoding="utf-8")
     actual_sha256 = hashlib.sha256(kernel.path.read_bytes()).hexdigest()
     if actual_sha256 != adapter.source_sha256.lower():
         raise ValueError(
@@ -1380,10 +2394,6 @@ def prepare_frontend_dataset_workload(
         f"launch_block_{axis}": extent
         for axis, extent in zip(("x", "y", "z"), adapter.block, strict=True)
         if extent != 1
-    }
-    opaque_schedule = {
-        f"c{index}": value
-        for index, value in enumerate(source_schedule.values())
     }
     if adapter.frontend == "tilelang":
         metadata_kernel = _generated_companion(kernel, catalog.kernels)
@@ -1401,20 +2411,30 @@ def prepare_frontend_dataset_workload(
         gate_parameters = _logical_abi_parameters(
             parameters, adapter.tensor_map_descriptors
         )
+        physical_parameters = _metadata_parameters(
+            metadata_kernel.metadata,
+            dimensions=dimensions,
+            scalars=adapter.scalar_map,
+            include_runtime_scalars=True,
+            use_logical_interface_dtypes=True,
+        )
+        physical_sidecar = _tensor_map_sidecars().get(metadata_kernel.case_id)
+        _validate_cuda_metadata_admission(
+            metadata_kernel,
+            metadata_kernel.metadata,
+            physical_parameters,
+            logical_parameters=parameters,
+            tensor_map_descriptors=(
+                physical_sidecar.descriptors if physical_sidecar is not None else ()
+            ),
+        )
         gate_source: Any = TileLangKernelSource.from_factory_file(
             kernel.path,
             kernel.symbol,
             factory_kwargs=adapter.factory_kwarg_map,
         )
-        gate_case: Any = TileLangCompileCase(
-            tuple(item.frontend_parameter() for item in gate_parameters),
-            adapter.grid,
-            adapter.block,
-            opaque_schedule,
-        )
         metadata = metadata_kernel.metadata
     else:
-        code = kernel.path.read_text(encoding="utf-8")
         metadata = _runtime_metadata(kernel)
         parameters = _metadata_parameters(
             metadata,
@@ -1425,8 +2445,15 @@ def prepare_frontend_dataset_workload(
         gate_parameters = _logical_abi_parameters(
             parameters, adapter.tensor_map_descriptors
         )
+        _validate_cuda_metadata_admission(
+            kernel,
+            metadata,
+            parameters,
+            logical_parameters=gate_parameters,
+            tensor_map_descriptors=adapter.tensor_map_descriptors,
+        )
         projection = DatasetSourceProjection(
-            code,
+            source_code,
             kernel.symbol,
             tuple(item.source_name for item in parameters),
             "cuda",
@@ -1434,14 +2461,6 @@ def prepare_frontend_dataset_workload(
             kernel.location,
         )
         gate_source = CudaKernelSource.from_file(kernel.path, kernel.symbol)
-        gate_case = CudaCompileCase(
-            tuple(item.frontend_parameter() for item in gate_parameters),
-            adapter.grid,
-            adapter.block,
-            opaque_schedule,
-            adapter.cuda_arch,
-            include_dirs=resolve_cuda_include_dirs(kernel),
-        )
     if (
         adapter.descriptor_sha256
         and _descriptor_sha256(metadata) != adapter.descriptor_sha256.lower()
@@ -1478,13 +2497,79 @@ def prepare_frontend_dataset_workload(
         ),
         parameter_order=tuple(item.source_name for item in parameters),
     )
-    _anonymous, _binding, mapping = anonymize_source(
-        projection.code,
-        source_symbol=projection.function,
-        frontend=adapter.frontend,
+    source_to_opaque = _stable_dataset_source_mapping(
+        projection.parameters,
+        tuple(compiler_view.compiler_slots),
+    )
+    # Harness execution receives the same c* bindings declared by SourceFacts;
+    # it must not independently allocate a schedule namespace.
+    opaque_schedule = {
+        source_to_opaque[name]: value for name, value in source_schedule.items()
+    }
+    if adapter.frontend == "tilelang":
+        gate_case: Any = TileLangCompileCase(
+            tuple(item.frontend_parameter() for item in gate_parameters),
+            adapter.grid,
+            adapter.block,
+            opaque_schedule,
+        )
+    else:
+        gate_case = CudaCompileCase(
+            tuple(item.frontend_parameter() for item in gate_parameters),
+            adapter.grid,
+            adapter.block,
+            opaque_schedule,
+            adapter.cuda_arch,
+            include_dirs=resolve_cuda_include_dirs(kernel),
+            physical_parameters=tuple(
+                item.frontend_parameter() for item in parameters
+            ),
+        )
+    if adapter.frontend == "tilelang":
+        _anonymous, _binding, python_mapping = anonymize_source(
+            projection.code,
+            source_symbol=projection.function,
+        )
+        expected_runtime_mapping = {
+            name: source_to_opaque[name] for name in projection.parameters
+        }
+        if any(
+            python_mapping.get(name) != opaque
+            for name, opaque in expected_runtime_mapping.items()
+        ):
+            raise ValueError(
+                "materialized TileLang source ABI does not match the stable Dataset mapping"
+            )
+        lift_source = projection.code
+        lift_source_kind = "python"
+    else:
+        projection = _cuda_lift_projection(
+            source_code,
+            projection.function,
+            source_kind=kernel.source_kind,
+            origin_location=kernel.location,
+        )
+        lift_source = projection.code
+        lift_source_kind = "cuda"
+    manifest = build_generated_source_manifest(
+        source=source_code,
+        source_slice=projection,
+        source_location=kernel.location,
+        view=compiler_view,
+        source_arguments=_dataset_manifest_arguments(parameters, compiler_view),
+        tensor_map_relations=(
+            _dataset_tensor_map_relations(
+                parameters,
+                adapter.tensor_map_descriptors,
+                compiler_view,
+            )
+            if adapter.frontend == "cuda"
+            else ()
+        ),
     )
     runtime_mapping = {
-        item.source_name: mapping[item.source_name] for item in parameters
+        item.source_name: source_to_opaque[item.source_name]
+        for item in parameters
     }
     profile = observer_profile_for(Frontend(adapter.frontend))
     entry = DatasetWorkloadEntry(
@@ -1495,11 +2580,36 @@ def prepare_frontend_dataset_workload(
         f"{profile.profile_id}@{profile.profile_version}",
         adapter.gate2_policy,
     )
+    request_source = SourceProgram(
+        lift_source,
+        gate_source,
+        lift_source_kind=lift_source_kind,
+        lift_source_symbol=projection.function,
+        lift_parameter_order=projection.parameters,
+        lift_constexpr_parameters=projection.constexpr_parameters,
+        lift_source_to_opaque=tuple(source_to_opaque.items())
+        if lift_source_kind == "cuda"
+        else (),
+    )
+    source_facts = SourceFacts.from_compiler_view(
+        compiler_view,
+        frontend=adapter.frontend,
+        source_kind=lift_source_kind,
+        source_symbol=projection.function,
+        source_to_opaque=source_to_opaque,
+        source_digest=hashlib.sha256(source_code.encode("utf-8")).hexdigest(),
+        source_slice_digest=hashlib.sha256(lift_source.encode("utf-8")).hexdigest(),
+    )
+    construction = CanonicalConstruction.from_source_facts(
+        source_facts,
+        source_text=lift_source,
+    )
     request = SCRCRunRequest(
-        SourceProgram(projection.code, gate_source),
+        request_source,
         HarnessBindingInstance.create(
             opaque_schedule,
             gate1_case=gate_case,
+            slot_order=tuple(opaque_schedule),
             gate2_context={
                 "test_mode": "finite",
                 "seed": adapter.seed,
@@ -1508,6 +2618,8 @@ def prepare_frontend_dataset_workload(
             },
         ),
         adapter.frontend,
+        source_facts,
+        construction,
     )
     return PreparedFrontendDatasetWorkload(
         adapter,
@@ -1520,6 +2632,7 @@ def prepare_frontend_dataset_workload(
         parameters,
         adapter.grid,
         adapter.block,
+        manifest,
     )
 
 
@@ -1534,7 +2647,10 @@ def _numpy_dtype(dtype: str) -> np.dtype[Any]:
         "i16": "int16",
         "i32": "int32",
         "i64": "int64",
+        "index": "int64",
         "u8": "uint8",
+        "u16": "uint16",
+        "u32": "uint32",
     }
     try:
         return np.dtype(aliases.get(dtype, dtype))
@@ -1569,10 +2685,19 @@ def _bind_shape(
     declared: list[int | str],
     actual: tuple[int, ...],
     dimensions: dict[str, int],
+    *,
+    dynamic_output: bool = False,
 ) -> None:
     if len(declared) != len(actual):
         raise ValueError("accepted J rank differs from the Dataset Harness")
     for expected, value in zip(declared, actual, strict=True):
+        if expected == "?":
+            if not dynamic_output:
+                raise ValueError(
+                    "J data-dependent extent requires an output-only binding; "
+                    "dynamic input/inout buffers are outside the current ABI"
+                )
+            continue
         if isinstance(expected, int):
             if expected != value:
                 raise ValueError("accepted J static extent differs from Dataset")
@@ -1590,6 +2715,7 @@ def build_frontend_dataset_gate2_suite(
 ) -> Gate2Suite:
     """Create one finite native Source/Replay/J case from an explicit valuation."""
 
+    prepared = prepared.with_contract(artifact.j, artifact.c)
     mapping = dict(prepared.source_to_opaque)
     runtime = {mapping[item.source_name]: item for item in prepared.runtime_parameters}
     j_inputs = {item.name: item for item in artifact.j.intent.inputs}
@@ -1599,6 +2725,10 @@ def build_frontend_dataset_gate2_suite(
     dimensions: dict[str, int] = {}
     input_bindings: dict[str, str] = {}
     output_bindings: dict[str, str] = {}
+    observed_output_shapes: dict[str, tuple[int, ...]] = {}
+    elaboration = j_elaboration(artifact.j)
+    canonical_outputs = elaboration.output_bindings
+    canonical_output_by_name = elaboration.output_by_name
     # ``arguments`` is the logical ABI consumed by Replay.  Source arguments
     # may replace selected logical inputs with physical CUtensorMap values.
     arguments: list[NativeArgument] = []
@@ -1682,6 +2812,7 @@ def build_frontend_dataset_gate2_suite(
                     value_key=key,
                     dtype=descriptor.logical_dtype,
                     shape=binding.shape,
+                    strides=binding.strides,
                 )
             )
             source_arguments.append(
@@ -1707,9 +2838,16 @@ def build_frontend_dataset_gate2_suite(
         )
         if tensor is None:
             raise ValueError("Dataset pointer must anchor a J input/output tensor")
-        if tensor.dtype != binding.dtype:
+        output_binding = canonical_output_by_name.get(logical_ref)
+        binding_type = output_binding.output_type if output_binding is not None else tensor
+        if binding_type.dtype != binding.dtype:
             raise ValueError("accepted J tensor dtype differs from Dataset ABI")
-        _bind_shape(tensor.shape, binding.shape, dimensions)
+        _bind_shape(
+            binding_type.shape,
+            binding.shape,
+            dimensions,
+            dynamic_output=parameter.mode is ParameterMode.OUTPUT,
+        )
         if parameter.mode is ParameterMode.INPUT:
             if logical_ref not in j_inputs:
                 raise ValueError("Dataset input pointer does not bind a J input")
@@ -1722,29 +2860,46 @@ def build_frontend_dataset_gate2_suite(
                     value_key=key,
                     dtype=binding.dtype,
                     shape=binding.shape,
+                    strides=binding.strides,
                 )
             )
         elif parameter.mode is ParameterMode.OUTPUT:
             if logical_ref not in j_outputs:
                 raise ValueError("Dataset output pointer does not bind a J output")
-            key = f"output_{parameter.name}"
-            output_bindings[logical_ref] = key
+            internal_key = f"output_{parameter.name}"
+            output_key = binding.output_key
+            if output_key is None:
+                raise ValueError(
+                    f"Dataset output {binding.source_name!r} lacks stable output identity"
+                )
+            output_bindings[logical_ref] = output_key
+            observed_output_shapes[logical_ref] = tuple(binding.shape)
             arguments.append(
                 NativeArgument(
                     NativeArgumentRole.OUTPUT,
                     dtype=binding.dtype,
                     shape=binding.shape,
-                    output_key=key,
+                    # ``internal_key`` is intentionally not used as the
+                    # observable name; Gate2 output identity comes from the
+                    # source manifest binding.
+                    value_key=internal_key,
+                    output_key=output_key,
+                    strides=binding.strides,
                 )
             )
         else:
             if logical_ref not in j_inputs or logical_ref not in j_outputs:
                 raise ValueError("Dataset inout pointer must bind one J inout tensor")
             input_key = f"input_{parameter.name}"
-            output_key = f"output_{parameter.name}"
+            output_key = binding.output_key
+            if output_key is None:
+                raise ValueError(
+                    f"Dataset inout {binding.source_name!r} lacks stable output identity"
+                )
             values[input_key] = _random_input(rng, binding)
             input_bindings[logical_ref] = input_key
             output_bindings[logical_ref] = output_key
+            observed_output_shapes[logical_ref] = tuple(binding.shape)
             arguments.append(
                 NativeArgument(
                     NativeArgumentRole.INOUT,
@@ -1752,6 +2907,7 @@ def build_frontend_dataset_gate2_suite(
                     dtype=binding.dtype,
                     shape=binding.shape,
                     output_key=output_key,
+                    strides=binding.strides,
                 )
             )
         source_arguments.append(arguments[-1])
@@ -1759,11 +2915,59 @@ def build_frontend_dataset_gate2_suite(
         raise ValueError("Dataset Harness input bindings differ from accepted J")
     if set(output_bindings) != set(j_outputs):
         raise ValueError("Dataset Harness output bindings differ from accepted J")
+    if tuple(item.output for item in canonical_outputs) != tuple(
+        item.name for item in artifact.j.intent.outputs
+    ):
+        raise ValueError(
+            "J output declarations differ from canonical output ABI order"
+        )
+    values = materialize_ragged_input_values(
+        artifact.j,
+        values,
+        input_bindings,
+    )
+    runtime_inputs = [
+        np.asarray(values[input_bindings[item.name]])
+        for item in artifact.j.intent.inputs
+    ]
+    resolved_output_shapes = resolve_runtime_output_shapes(
+        artifact.j.intent,
+        [list(item.output_type.shape) for item in canonical_outputs],
+        runtime_inputs,
+        dims=dimensions,
+        canonical_output_bindings=canonical_outputs,
+    )
+    for output, resolved_shape in zip(
+        (j_outputs[item.output] for item in canonical_outputs),
+        resolved_output_shapes,
+        strict=True,
+    ):
+        observed_shape = observed_output_shapes.get(output.name)
+        if observed_shape is None:
+            raise ValueError(
+                f"Dataset did not provide a concrete output shape for {output.name!r}"
+            )
+        if observed_shape != resolved_shape:
+            raise ValueError(
+                f"Dataset output shape for {output.name!r} differs from the "
+                f"J-derived runtime shape: {observed_shape} != {resolved_shape}"
+            )
     refeval = ScalarLoweringSpec.create(
         artifact.j,
         dims=dimensions,
         input_bindings=input_bindings,
         output_bindings=output_bindings,
+    )
+    source_program_sha256, source_execution_program_sha256 = program_identity_digests(
+        prepared.request.source.gate_source,
+        frontend=prepared.adapter.frontend,
+    )
+    execution_lineage = prepared.manifest.execution_lineage()
+    execution_lineage.update(
+        {
+            "source_program_sha256": source_program_sha256,
+            "source_execution_program_sha256": source_execution_program_sha256,
+        }
     )
     execution = NativeExecutionSpec(
         tuple(arguments),
@@ -1773,6 +2977,7 @@ def build_frontend_dataset_gate2_suite(
         metadata={
             "adapter_protocol": prepared.adapter.protocol,
             "dataset_case_id": prepared.adapter.case_id,
+            **execution_lineage,
         },
         source_arguments=tuple(source_arguments),
         source_block=prepared.adapter.physical_block,
@@ -1782,7 +2987,7 @@ def build_frontend_dataset_gate2_suite(
             else None
         ),
     )
-    output_keys = tuple(output_bindings[item.name] for item in artifact.j.intent.outputs)
+    output_keys = tuple(output_bindings[item.output] for item in canonical_outputs)
     case = Gate2Case(
         case_id,
         refeval.j,
@@ -1794,6 +2999,7 @@ def build_frontend_dataset_gate2_suite(
             "test_mode": test_mode,
             "adapter_protocol": prepared.adapter.protocol,
             "frontend": prepared.adapter.frontend,
+            **execution_lineage,
         },
     )
     return Gate2Suite(
@@ -2224,6 +3430,7 @@ __all__ = [
     "DatasetRuntimeParameter",
     "DatasetSourceProjection",
     "DatasetWorkloadEntry",
+    "CuTileConsumerResult",
     "FRONTEND_DATASET_HARNESSES",
     "FRONTEND_DATASET_HARNESS_PROTOCOL",
     "FRONTEND_DATASET_PROJECTION_PROTOCOL",
@@ -2235,5 +3442,6 @@ __all__ = [
     "PreparedFrontendDatasetWorkload",
     "build_frontend_dataset_gate2_suite",
     "project_frontend_dataset_harnesses",
+    "run_cutile_consumer",
     "prepare_frontend_dataset_workload",
 ]

@@ -8,7 +8,7 @@
 - LLVM 与 MLIR 20（当前构建在 20.1.8 上验证）；
 - C++17 编译器。
 
-真实 Triton/TileLang/CUDA 闭包还需要兼容的 PyTorch、Triton、CUDA 工具链和 NVIDIA GPU。TileLang Source 需要可用的 TileLang 安装。RVV 目标执行需要对应 sysroot、LLVM 工具链和目标机或运行环境。外部多前端 Dataset 默认位于仓库同级的 `Dataset/`，也可通过 `INTENTIR_DATASET_ROOT` 或 CLI 参数指定。
+真实 Triton/TileLang/CUDA 闭包还需要兼容的 PyTorch、Triton、CUDA 工具链和 NVIDIA GPU。TileLang Source 需要可用的 TileLang 安装。RVV 目标执行需要对应 sysroot、LLVM 工具链和目标机或运行环境。运行多前端 Dataset demo 时，必须通过 `INTENTIR_DATASET_ROOT` 或 CLI 参数显式指定外部 Dataset，demo 不再假设默认路径。
 
 ## 2. Python 环境
 
@@ -53,6 +53,7 @@ Python 后端还会使用 `mlir-opt`、`mlir-translate`、LLVM 运行库和 Clan
 PYTHONPATH=python python tools/scrc_batch.py --validate-manifest --json
 PYTHONPATH=python python tools/scrc_batch.py --list --json
 PYTHONPATH=python python tools/scrc_frontend.py --list --json
+PYTHONPATH=python python tools/frontend_dataset.py --validate
 ```
 
 对真实运行始终指定仓库之外的 evidence 根目录：
@@ -66,7 +67,7 @@ PYTHONPATH=python python tools/scrc_frontend.py \
   --json
 ```
 
-该命令会调用 Lift/Replay provider。若只需零模型调用的能力复核，应使用已接受 artifact 与精确 parent Replay 的 Gate2 recheck，见 [工作流](workflows.md)。
+该命令只调用 Triton/TTIR 的 Lift/Replay provider。真实闭包只能由该 fresh Lift → Replay → Gate 流程产生；历史 artifact 不进入活动验证路径。CUDA、CuTe、TileLang 不通过此入口运行，必须分别使用各自的 compiler/Gate1 runner；CUDA/TileLang 的 Gate2 继续使用 native adapter，CuTe 不回退到 Triton Gate2。native Dataset 缺失时保持 unavailable，不能回退为 Triton/TTIR 输入。
 
 ## 5. CUDA 后端
 

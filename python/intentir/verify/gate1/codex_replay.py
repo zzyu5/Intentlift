@@ -16,18 +16,15 @@ from intentir.extraction.providers.codex_cli import (
     CODEX_CLI_AGENT_RUNTIME,
     CODEX_CLI_TOOL_BRIDGE_ROOT_NAME,
     CodexCLICancelled,
-    CodexCLIDiagnosticReady,
+    CodexCLISubmissionRejected,
     CodexCLIError,
     CodexCLISubmissionAccepted,
     CodexCLISession,
     CodexCLIToolBridge,
     CodexCLITurn,
 )
-from intentir.extraction.providers.client import (
-    DEFAULT_RESPONSES_TIMEOUT_SECONDS,
-    XHIGH_RESPONSES_TIMEOUT_SECONDS,
-)
 from intentir.extraction.providers.provider import ProviderConfig, get_provider
+from intentir.ir.intent_op_contract import RAGGED_OPS
 from intentir.verify.gate1.compiler import KernelSource, TritonCompiler
 from intentir.verify.gate1.ttir import fingerprint_ttir, runtime_argument_names
 
@@ -42,6 +39,7 @@ from .replay import (
     ReplayGeneration,
     ReplayGenerationError,
     _context_receipt,
+    _frontend_replay_guidance,
     build_source_blind_replay_compile_case,
     _replay_input_files,
     _trajectory_bytes,
@@ -52,326 +50,21 @@ from .replay import (
 
 CODEX_CLI_REPLAY_BACKEND = "openai.codex-cli.intentir-replay.v67"
 
-_INITIAL_PROMPT = """You are the sole writer for one fresh source-blind IntentIR Replay episode.
-Work only under the isolated /workspace. input/ is immutable; output/, work/, and
-tmp/ are writable. There is no Source, Harness/compiler view, actual C value, Gate
-result, earlier Replay, sibling state, repository, or network.
+_INITIAL_PROMPT = """One fresh source-blind Replay in /workspace. input/ is immutable;
+write only output/, work/, tmp/. No Source, pi, non-C Harness/compiler facts,
+Gate results, prior/sibling state, repository or network.
 
-J is the only semantic authority. Read input/compiler-index.intent and the complete
-read-only input/semantic-program.intent before drafting, then read input/frontend.json
-and input/mask-c.json for the callable ABI. S_J is a deterministic parameterized compiler
-IR derived only from this J, not a target-source skeleton. Use `semantic_query` or
-`packet_query` only to cross-reference one named J/C handle after reading those complete
-small views. Pi, Source realization, Gate observations, and prior Replay are absent.
-For Triton Python, annotate only constexpr parameters with `tl.constexpr`; leave runtime
-pointer and scalar parameters unannotated.
-When a runtime scalar has a J logical binding and is used by an authored access index,
-predicate, domain, or loop bound, include that scalar (and only that scalar) in the
-Triton `do_not_specialize` list.  This preserves the J-owned runtime dependency in
-your own compiled IR instead of folding the current Harness value into the target.
-Never list an ABI-only scalar that has no J logical binding. Materialize a nonempty
-list directly on `@triton.jit(do_not_specialize=[...])` before the first compile; do
-not call `.to(...)` on a scalar that the frontend has already specialized to a Python
-value. Use an explicit target cast only after preserving that parameter as runtime.
-A J scalar used only as a pointwise arithmetic value is not an
-access/domain/loop carrier: leave it specializable and use it directly in the
-tensor expression (for example `rhs * p2`). Never call `p2.to(...)` in that
-case; ordinary tensor arithmetic materializes the specialized scalar at its
-typed consumer.
+Before drafting, read completely: input/compiler-index.intent,
+input/semantic-program.intent, input/frontend.json (including representation
+address/program bindings), input/c.json if present, input/REPLAY_CONTRACT.md,
+and input/TOOL.md. These own the semantic, ABI, lowering and tool rules.
+J/S_J alone owns semantics; C only binds implementation. Query tools may then
+cross-reference one named J/C handle, never replace reading the complete input.
 
-Act as the complete Replay compiler. Write one full target program to
-output/replay.source yourself. You own instruction selection, addressing, program
-mapping, control, loops/carriers, layout, memory, synchronization, target APIs and
-whole-program restructuring while preserving all J-owned value semantics. Do not edit
-S_J or infer a Source recipe. input/REPLAY_CONTRACT.md defines
-the ownership boundary and input/TOOL.md defines the tools.
-
-`compiler-index.intent` is only a compact cross-reference of facts already present in
-S_J and MaskC. Its dependency subsets are syntactic and neither select nor authorize a
-program axis, loop, lane, guard, or target API. Use it to avoid repeated JSON joins,
-then compile `boundary_ownership` as one whole-program contract. Preserve every
-authored access/effect as a distinct logical occurrence and keep logical domain guards
-distinct from access-local predicates; you still own every target realization choice.
-For a masked load, `fill_value` is the only authority for a target `other=` operand:
-materialize it exactly when present and omit `other=` when it is absent.  A
-`consumer_extension` proves how an already-authored outside value is consumed; it does
-not synthesize a missing fill value.
-Ordinary algebraic instruction selection may fold a J `add` whose one operand is an
-exact all-zero constant, including when that identity node exists only to express a
-logical broadcasted output shape.  Preserve the other operand, output mapping, access
-shape, predicate and effect, but do not emit target add arithmetic for the identity.
-The declaration order of `boundary_ownership.access_effects` is J/C-owned observable
-effect order: emit the corresponding loads, stores, atomics, and updates in that order.
-Do not postpone an earlier authored statistics store until after later parameter loads or
-another output store merely to group computations or outputs.
-One authored access with a multi-axis index is one target transfer whose tensor result may
-then be split; never replace it with one load/store per component. Do not implement an
-ordinary finite J domain by a Python/Triton serial loop: specialization may unroll the loop
-and silently change the authored access/effect multiplicity. The closed exception is a
-contraction axis attached to an anonymous C `reduction_tile_extent`: that combination
-authorizes a physical in-kernel contraction loop, while the J contraction remains the sole
-semantic authority for the accumulator and result. A standalone J `reduce` still uses one
-local tile reduction unless J itself authors a loop.
-Lower the closed reducer kind with the corresponding public Triton reducer:
-`sum -> tl.sum`, `prod -> tl.prod`, `max -> tl.max`, `min -> tl.min`,
-`any -> tl.any`, and `all -> tl.all`. In particular, do not encode boolean
-`any`/`all` as integer `max`/`min`; that changes the J-owned typed combiner and
-adds conversion operations to the compiler-visible graph.
-The other closed exception is an exact J `scatter` whose matching logical update
-has `combiner=add`, `duplicate_policy=combine`, and `order=unordered`, targets a
-singleton inout tensor, and whose contribution domain carries one anonymous C
-`reduction_tile_extent`. Realize that source-neutral update with one program tile:
-form `program_id(0) * tile + arange(0, tile)`, retain the authored access predicate,
-locally sum the active contributions, and commit them with `tl.atomic_add`. The
-atomic itself is the inout read-write effect; do not precede it with a load and
-replace it by an ordinary store. This rule does not apply to overwrite/one-of
-updates, non-singleton targets, or an unattached reduction domain.
-For either global additive-update exception, preserve the J-authored integer
-carrier width.  By default keep `program_id`, lane, tile arithmetic, and the
-runtime upper bound at the width of the J domain/bound carrier; widen only when
-an exact J coordinate or typed carrier requires it.  Do not introduce a wider
-address expression merely as a defensive implementation preference.
-The same source-neutral lowering applies when J explicitly defines a rank-0
-inout result as `base + reduce(sum, contributions)` and the contribution domain
-has one anonymous C `reduction_tile_extent`: use one program tile, retain the
-J access predicates, locally reduce the active contributions, and realize the
-single additive update with `tl.atomic_add`.  The atomic is the authored inout
-read-write effect; do not separately load the base or emit an ordinary store.
-This exception requires that exact closed J dependency shape and additive
-combiner; it does not authorize atomic lowering for an output-only scalar,
-another reducer, or an unattached domain.
-Factor the exact J effect axes before choosing a realization: distinguish axes shared across
-affected tensors, tensor-specific alternatives, and axes with anonymous C tile attachments.
-For an authored finite J domain with a C `tile_extent` attachment, you may choose the standard
-source-blind target realization `program_id * tile + arange(0, tile)` to cover that domain,
-provided you retain the J upper-bound predicate at every affected access. This is target
-instruction selection from J plus MaskC(C), not evidence about the Source grid or a pi
-instruction. You may instead product-linearize non-tiled shared axes, share one guarded
-program coordinate across mutually exclusive tensor-specific axes, or choose another
-whole-program mapping when it preserves the same J-owned effects. Never derive a guard
-elision, a specialization branch, an exact grid cardinality, or an additional logical axis
-from a C tile.
-When independently authored parallel/output `d*` domains each carry their own anonymous
-`tile_extent` attachment and there are at most three of them, retain that J partition:
-assign one target `program_id` axis to each such domain in declaration order. A domain
-attached through `reduction_tile_extent`, or used solely as a reducer/contraction axis,
-is not a launch domain and MUST NOT receive an independent `program_id`, except for
-the closed singleton additive-scatter update above. Do not merge
-distinct parallel J domains into a product coordinate. Within one multi-axis parallel J
-domain, you may instead use one linear `program_id(0)`, derive the per-axis tile counts,
-and decode it with div/rem. These choices depend only on J domain ownership and MaskC(C),
-never on Source, grid, or pi.
-For an untiled parallel/output domain whose affected J stores are scalar in that domain
-coordinate, use one scalar `program_id` directly. Do not manufacture `arange(0, 1)`, a
-singleton tensor coordinate, or singleton expand/broadcast operations around it. Introduce
-lane tensors only for axes carrying an actual anonymous tile attachment or a J-authored
-vector value.
-When a rank-2-or-higher dense full-rank tensor has a closed anonymous
-`block_order` attachment for every tensor axis, you MUST realize every access
-to that tensor with `tl.make_block_ptr`, not expanded flat-pointer arithmetic:
-use the
-J-authored shape and stride scalars, the decoded tile offsets, the attached
-anonymous order slots, and `boundary_check` on the same axes. This is permitted
-only when those access/axis attachments make the grouping unambiguous.
-For this fully attached multi-axis case, compute every `num_tiles[d]` with
-`tl.cdiv(extent[d], tile[d])`, decode one `tl.program_id(0)` from the trailing
-axis toward the leading axis using `%` followed by `//` for each trailing
-axis, and use the final residual quotient directly for the leading axis (do
-not add a redundant `% num_tiles[0]`). When J authors a wider coordinate
-carrier, widen both `program_id` and every `num_tiles[d]` before div/rem;
-do not postpone that widening until the final offsets. Cast the resulting
-per-axis tile offsets to `tl.int32`, pass the attached order tuple only to
-`tl.make_block_ptr(order=...)`, and pass the logical tensor-axis tuple
-`(0, 1, ...)` to `boundary_check`. Triton's boundary-check indices are logical
-dimensions, not memory-order positions. Do not rebuild an
-elementwise boolean mask beside these block pointers.
-When a block-pointer order tuple is selected by comparing anonymous C stride/order
-slots, express that compile-time choice directly as one `tl.constexpr` conditional
-expression. Do not spell the same choice as Python `if`/`else` statement blocks,
-which introduce compiler-visible control that J does not own.
-For a J `contraction` domain attached by `reduction_tile_extent`, use the anonymous tile as
-the local lane range and cover the contraction extent with an in-kernel target loop. Carry
-the J-authored accumulator across tiles, form each global contraction coordinate from the
-loop base plus the local range, retain the authored access predicate, then perform the final
-local reduction and store. Even when the current anonymous tile equals the current extent,
-retain this physical loop form rather than turning the contraction axis into a launch axis.
-This is source-blind target lowering from J plus MaskC(C), not a Source loop claim or a pi
-instruction. Do not apply this contraction-loop rule to an ordinary standalone J `reduce`.
-For the closed standalone diagonal-gather reduction case, however, a physical tiled
-accumulator loop is the canonical target realization: J has one scalar reduction whose
-operand depends on a gather/access with the same logical coordinate repeated across two
-tensor axes, and that contribution domain has one anonymous C
-`reduction_tile_extent`.  Allocate one vector accumulator of the anonymous tile size,
-iterate over `tl.cdiv(extent, tile)` tile ordinals and form each loop base as
-`ordinal * tile`, retain the exact J predicate/fill,
-accumulate each gathered tile into the vector carrier, then perform the final local
-reduction and scalar store.  Derive the diagonal address from J's repeated-coordinate
-access; do not infer Source strides or read pi.
-For the closed rank-2 column-reduction case with one C-tiled parallel/output axis and one
-C-tiled axis-0 standalone reduction, use physical tile order
-`[parallel_tile, reduction_tile]`: form the parallel coordinate as
-`[program_id(0) * parallel_tile + arange(0, parallel_tile), 1]`, form the reduction
-coordinate as `[1, loop_base + arange(0, reduction_tile)]`, carry a
-`[parallel_tile, reduction_tile]` accumulator through the reduction loop, then reduce its
-last axis. Compute each parallel and reduction upper-bound comparison once and broadcast
-those same booleans into the joint access mask. If J authors a later second access to the
-same tensor after intervening effects, emit a second physical loop in that authored effect
-position; do not reuse the earlier transfer. This is a generic lowering of the exact J
-axis/effect partition, not a Source recipe.
-For two or more sibling standalone reductions over distinct inputs that share the
-same logical reduction domain and the same anonymous C `reduction_tile_extent`,
-realize them in one shared physical tile loop. Initialize one vector accumulator
-per reduction with its authored identity, load each authored input once per tile
-with its exact predicate/fill, update the corresponding accumulator, and perform
-the authored local reductions only after the loop before evaluating the common
-scalar epilogue. Retain the J-authored read and write order. This is a generic
-multi-reduction lowering from J plus MaskC(C); it does not expose Source or pi.
-For the common rank-2-by-rank-1 contraction `ij,j->i`, keep the output coordinate as
-`[parallel_tile, 1]` and the contracted coordinate as `[1, reduction_tile]` throughout
-addressing and predicates. Compute each upper-bound comparison once at that expanded rank
-and share it across every J access that authors the same predicate. Carry a
-`[parallel_tile, reduction_tile]` partial-product accumulator through the physical loop,
-add the loaded elementwise products to it, and perform the single axis-1 reduction only
-after that loop; keep the singleton result dimension through the output store. This is the
-canonical public Triton realization of that J subscript shape, not a Source-specific
-template. For rank-2-by-rank-2 matrix multiplication, use the normal per-K-tile `tl.dot`
-accumulation instead; do not apply the rank-1-output partial-product form.
-For a J `consumer_extension` whose outside value is the reduction's two-sided
-identity, use that identity only to preserve the reduction semantics.  Put it in
-the predicated load's `other=` argument only when the matching J access also has
-that explicit `fill_value`; when the access has no fill, omit `other=` and do not
-add a post-load `where/select`.
-When a J `reduce` declares a collapsed result shape, keep the target reduction
-collapsed (`keep_dims=False`, normally the API default).  Reintroduce singleton
-axes only at the exact broadcasted consumer/store that needs them; do not change
-the reduction itself to `keep_dims=True`.
-When product-linearizing J axes, decode every authored logical coordinate. A lower bound
-that follows statically from public target semantics (`program_id`, nonnegative div/rem,
-or `arange`) is already discharged and must not be emitted as a redundant runtime
-comparison. Preserve every remaining authored upper bound. For a terminal complement of
-their positive conjunction, emit the direct disjunction of the individual upper-bound
-violations; do not replace it with either `not(combined_positive)` or one product-extent
-comparison. The J domain owns those predicate edges even when an arithmetic shortcut is
-extensionally equivalent for one launch.
-Construct each logical coordinate in the integer dtype authored by its J `iota`.
-For a boundary-only access axis without a J `iota`, first use the dtype of the
-exact typed scalar carrier that J binds to that dimension (either directly in
-the signature or through a value-dimension relation). Use i64 only when J has no
-such typed carrier. When an
-iota/coordinate is wider than the target-native program id or lane range, widen the base
-and lane components before forming their sum, not the already-combined coordinate. Never
-narrow from an anonymous valuation. For a multi-axis transfer whose J access uses
-the Cartesian product of distinct logical domains and shares one conjunctive
-predicate across that transfer, first expand each coordinate into the transfer
-rank and then compare it with its own authored bound before combining the
-predicates. Reuse those same expanded coordinates for address formation. This
-canonical target form follows only from J access rank and predicate sharing; do
-not compare rank-one coordinates and only later expand the boolean results. A
-genuinely rank-one access remains rank-one.
-In the common J-only fill case (no logical inputs, one guarded output, one runtime extent,
-and one anonymous tile), cast `program_id`, `arange`, and the runtime extent
-individually only when the J-selected coordinate dtype requires it. Do not rely
-on implicit promotion of an already-combined coordinate.
-Conversely, do not invent an explicit cast for a scalar operand when J does not
-author one. In particular, an i32 stride multiplied by a J-authored i64 iota is
-written directly as `coordinate * stride`; let the target's public mixed-integer
-promotion realize that consumer rather than pre-casting the stride.
-A `tile_extent` slot never authorizes guard elimination, a `c0 == logical_extent`
-specialization branch, or an unmasked transfer. Only a J-authored predicate or a
-separate anonymous C slot explicitly attached as guard specialization can do that.
-An unattached anonymous `specialization_branch` slot is likewise only a physical
-realization choice: it never changes a J-authored access predicate. Do not branch
-between masked and unmasked transfers from that slot alone.
-Do not invent a terminal early return, structured conditional, or additional domain
-predicate unless J explicitly authors that control fact. Realize each authored access
-predicate directly as that transfer's mask, sharing the same computed predicate across
-accesses when J shares it. A nonnegative lower bound already discharged by `program_id`,
-nonnegative div/rem, or `arange` must not be rebuilt as an `and` mask. Keep tensor-specific
-effect guards as sibling masks and do not change their ownership.
-Boundary domains delimit logical iteration but do not automatically become transfer
-masks.  A load/store mask contains exactly the clauses of that J access predicate;
-do not add an upper-bound comparison merely because another J domain names the
-program coordinate.
-
-Compile, inspect only your own Replay IR, and patch the complete program in this same
-episode. First run `replay_compile_check`; once construction passes, call
-`replay_ttir_inspect jc` for the bounded J/C structural summary. Compare its exact
-typed J obligations against your own arithmetic, dot, reduction, loop, and cast
-signatures before submit. Every operand and result dtype printed in S_J is authoritative:
-preserve intermediate result dtypes at the corresponding operation boundary and insert
-an explicit target cast when implicit promotion would skip that boundary. In particular,
-an f16 intermediate later consumed by an f32 operation must remain f16 before that
-consumer; matching only final store dtype is insufficient. Compare these typed edges;
-matching only operation counts is insufficient.
-For Triton/CUDA, preserve the public target realization of authored predicate
-and transcendental nodes: lower `map_unary(fn=erf)` with
-`tl.math.erf(x.to(tl.float32))`, not `libdevice.erf`,
-`map_unary(fn=exp)` with `libdevice.exp`,
-`map_unary(fn=sigmoid)` as `1 / (1 + libdevice.exp2(-x.to(tl.float32) *
-1.4426950408889634))`,
-importing `libdevice` from `triton.language.extra.cuda`; call
-`libdevice.exp2` literally, not `tl.exp2` or `tl.sigmoid`, because those public
-target APIs compile to a different compiler-visible operation graph,
-`map_unary(fn=isnan)` with `libdevice.isnan(value.to(tl.float32))`, and an f32
-`map_unary(fn=isfinite)` with `libdevice.finitef(value.to(tl.float32))` converted
-to the authored i1 result. Do not replace authored `isnan` with `value != value`.
-If the callable ABI physically stores a J-authored i1 tensor as bytes, cast each
-load to `tl.int1` before its authored logical consumers. Retain an authored
-comparison with integer one; neither using the raw byte directly as a predicate
-nor comparing it to Python `True` preserves that typed J boundary.
-Lower `map_unary(fn=logical_not)` as boolean conversion followed by boolean
-negation (for example `~value.to(tl.int1)`); do not replace that authored node
-with the algebraically equivalent direct comparison `value == 0`, which erases
-the compiler-visible negation. A predicated J load with no authored
-`fill_value` must omit Triton's `other=` argument; never invent zero merely to
-silence inactive lanes.
-When exact J directly spells `add(primary, neg(value))` or
-`add(primary, sub(zero,value))` and that negated producer has no other J consumer,
-lower the target expression as the direct subtraction `primary - value`; do not retain
-an extra target zero/neg/add chain. This is local instruction selection, not a general
-algebraic rewrite. Inspect your own IR again when a concrete J obligation remains
-unclear; use targeted `find`, `raw`, or
-`observer` queries instead of dumping the whole fingerprint. Keep computations for inactive constexpr
-alternatives inside their branch and do not add unmentioned `volatile`, cache,
-eviction, or other target attributes. In particular, when an anonymous constexpr
-selects whether an already-authored logical-domain guard is elided, put the unguarded
-and guarded memory operations in their respective lexical branches. Never encode the
-unguarded arm as an always-true comparison or mask and then issue one masked operation
-outside the branch: target IR may retain that predicate and turn an unconditional J
-access/effect into a masked one. Then run
-`submit_replay` on the reviewed exact bytes and repair until it
-passes. Submit also rejects an unambiguous read/write-mode contradiction between an
-explicit J boundary effect and your own compiled TTIR. Fixed code materializes S_J,
-projects exact packet facts, checks and rejects;
-it never constructs or repairs target source. Finish only with the transaction passing
-and do not claim Gate1, Gate2, or certification. A passive host watcher may checkpoint
-stable compilable bytes, but it never submits them and never ends this coding turn;
-only your explicit `submit_replay` can finish early.
-"""
-
-_REPAIR_PROMPT = """The same fresh source-blind Replay episode continues in the same thread and workspace.
-Read work/host_replay_check.json and the current output/replay.source. Repair the
-complete program using the same read-only S_J, then rerun submit_replay.
-Diagnostics reject only; they do not supply a semantic mapping or repair. Finish only
-when ingress and compile both pass.
-"""
-
-_INCREMENTAL_PROMPT = """You are the sole writer for one source-blind incremental Replay compilation.
-The exact new J in input/semantic-program.intent is the only semantic authority.  The
-current output/replay.source is a compilation cache produced earlier from another J;
-it contains no Source, pi, Gate observation, or Harness fact and is not an authority.
-
-Read the complete new semantic program, the compact compiler index, frontend ABI,
-MaskC, and the current Replay.  Patch or rewrite the Replay so it implements the new
-J.  The supplied change record only locates the edited J field; it does not authorize
-target semantics.  Preserve unchanged J-owned behavior, but never preserve old Replay
-behavior when it conflicts with the new J.
-
-Work only inside the isolated workspace.  Compile and inspect only your own Replay.
-Use replay_compile_check and submit_replay, repairing the complete program until the
-transaction passes.  Fixed tools diagnose and reject; they do not generate target
-source or reveal Source.  input/REPLAY_CONTRACT.md and input/TOOL.md remain the closed
-contract and tool reference.
+Compile all S_J to output/replay.source. Choose target realization without
+changing J. Compile/inspect only your source; submit_replay once on final bytes.
+Diagnostics only reject. Rejection ends the episode: no continuation or repair
+from rejected source. Never claim Gate1, Gate2 or certification.
 """
 
 
@@ -399,21 +92,28 @@ def _aggregate_usage(turns: list[CodexCLITurn]) -> dict[str, int]:
     return usage
 
 
-def _replay_startup_context(
-    packet: Mapping[str, Any], files: Mapping[str, str]
-) -> dict[str, Any]:
+def _replay_startup_context(files: Mapping[str, str]) -> dict[str, Any]:
     """Return a path-only receipt; Codex reads the exact packet as a local file."""
 
-    encoded = json.dumps(
-        packet,
-        sort_keys=True,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    packet_file = files.get("packet.json")
+    if not isinstance(packet_file, str):
+        raise ValueError("Replay startup context requires packet.json")
+    paths = {
+        "packet": "input/packet.json",
+        "semantic_program": "input/semantic-program.intent",
+        "semantic_program_json": "input/semantic-program.json",
+        "compiler_index": "input/compiler-index.intent",
+        "compiler_index_json": "input/compiler-index.json",
+        "frontend": "input/frontend.json",
+        "public_contract": "input/REPLAY_CONTRACT.md",
+        "tool_contract": "input/TOOL.md",
+        "replay": "output/replay.source",
+    }
+    if "c.json" in files:
+        paths["c"] = "input/c.json"
     return {
         "protocol": "intentir.scrc.replay-startup-view.v6",
-        "packet_bytes": len(encoded),
+        "packet_bytes": len(packet_file.encode("utf-8")),
         "semantic_program_text_bytes": len(
             files["semantic-program.intent"].encode("utf-8")
         ),
@@ -426,19 +126,7 @@ def _replay_startup_context(
         "compiler_index_json_bytes": len(
             files["compiler-index.json"].encode("utf-8")
         ),
-        "paths": {
-            "packet": "input/packet.json",
-            "semantic_program": "input/semantic-program.intent",
-            "semantic_program_json": "input/semantic-program.json",
-            "compiler_index": "input/compiler-index.intent",
-            "compiler_index_json": "input/compiler-index.json",
-            "mask_c": "input/mask-c.json",
-            "frontend": "input/frontend.json",
-            "public_contract": "input/REPLAY_CONTRACT.md",
-            "tool_contract": "input/TOOL.md",
-            "replay": "output/replay.source",
-            "host_check": "work/host_replay_check.json",
-        },
+        "paths": paths,
         "authority": (
             "path and byte-count receipt only; exact source-isolated packet bytes "
             "remain in input/packet.json and no code or schedule is generated"
@@ -526,6 +214,7 @@ def _j_contract_summary(semantic_program: Mapping[str, Any]) -> dict[str, Any]:
         "scatter",
         "select",
         "transpose",
+        *RAGGED_OPS,
     }
     typed_obligations: list[dict[str, Any]] = []
     for item in nodes if isinstance(nodes, list) else []:
@@ -780,18 +469,14 @@ class CodexCLIReplayWriter:
     effort: str | None = None
     frontend: Frontend = Frontend.TRITON
     model_timeout_seconds: float | None = None
-    # Time, not a semantic-attempt count, bounds one fresh Replay episode.  High
-    # gets three full provider windows; xhigh gets two of its longer windows.
-    # This prevents a bad direction from cycling for an hour while leaving every
-    # useful coding-agent tool action inside those turns unrestricted.
+    # An explicit time budget may bound one fresh Replay episode.  When it is
+    # omitted, the provider and episode are unbounded; callers that need a
+    # bounded run must opt in through this field.
     session_wall_time_limit_seconds: float | None = None
     # Codex owns its thread compaction.  Zero disables host-side thread rollover;
     # cumulative API input-token counters are not a measure of live context size.
     context_rollover_input_tokens: int = 0
-    repair_effort: str | None = None
     compile_checker: Callable[[str, Gate1Artifact, str], Any] | None = None
-    prior_replay_source: str | None = None
-    j_change: Mapping[str, Any] | None = None
     stop_requested: Callable[[], int | None] | None = field(
         default=None, repr=False
     )
@@ -810,32 +495,25 @@ class CodexCLIReplayWriter:
         return tuple(self._records)
 
     def generate(
-        self, artifact: Gate1Artifact, *, masked: bool = False
+        self,
+        artifact: Gate1Artifact,
+        *,
+        masked: bool = False,
+        callable_abi_order: tuple[str, ...] | list[str] | None = None,
     ) -> ReplayGeneration:
         if self.context_rollover_input_tokens < 0:
             raise ValueError("Replay context rollover token threshold cannot be negative")
         provider = self.provider or get_provider()
         effective_effort = self.effort or provider.reasoning_effort
         episode_limit = self.session_wall_time_limit_seconds
-        if episode_limit is None:
-            episode_limit = (
-                2.0 * XHIGH_RESPONSES_TIMEOUT_SECONDS
-                if effective_effort.casefold() == "xhigh"
-                else 3.0 * DEFAULT_RESPONSES_TIMEOUT_SECONDS
-            )
-        if episode_limit <= 0:
+        if episode_limit is not None and episode_limit <= 0:
             raise ValueError("Replay episode wall-time limit must be positive")
         turn_limit = self.model_timeout_seconds
-        if turn_limit is None:
-            turn_limit = (
-                XHIGH_RESPONSES_TIMEOUT_SECONDS
-                if effective_effort.casefold() == "xhigh"
-                else DEFAULT_RESPONSES_TIMEOUT_SECONDS
-            )
         files, packet, _instructions = _replay_input_files(
             artifact,
             frontend=self.frontend,
             masked=masked,
+            callable_abi_order=callable_abi_order,
         )
         agent_packet = dict(packet)
         semantic_program = materialize_replay_semantics(packet["j"]).to_json()
@@ -847,6 +525,10 @@ class CodexCLIReplayWriter:
             indent=2,
         ) + "\n"
         function_name = str(packet["u_f"]["replay_function"])
+        if self.compile_checker is None and self.frontend is not Frontend.TRITON:
+            raise ValueError(
+                "native Codex Replay requires a frontend-specific compile checker"
+            )
 
         try:
             from minisweagent.environments.intentir_replay import (
@@ -860,8 +542,6 @@ class CodexCLIReplayWriter:
             ) from exc
 
         workspace = IntentIRReplayWorkspace.create(files)
-        if self.prior_replay_source is not None:
-            _atomic_write_text(workspace.replay_path, self.prior_replay_source)
         turns: list[CodexCLITurn] = []
         checks: list[dict[str, Any]] = []
         compile_checks: list[dict[str, Any]] = []
@@ -870,7 +550,6 @@ class CodexCLIReplayWriter:
         semantic_queries: list[dict[str, Any]] = []
         timeout_events: list[dict[str, Any]] = []
         accepted_submission_interrupts: list[dict[str, Any]] = []
-        diagnostic_ready_interrupts: list[dict[str, Any]] = []
         live_checkpoint_events: list[dict[str, Any]] = []
         host_commit_events: list[dict[str, Any]] = []
         accepted_submission_event = threading.Event()
@@ -881,7 +560,7 @@ class CodexCLIReplayWriter:
         formal_ingress = None
         formal_compile = None
         last_checked_good: str | None = None
-        startup_context = _replay_startup_context(agent_packet, files)
+        startup_context = _replay_startup_context(files)
         synthetic_compiler = (
             None
             if self.compile_checker is not None
@@ -891,21 +570,8 @@ class CodexCLIReplayWriter:
             )
         )
         ttir_observations: dict[str, dict[str, Any]] = {}
-        reviewed_jc_sources: set[str] = set()
-        prompt_body = (
-            _INITIAL_PROMPT
-            if self.prior_replay_source is None
-            else _INCREMENTAL_PROMPT
-            + "\n\n<j-change>\n"
-            + json.dumps(
-                dict(self.j_change or {}),
-                sort_keys=True,
-                ensure_ascii=False,
-                allow_nan=False,
-                separators=(",", ":"),
-            )
-            + "\n</j-change>\n"
-        )
+        prompt_body = _INITIAL_PROMPT
+        prompt_body += _frontend_replay_guidance(self.frontend)
         prompt = (
             prompt_body
             + "\n\n<source-blind-startup>\n"
@@ -918,7 +584,6 @@ class CodexCLIReplayWriter:
             )
             + "\n</source-blind-startup>\n"
         )
-        selected_effort = effective_effort
         active_elapsed_ms = 0.0
         timed_out_calls = 0
         thread_id: str | None = None
@@ -928,19 +593,6 @@ class CodexCLIReplayWriter:
         last_replay_check_signature: tuple[tuple[str, str], ...] | None = None
         repeated_replay_diagnostic = 0
         explicit_submission_accepted = False
-
-        def write_host_check(check: Mapping[str, Any]) -> None:
-            _atomic_write_text(
-                workspace.scratch_dir / "host_replay_check.json",
-                json.dumps(
-                    check,
-                    indent=2,
-                    sort_keys=True,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-                + "\n",
-            )
 
         def new_session() -> Any:
             return self.session_factory(
@@ -1067,6 +719,7 @@ class CodexCLIReplayWriter:
 
             ingress = dict(replay_check_tool())
             if ingress.get("status") != "pass":
+                diagnostic_ready_event.set()
                 return {
                     "protocol": "intentir.codex-cli.replay-submit.v2",
                     "status": "fail",
@@ -1078,25 +731,10 @@ class CodexCLIReplayWriter:
             compiled = dict(replay_compile_tool())
             necessary: Mapping[str, Any] | None = None
             if compiled.get("status") == "pass" and synthetic_compiler is not None:
-                current_source = workspace.read_replay()
-                reviewed_before_submit = current_source in reviewed_jc_sources
                 necessary = replay_ttir_inspect_tool(("jc",))
-                if not reviewed_before_submit:
-                    return {
-                        "protocol": "intentir.codex-cli.replay-submit.v2",
-                        "status": "fail",
-                        "phase": "j_owned_review_required",
-                        "ingress": ingress,
-                        "compile": compiled,
-                        "j_owned_review": necessary,
-                        "authority": (
-                            "source-blind own-TTIR review checkpoint only; inspect the "
-                            "returned J/C facts and current Replay TTIR, then explicitly "
-                            "submit the same or revised exact bytes"
-                        ),
-                    }
                 diagnostics = necessary.get("j_owned_necessary_diagnostics")
                 if isinstance(diagnostics, list) and diagnostics:
+                    diagnostic_ready_event.set()
                     return {
                         "protocol": "intentir.codex-cli.replay-submit.v2",
                         "status": "fail",
@@ -1112,6 +750,8 @@ class CodexCLIReplayWriter:
             if compiled.get("status") == "pass":
                 explicit_submission_accepted = True
                 accepted_submission_event.set()
+            else:
+                diagnostic_ready_event.set()
             return {
                 "protocol": "intentir.codex-cli.replay-submit.v2",
                 "status": compiled.get("status", "fail"),
@@ -1183,6 +823,7 @@ class CodexCLIReplayWriter:
                     try:
                         fingerprint = fingerprint_ttir(
                             result.ttir,
+                            external_math=result.external_math,
                             python_interface=result.python_interface,
                             schedule=case.schedule,
                         )
@@ -1316,8 +957,6 @@ class CodexCLIReplayWriter:
                         "path": arguments[1],
                         "value": value,
                     }
-            if mode == "jc" and result_view.get("status") == "pass":
-                reviewed_jc_sources.add(current)
             ttir_inspections.append(
                 {
                     "query": list(arguments) if arguments else ["summary"],
@@ -1477,24 +1116,37 @@ class CodexCLIReplayWriter:
                 own_ir: Mapping[str, Any] | None = None
                 committed = False
                 if accepted:
-                    own_ir = _locked_tool_call(replay_ttir_inspect_tool, ("jc",))
-                    necessary = own_ir.get("j_owned_necessary_diagnostics")
                     try:
                         still_current = workspace.read_replay() == observed_text
                     except Exception:
                         still_current = False
-                    committed = (
-                        still_current
-                        and own_ir.get("status") == "pass"
-                        and not necessary
-                    )
+                    if synthetic_compiler is None:
+                        # Native frontends have no Triton TTIR.  Their
+                        # frontend-specific compile checker is the complete
+                        # source-blind construction checkpoint; Gate1 remains
+                        # the first native structural observer.
+                        committed = still_current
+                    else:
+                        own_ir = _locked_tool_call(
+                            replay_ttir_inspect_tool, ("jc",)
+                        )
+                        necessary = own_ir.get("j_owned_necessary_diagnostics")
+                        committed = (
+                            still_current
+                            and own_ir.get("status") == "pass"
+                            and not necessary
+                        )
                 live_checkpoint_events.append(
                     {
                         "replay_bytes": len(checked_text.encode()) if checked_text else 0,
                         "status": check.get("status", "fail"),
                         "accepted": accepted,
                         "j_owned_necessary": (
-                            own_ir.get("status") if own_ir is not None else "not_run"
+                            own_ir.get("status")
+                            if own_ir is not None
+                            else "not_applicable"
+                            if synthetic_compiler is None
+                            else "not_run"
                         ),
                         "committed": committed,
                     }
@@ -1508,7 +1160,11 @@ class CodexCLIReplayWriter:
                             "replay_bytes": len(checked_text.encode()),
                             "ingress": "pass",
                             "compile": "pass",
-                            "j_owned_necessary": "pass",
+                            "j_owned_necessary": (
+                                "not_applicable"
+                                if synthetic_compiler is None
+                                else "pass"
+                            ),
                             "authority": (
                                 "atomic commit of exact Agent-authored bytes only; "
                                 "fixed code generated and repaired no target source"
@@ -1522,10 +1178,6 @@ class CodexCLIReplayWriter:
                     stable_since = 0.0
                     continue
                 if checked_text == observed_text:
-                    write_host_check(check)
-                    # The same closed diagnostic is available through the explicit
-                    # tools. A passive failed draft must not split one native
-                    # write-check-patch loop into another provider turn.
                     observed_replay = None
                     stable_since = 0.0
 
@@ -1541,20 +1193,27 @@ class CodexCLIReplayWriter:
             session = new_session()
             while True:
                 remaining = (
-                    episode_limit
-                    - active_elapsed_ms / 1000.0
+                    None
+                    if episode_limit is None
+                    else episode_limit - active_elapsed_ms / 1000.0
                 )
-                if remaining <= 0:
+                if remaining is not None and remaining <= 0:
                     raise RuntimeError("Replay owner episode wall-time exhausted")
-                turn_timeout = min(remaining, turn_limit)
+                turn_timeout = (
+                    turn_limit
+                    if remaining is None
+                    else remaining
+                    if turn_limit is None
+                    else min(remaining, turn_limit)
+                )
                 try:
                     turn = session.run(
                         prompt,
                         timeout_seconds=turn_timeout,
-                        effort=selected_effort,
+                        effort=effective_effort,
                         stop_requested=self.stop_requested,
                         submission_accepted=accepted_submission_event.is_set,
-                        diagnostic_ready=diagnostic_ready_event.is_set,
+                        submission_rejected=diagnostic_ready_event.is_set,
                     )
                     accepted_submission_event.clear()
                     diagnostic_ready_event.clear()
@@ -1588,33 +1247,24 @@ class CodexCLIReplayWriter:
                         "exact_checkpoint_restored"
                     )
                     break
-                except CodexCLIDiagnosticReady as exc:
+                except CodexCLISubmissionRejected as exc:
                     active_elapsed_ms += exc.elapsed_ms
                     diagnostic_ready_event.clear()
                     accepted_submission_event.clear()
                     thread_id = exc.thread_id
                     if thread_id not in thread_ids:
                         thread_ids.append(thread_id)
-                    diagnostic_ready_interrupts.append(
-                        {
-                            "elapsed_ms": exc.elapsed_ms,
-                            "thread_id": exc.thread_id,
-                            "recovery": "same_thread_closed_diagnostic",
-                        }
-                    )
-                    passed, check = evaluate_current(
-                        trigger="host_live_diagnostic_recheck"
-                    )
-                    if passed:
-                        break
-                    write_host_check(check)
-                    prompt = _REPAIR_PROMPT
-                    selected_effort = self.repair_effort or effective_effort
-                    continue
+                    raise CodexCLIError(
+                        "Replay submission rejected; a fresh writer is required"
+                    ) from exc
                 except CodexCLIError as exc:
                     if "wall-time limit" not in str(exc):
                         raise
-                    elapsed = turn_timeout * 1000.0
+                    elapsed = (
+                        float(turn_timeout) * 1000.0
+                        if turn_timeout is not None
+                        else 0.0
+                    )
                     active_elapsed_ms += elapsed
                     timed_out_calls += 1
                     thread_id = getattr(session, "thread_id", None)
@@ -1628,8 +1278,9 @@ class CodexCLIReplayWriter:
                         trigger="host_timeout_recheck"
                     )
                     remaining_after_timeout = (
-                        episode_limit
-                        - active_elapsed_ms / 1000.0
+                        None
+                        if episode_limit is None
+                        else episode_limit - active_elapsed_ms / 1000.0
                     )
                     if passed:
                         timeout_event["recovery"] = (
@@ -1652,7 +1303,10 @@ class CodexCLIReplayWriter:
                                 else "turn_deadline_host_validated_checked_checkpoint"
                             )
                             break
-                    if remaining_after_timeout <= 0:
+                    if (
+                        remaining_after_timeout is not None
+                        and remaining_after_timeout <= 0
+                    ):
                         timeout_event["recovery"] = "episode_time_exhausted"
                         raise RuntimeError(
                             "Replay owner episode wall-time exhausted"
@@ -1663,11 +1317,11 @@ class CodexCLIReplayWriter:
                             "initial Codex Replay turn timed out without a "
                             "resumable thread or checked Replay"
                         ) from exc
-                    write_host_check(check)
-                    timeout_event["recovery"] = "same_thread_continuation"
-                    prompt = _REPAIR_PROMPT
-                    selected_effort = self.repair_effort or effective_effort
-                    continue
+                    timeout_event["recovery"] = "fresh_writer_required"
+                    raise CodexCLIError(
+                        "Codex Replay turn timed out without an accepted checkpoint; "
+                        "a fresh writer is required"
+                    ) from exc
                 turns.append(turn)
                 thread_id = turn.thread_id
                 if thread_id not in thread_ids:
@@ -1675,6 +1329,23 @@ class CodexCLIReplayWriter:
                 active_elapsed_ms += turn.elapsed_ms
                 passed, check = evaluate_current(trigger="host_post_turn")
                 if passed and explicit_submission_accepted:
+                    break
+                if passed and synthetic_compiler is None:
+                    last_checked_good = source_text
+                    host_commit_events.append(
+                        {
+                            "trigger": "host_post_turn",
+                            "replay_bytes": len(source_text.encode()),
+                            "ingress": "pass",
+                            "compile": "pass",
+                            "j_owned_necessary": "not_applicable",
+                            "authority": (
+                                "exact Agent-authored native Replay bytes passed the "
+                                "frontend-specific construction checker; formal Gate1 "
+                                "remains external"
+                            ),
+                        }
+                    )
                     break
                 if passed:
                     last_checked_good = source_text
@@ -1695,35 +1366,14 @@ class CodexCLIReplayWriter:
                             }
                         )
                         break
-                    diagnostics = (
-                        [dict(item) for item in necessary]
-                        if isinstance(necessary, list) and necessary
-                        else [
-                            {
-                                "rule_code": "replay_own_ttir_review_failed",
-                                "path": "<replay-ttir>",
-                                "anonymous_handles": [],
-                                "line": None,
-                            }
-                        ]
+                    raise CodexCLIError(
+                        "Replay own-TTIR review rejected the submission; "
+                        "a fresh writer is required"
                     )
-                    write_host_check(
-                        {
-                            "protocol": REPLAY_CHECK_PROTOCOL,
-                            "status": "fail",
-                            "diagnostics": diagnostics,
-                            "authority": (
-                                "J-only necessary-condition diagnostics; fixed code "
-                                "does not generate or repair Replay"
-                            ),
-                        }
-                    )
-                    prompt = _REPAIR_PROMPT
-                    selected_effort = self.repair_effort or effective_effort
-                    continue
-                write_host_check(check)
-                prompt = _REPAIR_PROMPT
-                selected_effort = self.repair_effort or effective_effort
+                raise CodexCLIError(
+                    "Replay construction rejected the submission; "
+                    "a fresh writer is required"
+                )
 
             assert formal_ingress is not None and formal_ingress.code is not None
             assert formal_compile is not None and formal_compile.status == "pass"
@@ -1742,7 +1392,6 @@ class CodexCLIReplayWriter:
                 "semantic_queries": semantic_queries,
                 "timeout_events": timeout_events,
                 "accepted_submission_interrupts": accepted_submission_interrupts,
-                "diagnostic_ready_interrupts": diagnostic_ready_interrupts,
                 "live_checkpoint": live_checkpoint_events,
                 "host_commit": host_commit_events,
                 "explicit_submission_accepted": explicit_submission_accepted,
@@ -1779,13 +1428,11 @@ class CodexCLIReplayWriter:
                         len(turns)
                         + timed_out_calls
                         + len(accepted_submission_interrupts)
-                        + len(diagnostic_ready_interrupts)
                     ),
                     "model_segments_lower_bound": (
                         sum(turn.model_segments for turn in turns)
                         + timed_out_calls
                         + len(accepted_submission_interrupts)
-                        + len(diagnostic_ready_interrupts)
                     ),
                     "tool_actions": sum(turn.tool_actions for turn in turns),
                     "formal_ingress_protocol": REPLAY_CHECK_PROTOCOL,
@@ -1807,13 +1454,11 @@ class CodexCLIReplayWriter:
                     len(turns)
                     + timed_out_calls
                     + len(accepted_submission_interrupts)
-                    + len(diagnostic_ready_interrupts)
                 ),
                 physical_provider_calls=(
                     sum(turn.model_segments for turn in turns)
                     + timed_out_calls
                     + len(accepted_submission_interrupts)
-                    + len(diagnostic_ready_interrupts)
                 ),
                 transport_retries=0,
                 elapsed_ms=active_elapsed_ms,
@@ -1841,7 +1486,6 @@ class CodexCLIReplayWriter:
                 "semantic_queries": semantic_queries,
                 "timeout_events": timeout_events,
                 "accepted_submission_interrupts": accepted_submission_interrupts,
-                "diagnostic_ready_interrupts": diagnostic_ready_interrupts,
                 "live_checkpoint": live_checkpoint_events,
                 "tool_bridge": bridge.evidence,
                 "failure_class": type(exc).__name__,
@@ -1868,7 +1512,6 @@ class CodexCLIReplayWriter:
                     len(turns)
                     + timed_out_calls
                     + len(accepted_submission_interrupts)
-                    + len(diagnostic_ready_interrupts)
                 ),
                 elapsed_ms=active_elapsed_ms,
                 trajectory=trajectory,
@@ -1877,7 +1520,7 @@ class CodexCLIReplayWriter:
                     turn.model_segments for turn in turns
                 ) + cancelled_calls + timed_out_calls + len(
                     accepted_submission_interrupts
-                ) + len(diagnostic_ready_interrupts),
+                ),
                 transport_retries=0,
             )
             self._records.append(attempt)

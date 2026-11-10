@@ -15,13 +15,14 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from .codegen import extract_python_module, validate_triton_module
 
@@ -36,6 +37,150 @@ __all__ = [
 
 _CACHE_SCHEMA_VERSION = 2
 _WORKER = Path(__file__).with_name("_triton_worker.py")
+_PROJECT_PYTHON_ROOT = Path(__file__).resolve().parents[3]
+
+# Reviewed LLVM bitcode, not a filename/symbol allowlist. Its f32 wrapper is
+# exactly __CUDA_FTZ ? nvvm.rsqrt.approx.ftz.f(x) : nvvm.rsqrt.approx.f(x);
+# its f64 wrapper is exactly nvvm.rsqrt.approx.d(x). No arithmetic expansion,
+# replacement library is authorized by this profile. f32 FTZ linkage must
+# authorize only the distinct J rsqrt_ftz operation.
+_REVIEWED_RSQRT_LIBDEVICE_SHA256 = "5c2fae37c86e68c3a38605a95f512d7d12d5f3db986310be47f57304aa72a5ee"
+EXTERNAL_MATH_FAILURE_RULES = frozenset({
+    "source_extern_target_unproved", "source_extern_linkage_unproved",
+    "source_extern_library_unavailable", "source_extern_library_identity_unproved",
+    "source_extern_linked_ir_unavailable", "source_extern_ftz_unproved",
+    "source_extern_compiler_override_forbidden", "source_extern_rsqrt_authorization_unavailable",
+    "source_extern_rsqrt_ftz_contract_unavailable",
+})
+
+
+def _libdevice_snapshot(triton_file: str) -> tuple[Path, str] | None:
+    """Snapshot the selected library before compilation; never execute it."""
+    default = Path(triton_file).resolve().parent / "backends/nvidia/lib/libdevice.10.bc"
+    path = Path(os.environ.get("TRITON_LIBDEVICE_PATH", str(default))).resolve()
+    try:
+        return path, hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _compiled_external_math(
+    compiled: Any, ttir: str, before: tuple[Path, str] | None,
+) -> dict[str, Any]:
+    """Host-worker receipt for a reviewed library actually selected by CUDA.
+
+    This is operation/linkage evidence, not a numerical equality claim. The
+    f32 FTZ branch authorizes only the distinct rsqrt_ftz J operation; Gate2
+    still applies the existing floating-point comparison policy.
+    Only hashes and closed facts leave the worker, never library paths/LLVM IR.
+    """
+    def unavailable(rule: str) -> dict[str, Any]:
+        return {"status": "unavailable", "rule_code": rule}
+
+    if "tt.extern_elementwise" not in ttir:
+        return {}
+    if os.environ.get("TRITON_KERNEL_OVERRIDE", "0") != "0":
+        return unavailable("source_extern_compiler_override_forbidden")
+    metadata = getattr(compiled, "metadata", None)
+    if getattr(getattr(metadata, "target", None), "backend", None) != "cuda":
+        return unavailable("source_extern_target_unproved")
+    libraries = getattr(metadata, "extern_libs", None)
+    if (
+        before is None or not isinstance(libraries, (list, tuple)) or len(libraries) != 1
+        or not isinstance(libraries[0], (list, tuple)) or len(libraries[0]) != 2
+        or libraries[0][0] != "libdevice" or not isinstance(libraries[0][1], str)
+    ):
+        return unavailable("source_extern_linkage_unproved")
+    try:
+        path = Path(libraries[0][1]).resolve()
+        after = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return unavailable("source_extern_library_unavailable")
+    if path != before[0] or after != before[1] or after != _REVIEWED_RSQRT_LIBDEVICE_SHA256:
+        return unavailable("source_extern_library_identity_unproved")
+    llir = compiled.asm.get("llir")
+    if not isinstance(llir, str) or not llir:
+        return unavailable("source_extern_linked_ir_unavailable")
+    if any(
+        value != "ieee,ieee"
+        for value in re.findall(r'"denormal-fp-math(?:-f32)?"\s*=\s*"([^"]*)"', llir)
+    ):
+        return unavailable("source_extern_ftz_unproved")
+    # Read the actual module-flags member, not an unrelated metadata string.
+    flags = re.findall(r"(?m)^!llvm\.module\.flags\s*=\s*!\{([^{}]*)\}\s*$", llir)
+    if len(flags) != 1:
+        return unavailable("source_extern_ftz_unproved")
+    refs = re.findall(r"![0-9]+", flags[0])
+    ftz = []
+    for ref in refs:
+        rows = re.findall(r"(?m)^" + re.escape(ref) + r"\s*=\s*!\{([^{}]*)\}\s*$", llir)
+        if len(rows) != 1:
+            return unavailable("source_extern_ftz_unproved")
+        if '"nvvm-reflect-ftz"' in rows[0]:
+            ftz.append(rows[0].strip())
+    mode = re.fullmatch(r'i32 [1-8],\s*!"nvvm-reflect-ftz",\s*i32 ([01])', ftz[0]) if len(ftz) == 1 else None
+    if mode is None:
+        return unavailable("source_extern_ftz_unproved")
+    flush = mode[1] == "1"
+    if not flush and "llvm.nvvm.rsqrt.approx.ftz" in llir:
+        return unavailable("source_extern_ftz_unproved")
+    if flush and re.search(r'\bsymbol\s*=\s*"__nv_rsqrtf"', ttir):
+        ptx = compiled.asm.get("ptx")
+        if not isinstance(ptx, str) or re.search(r"(?m)^\s*rsqrt\.approx\.ftz\.f32\s+", ptx) is None:
+            return unavailable("source_extern_rsqrt_ftz_contract_unavailable")
+    return {
+        "status": "pass", "target": "cuda", "ftz": flush,
+        "ttir_sha256": hashlib.sha256(ttir.encode()).hexdigest(),
+        "llir_sha256": hashlib.sha256(llir.encode()).hexdigest(),
+        "library_sha256": after,
+        "symbols": {"__nv_rsqrtf": "f32", "__nv_rsqrt": "f64"},
+    }
+
+
+def validated_external_math_symbols(
+    ttir: str, evidence: Mapping[str, Any] | None,
+) -> frozenset[str]:
+    """Consume only host compile receipts bound to the exact raw TTIR.
+
+    Neither J nor provider text supplies this argument. Normalized Gate1 views
+    must pass the original compile text separately to retain its binding.
+    Missing/old receipts confer no external-operation authorization.
+    """
+    if not isinstance(evidence, Mapping) or set(evidence) != {
+        "status", "target", "ftz", "ttir_sha256", "llir_sha256", "library_sha256", "symbols",
+    }:
+        return frozenset()
+    if (
+        evidence["status"] != "pass" or evidence["target"] != "cuda" or type(evidence["ftz"]) is not bool
+        or evidence["ttir_sha256"] != hashlib.sha256(ttir.encode()).hexdigest()
+        or evidence["library_sha256"] != _REVIEWED_RSQRT_LIBDEVICE_SHA256
+        or not isinstance(evidence["llir_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", evidence["llir_sha256"]) is None
+        or evidence["symbols"] != {"__nv_rsqrtf": "f32", "__nv_rsqrt": "f64"}
+    ):
+        return frozenset()
+    return frozenset(evidence["symbols"])
+
+
+def _worker_environment(base: Mapping[str, str]) -> dict[str, str]:
+    """Give fresh Gate1 workers the same source import root as the parent.
+
+    The command-line tools intentionally import the active checkout by adding
+    ``<repo>/python`` to ``sys.path``.  A worker launched by filesystem path
+    does not inherit that Python-only mutation, so an otherwise healthy
+    source checkout could fail before Triton is imported with
+    ``ModuleNotFoundError: intentir``.  Preserve caller-provided paths while
+    making the active checkout the first deterministic lookup location.
+    """
+
+    environment = dict(base)
+    project_root = str(_PROJECT_PYTHON_ROOT)
+    existing = environment.get("PYTHONPATH", "")
+    entries = [project_root]
+    if existing:
+        entries.append(existing)
+    environment["PYTHONPATH"] = os.pathsep.join(entries)
+    return environment
 
 
 def _plain_mapping(value: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -57,6 +202,7 @@ class KernelSource:
     path: str | os.PathLike[str] | None = None
     code: str | None = None
     trusted: bool = False
+    import_roots: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.kind not in {"module_file", "code"}:
@@ -69,6 +215,23 @@ class KernelSource:
             object.__setattr__(self, "path", str(Path(self.path).expanduser()))
         elif not isinstance(self.code, str) or self.path is not None:
             raise ValueError("code source requires a Python string and forbids path")
+        roots = tuple(
+            str(Path(root).expanduser().resolve())
+            for root in self.import_roots
+        )
+        if len(roots) != len(set(roots)):
+            raise ValueError("KernelSource.import_roots must be unique")
+        if roots and not self.trusted:
+            raise ValueError(
+                "KernelSource.import_roots are allowed only for trusted Source"
+            )
+        missing = [root for root in roots if not Path(root).is_dir()]
+        if missing:
+            raise ValueError(
+                "KernelSource.import_roots must name existing directories: "
+                + ", ".join(missing)
+            )
+        object.__setattr__(self, "import_roots", roots)
 
     @classmethod
     def from_file(
@@ -77,14 +240,32 @@ class KernelSource:
         function: str,
         *,
         trusted: bool = False,
+        import_roots: Iterable[str | os.PathLike[str]] = (),
     ) -> "KernelSource":
-        return cls("module_file", function, path=path, trusted=trusted)
+        return cls(
+            "module_file",
+            function,
+            path=path,
+            trusted=trusted,
+            import_roots=tuple(str(item) for item in import_roots),
+        )
 
     @classmethod
     def from_code(
-        cls, code: str, function: str, *, trusted: bool = False
+        cls,
+        code: str,
+        function: str,
+        *,
+        trusted: bool = False,
+        import_roots: Iterable[str | os.PathLike[str]] = (),
     ) -> "KernelSource":
-        return cls("code", function, code=code, trusted=trusted)
+        return cls(
+            "code",
+            function,
+            code=code,
+            trusted=trusted,
+            import_roots=tuple(str(item) for item in import_roots),
+        )
 
     @classmethod
     def from_replay(
@@ -261,10 +442,13 @@ class CompileResult:
     compiler: Mapping[str, Any] = field(default_factory=dict)
     target: Mapping[str, Any] = field(default_factory=dict)
     diagnostic: str = ""
+    failure_class: str | None = None
+    exception_type: str | None = None
     cache_key: str | None = None
     elapsed_ms: float = 0.0
     asm_keys: tuple[str, ...] = ()
     cache_hit: bool = False
+    external_math: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def versions(self) -> Mapping[str, Any]:
@@ -282,10 +466,21 @@ class CompileResult:
             compiler=_plain_mapping(payload.get("compiler")),
             target=_plain_mapping(payload.get("target")),
             diagnostic=str(payload.get("diagnostic", "")),
+            failure_class=(
+                str(payload["failure_class"])
+                if isinstance(payload.get("failure_class"), str)
+                else None
+            ),
+            exception_type=(
+                str(payload["exception_type"])
+                if isinstance(payload.get("exception_type"), str)
+                else None
+            ),
             cache_key=payload.get("cache_key"),
             elapsed_ms=float(payload.get("elapsed_ms", 0.0)),
             asm_keys=tuple(payload.get("asm_keys", ())),
             cache_hit=bool(payload.get("cache_hit", False)),
+            external_math=_plain_mapping(payload.get("external_math")),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -335,6 +530,9 @@ class TritonCompiler:
             "platform": platform.platform(),
             "torch": self._installed_version("torch"),
             "triton": self._installed_version("triton"),
+            "worker_sha256": hashlib.sha256(Path(__file__).with_name("_triton_worker.py").read_bytes()).hexdigest(),
+            "compiler_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "compat_sha256": hashlib.sha256(Path(__file__).parent.parent.joinpath("triton_compat.py").read_bytes()).hexdigest(),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         }
         canonical = json.dumps(
@@ -358,6 +556,10 @@ class TritonCompiler:
                 return None
             result = CompileResult.from_payload(payload["result"])
             if not result.ok:
+                return None
+            # Library selection and module flags must be observed anew. Old
+            # cache entries cannot stand in for current link-time evidence.
+            if result.ttir and "tt.extern_elementwise" in result.ttir:
                 return None
             return replace(result, cache_key=key, cache_hit=True)
         except (OSError, ValueError, KeyError, TypeError):
@@ -417,6 +619,7 @@ class TritonCompiler:
                 "code": code,
                 "filename": filename,
                 "function": source.function,
+                "import_roots": list(source.import_roots),
                 # This field participates in the evidence/cache identity even
                 # though the worker does not execute policy from it.  Source
                 # and replay must each compile once when their text happens to
@@ -453,8 +656,9 @@ class TritonCompiler:
                 json.dumps(request, sort_keys=True), encoding="utf-8"
             )
 
-            environment = dict(os.environ)
+            environment = _worker_environment(os.environ)
             environment.update(self.extra_env)
+            environment = _worker_environment(environment)
             # These flags are part of the Gate1 evidence contract.  Always
             # compile and retain the textual IR; the worker also reads asm
             # directly so Triton's filesystem dump is supporting evidence only.
@@ -493,6 +697,8 @@ class TritonCompiler:
                 return CompileResult(
                     ok=False,
                     diagnostic=diagnostic,
+                    failure_class="triton_compile_worker_timeout",
+                    exception_type="TimeoutExpired",
                     cache_key=resolved_key,
                     elapsed_ms=elapsed,
                 )
@@ -510,7 +716,12 @@ class TritonCompiler:
                     diagnostic += "\nworker stdout:\n" + process.stdout
                 if process.stderr:
                     diagnostic += "\nworker stderr:\n" + process.stderr
-                result = CompileResult(ok=False, diagnostic=diagnostic)
+                result = CompileResult(
+                    ok=False,
+                    diagnostic=diagnostic,
+                    failure_class="triton_compile_worker_result_invalid",
+                    exception_type=type(exc).__name__,
+                )
 
             if process.returncode != 0:
                 diagnostic = result.diagnostic or (
@@ -520,7 +731,15 @@ class TritonCompiler:
                     diagnostic += "\nworker stdout:\n" + process.stdout
                 if process.stderr:
                     diagnostic += "\nworker stderr:\n" + process.stderr
-                result = replace(result, ok=False, diagnostic=diagnostic)
+                result = replace(
+                    result,
+                    ok=False,
+                    diagnostic=diagnostic,
+                    failure_class=(
+                        result.failure_class
+                        or "triton_compile_worker_process_failed"
+                    ),
+                )
 
         result = replace(
             result,

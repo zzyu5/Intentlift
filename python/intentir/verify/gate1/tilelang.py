@@ -11,6 +11,8 @@ import json
 import re
 from typing import Any, Mapping
 
+from intentir.ir.canonical_construction import CanonicalHandleAllocator
+
 from .ptx import (
     PTXFingerprint,
     compare_ptx_fingerprints,
@@ -116,10 +118,14 @@ class _TIRAlphaNormalizer(ast.NodeTransformer):
         if existing is not None:
             return existing
         if parameter:
-            replacement = f"p{self.next_parameter}"
+            replacement = CanonicalHandleAllocator.canonical_names(
+                "p", self.next_parameter + 1
+            )[-1]
             self.next_parameter += 1
         else:
-            replacement = f"v{self.next_local}"
+            replacement = CanonicalHandleAllocator.canonical_names(
+                "v", self.next_local + 1
+            )[-1]
             self.next_local += 1
         scope[name] = replacement
         return replacement

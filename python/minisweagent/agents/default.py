@@ -1,6 +1,4 @@
-"""Basic agent class. See https://mini-swe-agent.com/latest/advanced/control_flow/ for visual explanation
-or https://minimal-agent.com for a tutorial on the basic building principles.
-"""
+"""Basic agent control loop retained for IntentIR Lift and Replay."""
 
 import copy
 import hashlib
@@ -186,12 +184,32 @@ class DefaultAgent:
 
     def query(self) -> dict:
         """Query the model and return model messages. Override to add hooks."""
-        if 0 < self.config.step_limit <= self.n_calls or 0 < self.config.cost_limit <= self.cost:
+        if 0 < self.config.step_limit <= self.n_calls:
             raise LimitsExceeded(
                 {
                     "role": "exit",
-                    "content": "LimitsExceeded",
-                    "extra": {"exit_status": "LimitsExceeded", "submission": ""},
+                    "content": "AgentStepLimitExceeded",
+                    "extra": {
+                        "exit_status": "AgentStepLimitExceeded",
+                        "submission": "",
+                        "limit_kind": "agent_step",
+                        "model_calls": self.n_calls,
+                        "step_limit": self.config.step_limit,
+                    },
+                }
+            )
+        if 0 < self.config.cost_limit <= self.cost:
+            raise LimitsExceeded(
+                {
+                    "role": "exit",
+                    "content": "AgentCostLimitExceeded",
+                    "extra": {
+                        "exit_status": "AgentCostLimitExceeded",
+                        "submission": "",
+                        "limit_kind": "agent_cost",
+                        "cost": self.cost,
+                        "cost_limit": self.config.cost_limit,
+                    },
                 }
             )
         if 0 < self.config.wall_time_limit_seconds <= int(time.time() - self._start_time):
@@ -203,7 +221,13 @@ class DefaultAgent:
                 }
             )
         self.n_calls += 1
-        message = self.model.query(self.messages)
+        query_kwargs: dict[str, object] = {}
+        response_tools = getattr(self.env, "response_tools", None)
+        if callable(response_tools):
+            surface = response_tools()
+            if surface is not None:
+                query_kwargs["response_tools"] = surface
+        message = self.model.query(self.messages, **query_kwargs)
         self.cost += message.get("extra", {}).get("cost", 0.0)
         self.add_messages(message)
         return message
